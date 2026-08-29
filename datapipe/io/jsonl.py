@@ -7,7 +7,7 @@ import os
 from typing import Any, Callable, Iterator
 
 from datapipe.errors import SourceError
-from datapipe.io.base import Source, Sink
+from datapipe.io.base import Source, Sink, SourceRecordError
 from datapipe.io.utils import (
     detect_compression,
     iter_lines,
@@ -84,8 +84,14 @@ class JsonlSource(Source):
             for line in iter_lines(raw, self.encoding):
                 if self.raw:
                     yield line
-                else:
+                    continue
+                try:
                     yield self.loads(line)
+                except Exception as exc:  # noqa: BLE001
+                    # Report a per-record decode failure as a resumable marker
+                    # so the runner can apply the error policy and continue
+                    # with subsequent lines (finding 9).
+                    yield SourceRecordError(exc=exc, line=line)
 
     def __iter__(self) -> Iterator[Any]:
         for path in self._resolve_files():

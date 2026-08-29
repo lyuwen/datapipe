@@ -74,12 +74,28 @@ On `KeyboardInterrupt`:
 ## Error model
 
 A worker failure is wrapped in `StageExecutionError` carrying `stage_name`,
-`record_seq`, and the original `cause`. Error policies:
+`record_seq`, and the original `cause`. A source-level decode failure (e.g. a
+malformed JSONL line) is reported as a per-record error too, so it flows
+through the same policies. Error policies:
 
-- `errors="raise"` (default): first error aborts the run.
-- `errors="skip"`: failed rows are counted and omitted.
-- `errors="return"`: errors go to `error_sink` (or are exposed as structured
-  `TaskResult`s when no error sink is given).
+- `errors="raise"` (default): first error aborts the run immediately. An
+  interrupted ordered sink contains only the contiguous completed prefix —
+  buffered results that follow a gap are never written.
+- `errors="skip"`: failed rows are counted and omitted. Under `ordered=True`,
+  a failure is skipped at its sequence position, so `next_to_emit` advances
+  contiguously and the reorder buffer stays bounded regardless of error
+  count.
+- `errors="return"`: errors go to `error_sink` (a file-backed sink is opened
+  and closed automatically) or are exposed as structured `TaskResult`s when
+  no error sink is given.
+
+## Sink finalization
+
+Finalization is not silently swallowed. `sink.close()` performs the final
+buffered write (e.g. the last Parquet batch), so a failure there — such as a
+schema mismatch or disk error — propagates out of `run()` instead of
+returning a successful result. If both the run and the finalization fail, the
+original run error is the one that propagates.
 
 ## Stats
 

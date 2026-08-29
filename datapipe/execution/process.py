@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 from concurrent.futures import Future, ProcessPoolExecutor
-from typing import Any, Callable, Iterable
 
-from datapipe.context import WorkerContext
 from datapipe.execution.base import BoundedMapExecutor, _Job
 from datapipe.execution.worker import _init_worker, _process_payload
 from datapipe.runtime.context import RuntimeContext

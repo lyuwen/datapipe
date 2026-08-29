@@ -113,16 +113,55 @@ def test_jsonl_empty_file(tmp_path):
 
 
 def test_jsonl_malformed_raises(tmp_path):
+    """errors='raise' surfaces the decode error (from the worker stage)."""
     p = tmp_path / "bad.jsonl"
     _write(str(p), ['{"ok": 1}', "NOT JSON", '{"ok": 3}'])
-    with pytest.raises(StageExecutionError):
+    with pytest.raises(StageExecutionError) as ei:
         Pipeline([JsonLoadStage()]).run(
-            source=JsonlSource(str(p)),
+            source=JsonlSource(str(p), raw=True),
             sink=ListSink(),
             executor=SequentialExecutor(),
             errors="raise",
             progress=False,
         )
+    assert isinstance(ei.value.cause, json.JSONDecodeError)
+
+
+def test_jsonl_malformed_skip_continues(tmp_path):
+    """errors='skip' skips a malformed line and processes the rest."""
+    p = tmp_path / "bad.jsonl"
+    _write(str(p), ['{"ok": 1}', "NOT JSON", '{"ok": 3}'])
+    sink = ListSink()
+    stats = Pipeline([JsonLoadStage()]).run(
+        source=JsonlSource(str(p), raw=True),
+        sink=sink,
+        executor=SequentialExecutor(),
+        errors="skip",
+        progress=False,
+    )
+    assert sink.items == [{"ok": 1}, {"ok": 3}]
+    assert stats.failed_records == 1
+    assert stats.output_records == 2
+
+
+def test_jsonl_malformed_return(tmp_path):
+    """errors='return' records the decode error in the error_sink."""
+    p = tmp_path / "bad.jsonl"
+    _write(str(p), ['{"ok": 1}', "NOT JSON", '{"ok": 3}'])
+    esink = ListSink()
+    sink = ListSink()
+    stats = Pipeline([JsonLoadStage()]).run(
+        source=JsonlSource(str(p), raw=True),
+        sink=sink,
+        executor=SequentialExecutor(),
+        errors="return",
+        error_sink=esink,
+        progress=False,
+    )
+    assert sink.items == [{"ok": 1}, {"ok": 3}]
+    assert len(esink.items) == 1
+    assert esink.items[0]["seq"] == 1
+    assert esink.items[0]["error_type"] == "JSONDecodeError"
 
 
 def test_jsonl_unicode(tmp_path):

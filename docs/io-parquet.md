@@ -15,8 +15,10 @@ ParquetSource(path, *, columns=None, filters=None, batch_size=4096)
 - Yields rows as Python dicts (by default).
 - Physical reading is batched internally — never one Parquet IO operation per
   row.
-- `columns` projects only the needed columns; `filters` applies row-group
-  predicates (a `pyarrow` expression).
+- `columns` projects only the needed columns.
+- `filters` applies row predicates to every batch read (a pyarrow
+  `dataset.Expression`, or the legacy `(col, op, value)` / list-of-tuples
+  form, ANDed together).
 - Directory datasets are discovered automatically.
 
 ### Physical sharding
@@ -35,9 +37,13 @@ ParquetSink(path, *, schema=None, batch_size=4096, compression="zstd")
 - Buffers rows into batches and writes with a `ParquetWriter` — never one
   row at a time.
 - `schema` may be an explicit `pyarrow.Schema`; otherwise it is inferred from
-  the first batch.
+  the first batch. With an explicit schema, each batch is constructed with it
+  directly, so Python values are converted to the declared types and
+  mismatches surface at write/close time (never silently).
 - A directory path (trailing slash or existing directory) writes
-  `path/part-{rank:05d}.parquet`.
+  `path/part-{rank:05d}.parquet`. A plain file path is used as-is on a
+  single rank; multi-rank runs insert a `.part-{rank}` suffix so ranks never
+  overwrite each other's file.
 
 ## Example
 

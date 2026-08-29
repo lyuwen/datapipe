@@ -5,11 +5,10 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from datapipe.context import WorkerContext
 from datapipe.errors import (
-    DataPipeError,
     PipelineValidationError,
     StageExecutionError,
 )
@@ -227,6 +226,7 @@ class Pipeline:
         )
 
         start = time.monotonic()
+        primary_error: BaseException | None = None
         try:
             stats = self._run_impl(
                 source=source,
@@ -235,15 +235,36 @@ class Pipeline:
                 config=config,
                 progress_reporter=progress_reporter,
             )
+        except BaseException as exc:  # noqa: BLE001
+            # Remember the run error (if any) so a finalization failure does
+            # not mask the original failure.
+            primary_error = exc
+            raise
         finally:
+            # Finalize sinks first. A failure here must NOT be swallowed
+            # (e.g. ParquetSink.close() writes the final buffered batch), but
+            # it must not mask an already-raised run error either.
+            finalize_error: BaseException | None = None
             try:
                 sink.close()
-            except Exception:  # noqa: BLE001
-                logger.exception("error closing sink")
+            except BaseException as exc:  # noqa: BLE001
+                finalize_error = exc
+                logger.error("error closing sink: %s", exc)
             try:
                 source.close()
-            except Exception:  # noqa: BLE001
-                logger.exception("error closing source")
+            except BaseException as exc:  # noqa: BLE001
+                if finalize_error is None:
+                    finalize_error = exc
+                logger.error("error closing source: %s", exc)
+            try:
+                if config.error_sink is not None:
+                    config.error_sink.close()
+            except BaseException as exc:  # noqa: BLE001
+                if finalize_error is None:
+                    finalize_error = exc
+                logger.error("error closing error_sink: %s", exc)
+            if finalize_error is not None and primary_error is None:
+                raise finalize_error
 
         stats.elapsed_seconds = time.monotonic() - start
         stats.records_per_second = (
@@ -266,6 +287,8 @@ class Pipeline:
 
         source.open(runtime)
         sink.open(runtime)
+        if config.error_sink is not None:
+            config.error_sink.open(runtime)
         records = source.iter_for_runtime(runtime, config.sharding)
 
         reporter: ProgressReporter = (
@@ -286,18 +309,19 @@ class Pipeline:
             if result.error is not None:
                 stats.failed_records += 1
 
-            # Policy "raise": abort the run by raising the wrapped error.
+            # Policy "raise": abort the run immediately on the first error,
+            # regardless of position. Completed-but-unemitted results in the
+            # reorder buffer are dropped on abort (see finally below), so the
+            # sink keeps only the contiguous prefix written before the error.
             if result.error is not None and config.errors == "raise":
                 self._raise_result(result)
                 return  # unreachable
 
-            # Policy "skip": drop failures entirely.
-            if result.error is not None and config.errors == "skip":
-                reporter.update(1, errors=stats.failed_records)
-                return
-
-            # From here on: success, or errors == "return" (error surfaced).
             if config.ordered:
+                # Buffer EVERY result (success, drop, error) at its seq
+                # position. Errors under "skip"/"return" are emitted at their
+                # position too, so next_to_emit always advances contiguously
+                # and the buffer stays bounded regardless of error count.
                 ordered_buffer[result.seq] = result
                 stats.max_reorder_buffer_observed = max(
                     stats.max_reorder_buffer_observed, len(ordered_buffer)
@@ -323,19 +347,10 @@ class Pipeline:
             raise
         finally:
             reporter.close()
-            # Flush any reorder buffer left behind after an abort (error or
-            # KeyboardInterrupt). Do not re-raise errors here; the original
-            # exception is propagating.
-            if config.ordered:
-                for emit_seq in sorted(ordered_buffer):
-                    emit = ordered_buffer.pop(emit_seq)
-                    next_to_emit += 1
-                    try:
-                        self._emit(emit, sink, stats, config, reporter)
-                    except Exception:  # noqa: BLE001
-                        logger.exception(
-                            "error flushing reorder buffer at seq %s", emit.seq
-                        )
+            # On abort (error policy "raise" or KeyboardInterrupt), do NOT
+            # flush the reorder buffer. An interrupted ordered sink must
+            # contain only the contiguous completed prefix; flushing buffered
+            # results that follow a gap would violate input order.
 
         stats.input_records = stats.completed_records
         return stats
@@ -348,9 +363,17 @@ class Pipeline:
         config: RunConfig,
         reporter: ProgressReporter,
     ) -> None:
-        """Write one result per policy (only reached for success or
-        errors == "return")."""
+        """Write one result per policy.
+
+        ``errors == "raise"`` is never routed here (aborts in ``on_result``).
+        For ``errors in ("skip", "return")``, error results reach this point
+        at their sequence position (ordered mode) or immediately (unordered).
+        """
         if result.error is not None:
+            if config.errors == "skip":
+                # Failed records are counted and omitted.
+                reporter.update(1, errors=stats.failed_records)
+                return
             # errors == "return": deliver to error_sink if given, else expose
             # the structured TaskResult to the main sink.
             if config.error_sink is not None:

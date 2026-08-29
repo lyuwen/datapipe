@@ -15,6 +15,25 @@ from typing import Any, Iterable, Iterator
 from datapipe.runtime.context import RuntimeContext
 
 
+class SourceRecordError(Exception):
+    """A per-record failure detected at the source boundary.
+
+    A source may *yield* one of these (preferred — the generator stays
+    resumable) so the runner can apply the configured error policy and keep
+    processing subsequent records. ``exc`` is the underlying exception and
+    ``line`` is the offending raw input (optional).
+
+    ``SourceRecordError`` also derives from ``Exception`` so a source may
+    *raise* one; the scheduler treats a raised marker as a per-record error
+    (the generator is then closed, so the source ends).
+    """
+
+    def __init__(self, exc: BaseException, line: Any = None) -> None:
+        super().__init__(f"source record error: {exc}")
+        self.exc = exc
+        self.line = line
+
+
 class Source(ABC):
     """Abstract record source."""
 
@@ -46,16 +65,27 @@ class Source(ABC):
         Uses physical sharding when supported, else applies the logical
         sharding strategy.
         """
+        # Allow a RangeSharding without an explicit total to obtain one from
+        # the source's reported total (finding 10).
+        from datapipe.sharding.range import RangeSharding
+
+        if isinstance(sharding, RangeSharding) and sharding.total is None:
+            total = self.total
+            if total is not None:
+                sharding.total = total
+
         if self.supports_physical_sharding:
             shard = self.iter_shard(runtime.rank, runtime.world_size)
             if shard is not None:
-                return shard
+                return _normalize_source_errors(shard)
 
-        return _logically_shard(
-            self.__iter__(),
-            sharding=sharding,
-            rank=runtime.rank,
-            world_size=runtime.world_size,
+        return _normalize_source_errors(
+            _logically_shard(
+                self.__iter__(),
+                sharding=sharding,
+                rank=runtime.rank,
+                world_size=runtime.world_size,
+            )
         )
 
     @property
@@ -97,6 +127,26 @@ def _logically_shard(
             yield value
 
 
+def _normalize_source_errors(records: Iterable[Any]) -> Iterator[Any]:
+    """Normalize raised ``SourceRecordError`` into yielded markers.
+
+    This lets a source *raise* ``SourceRecordError`` (e.g. from deep inside a
+    wrapper) while keeping the runner's per-record error handling uniform:
+    every per-record source failure arrives as a yielded marker at the
+    executor boundary.
+    """
+    it = iter(records)
+    while True:
+        try:
+            value = next(it)
+        except StopIteration:
+            return
+        except SourceRecordError as exc:
+            yield SourceRecordError(exc=exc.exc, line=exc.line)
+            return  # the generator that raised is closed; stop pulling
+        yield value
+
+
 class Sink(ABC):
     """Abstract record sink."""
 
@@ -112,4 +162,4 @@ class Sink(ABC):
 
 
 # Re-export for consumers who import from datapipe.io.base directly.
-__all__ = ["Source", "Sink"]
+__all__ = ["Source", "Sink", "SourceRecordError"]

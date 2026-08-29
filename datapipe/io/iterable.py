@@ -15,11 +15,14 @@ class IterableSource(Source):
     def __init__(self, iterable: Iterable[Any]) -> None:
         self._iterable = iterable
         self._seq_offset = 0
-        self._total_hint: int | None = None
+        # Compute the total eagerly for sized iterables so it is available
+        # before iteration begins (needed by RangeSharding total injection).
+        if isinstance(iterable, (list, tuple, range, set, frozenset)):
+            self._total_hint: int | None = len(iterable)
+        else:
+            self._total_hint = None
 
     def __iter__(self) -> Iterator[Any]:
-        if isinstance(self._iterable, (list, tuple, range, set, frozenset)):
-            self._total_hint = len(self._iterable)
         return iter(self._iterable)
 
     @property

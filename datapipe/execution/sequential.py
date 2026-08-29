@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterable
 
 from datapipe.context import WorkerContext
 from datapipe.execution.base import Executor, _wrap_error, _wrap_result
+from datapipe.io.base import SourceRecordError
 from datapipe.result import ExecutionStats, TaskResult
 from datapipe.runtime.context import RuntimeContext
 
@@ -46,6 +47,14 @@ class SequentialExecutor(Executor):
         try:
             for seq, value in enumerate(records):
                 ctx.record_index = seq
+                if isinstance(value, SourceRecordError):
+                    # Resumable per-record source failure: report it without
+                    # running the pipeline and keep processing.
+                    on_result(_wrap_error(_seq_job(seq), value.exc))
+                    stats.max_in_flight_observed = max(
+                        stats.max_in_flight_observed, 1
+                    )
+                    continue
                 try:
                     result = worker.process(value, ctx)
                 except BaseException as exc:  # noqa: BLE001

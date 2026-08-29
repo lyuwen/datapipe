@@ -8,7 +8,10 @@ JSONL is the ergonomic default format.
 JsonlSource(path, *, raw=False, encoding="utf-8", compression="auto")
 ```
 
-- `raw=False` (default): yields parsed Python objects.
+- `raw=False` (default): yields parsed Python objects. A malformed line is
+  reported as a per-record source error, so it flows through the configured
+  error policy (`skip` skips it and keeps going; `raise` aborts; `return`
+  sends it to the error sink).
 - `raw=True`: yields raw line strings — parse inside workers with
   `JsonLoadStage()` to keep coordinator work small.
 - `compression="auto"` inspects the extension: `.gz` -> gzip, `.zst` -> zstd.

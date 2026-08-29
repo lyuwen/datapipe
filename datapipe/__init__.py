@@ -20,6 +20,7 @@ from datapipe.io import (
     ListSink,
     ParquetSink,
     ParquetSource,
+    SourceRecordError,
 )
 from datapipe.pipeline import Pipeline
 from datapipe.result import ExecutionStats, TaskResult
@@ -72,6 +73,7 @@ __all__ = [
     "IterableSource",
     "CallableSink",
     "ListSink",
+    "SourceRecordError",
     # Results / misc
     "WorkerContext",
     "TaskResult",

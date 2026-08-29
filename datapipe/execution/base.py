@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from datapipe.context import WorkerContext
+from datapipe.io.base import SourceRecordError
 from datapipe.result import ExecutionStats, TaskResult
 from datapipe.runtime.context import RuntimeContext
 
@@ -154,6 +155,31 @@ class BoundedMapExecutor(Executor):
                 except StopIteration:
                     source_exhausted = True
                     break
+                except SourceRecordError as exc:
+                    # A source may *raise* SourceRecordError; treat it the
+                    # same as a yielded marker below.
+                    on_result(
+                        _wrap_error(_Job(seq=next_seq, value=None), exc.exc)
+                    )
+                    next_seq += 1
+                    continue
+                except BaseException as exc:  # noqa: BLE001
+                    # A genuine source failure (e.g. IO error) while pulling.
+                    # Deliver it as a per-record error at the current seq so
+                    # the configured error policy applies; the generator that
+                    # raised is closed, so stop pulling.
+                    on_result(_wrap_error(_Job(seq=next_seq, value=None), exc))
+                    next_seq += 1
+                    source_exhausted = True
+                    break
+                if isinstance(value, SourceRecordError):
+                    # Resumable per-record failure: report it without
+                    # submitting a job and keep pulling subsequent records.
+                    on_result(
+                        _wrap_error(_Job(seq=next_seq, value=None), value.exc)
+                    )
+                    next_seq += 1
+                    continue
                 job = _Job(seq=next_seq, value=value)
                 next_seq += 1
                 future = self._submit(job)
