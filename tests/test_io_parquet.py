@@ -131,3 +131,37 @@ def test_parquet_batched_write_small_batch(tmp_path):
     )
     t = pq.read_table(str(tmp_path / "out" / "part-00000.parquet"))
     assert t.num_rows == 50
+
+
+# ---------------------------------------------------------------------------
+# A4. Parquet filter may reference a column not in the column projection
+# ---------------------------------------------------------------------------
+
+
+def test_parquet_filter_can_reference_unprojected_column(tmp_path):
+    """columns=["name"] with filters=field("id") >= 3 must not raise ArrowInvalid
+    and must return only the projected column for matching rows."""
+    import pyarrow.dataset as ds
+
+    inp = str(tmp_path / "in.parquet")
+    pq.write_table(
+        pa.table({"id": list(range(10)), "name": [f"row{i}" for i in range(10)]}),
+        inp,
+    )
+
+    # Expression filter
+    rows = list(
+        __import__("datapipe").ParquetSource(
+            inp, columns=["name"], filters=ds.field("id") >= 3
+        )
+    )
+    assert all(set(r.keys()) == {"name"} for r in rows), "only 'name' column expected"
+    assert [r["name"] for r in rows] == [f"row{i}" for i in range(3, 10)]
+
+    # Legacy tuple filter
+    rows2 = list(
+        __import__("datapipe").ParquetSource(
+            inp, columns=["name"], filters=[("id", ">=", 3)]
+        )
+    )
+    assert [r["name"] for r in rows2] == [f"row{i}" for i in range(3, 10)]

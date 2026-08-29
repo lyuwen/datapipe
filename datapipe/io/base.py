@@ -72,7 +72,9 @@ class Source(ABC):
         if isinstance(sharding, RangeSharding) and sharding.total is None:
             total = self.total
             if total is not None:
-                sharding.total = total
+                # Resolve into a local instance; never mutate the caller's
+                # reusable strategy (finding 3).
+                sharding = RangeSharding(total=total)
 
         if self.supports_physical_sharding:
             shard = self.iter_shard(runtime.rank, runtime.world_size)

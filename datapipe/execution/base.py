@@ -23,6 +23,19 @@ from datapipe.result import ExecutionStats, TaskResult
 from datapipe.runtime.context import RuntimeContext
 
 
+class WorkerSetupError(Exception):
+    """Raised when a worker's setup() fails.
+
+    Wraps the original exception so the scheduler can distinguish an
+    initialization failure (which must abort regardless of error policy)
+    from a per-record processing failure (which routes through the policy).
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(f"worker setup failed: {cause}")
+        self.cause = cause
+
+
 class Executor(ABC):
     """Owns local parallelism only."""
 
@@ -100,6 +113,14 @@ class BoundedMapExecutor(Executor):
     def _submit(self, job: _Job) -> Future:
         raise NotImplementedError
 
+    def _pre_shutdown(self) -> None:
+        """Called after all records complete, before the pool is torn down.
+
+        Override to submit teardown work to the still-live pool so that
+        teardown runs on the owning worker threads rather than the coordinator.
+        The default no-op is correct for executors that don't need this.
+        """
+
     def _shutdown_backend(self, cancel_futures: bool = False) -> None:
         pass
 
@@ -163,15 +184,11 @@ class BoundedMapExecutor(Executor):
                     )
                     next_seq += 1
                     continue
-                except BaseException as exc:  # noqa: BLE001
-                    # A genuine source failure (e.g. IO error) while pulling.
-                    # Deliver it as a per-record error at the current seq so
-                    # the configured error policy applies; the generator that
-                    # raised is closed, so stop pulling.
-                    on_result(_wrap_error(_Job(seq=next_seq, value=None), exc))
-                    next_seq += 1
-                    source_exhausted = True
-                    break
+                except BaseException:
+                    # A genuine source failure (IO error, KeyboardInterrupt,
+                    # etc.) is not a per-record error; propagate so the
+                    # pipeline aborts rather than silently truncating output.
+                    raise
                 if isinstance(value, SourceRecordError):
                     # Resumable per-record failure: report it without
                     # submitting a job and keep pulling subsequent records.
@@ -199,6 +216,11 @@ class BoundedMapExecutor(Executor):
                     job = pending.pop(future)
                     try:
                         result = future.result()
+                    except WorkerSetupError:
+                        # Worker initialization failure is not a per-record
+                        # error; abort regardless of the configured error
+                        # policy by re-raising out of the scheduler loop.
+                        raise
                     except BaseException as exc:  # noqa: BLE001
                         # A worker raised while processing this record.
                         on_result(_wrap_error(job, exc))
@@ -211,6 +233,10 @@ class BoundedMapExecutor(Executor):
         finally:
             for future in list(pending):
                 future.cancel()
+            # Let subclasses (e.g. ThreadExecutor) submit teardown futures to
+            # the still-live pool before it is closed.  Runs on both normal
+            # completion and abort so worker resources are always released.
+            self._pre_shutdown()
             self._shutdown_backend(cancel_futures=True)
 
     def shutdown(self, cancel_futures: bool = False) -> None:

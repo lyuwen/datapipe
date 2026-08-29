@@ -135,29 +135,79 @@ class ParquetSource(Source):
     def __iter__(self) -> Iterator[Any]:
         _require_pyarrow()
         self._expr()
-        yield from self._iter_paths(self._files())
+        if _is_dataset_path(self.path):
+            yield from self._iter_directory()
+        else:
+            yield from self._iter_paths([self.path])
 
     def iter_shard(self, rank: int, world_size: int) -> Iterator[Any] | None:
         """Physically shard a dataset by assigning files (preferred), falling
         back to row-group assignment for a single file.
         """
         self._expr()
-        files = self._files()
         if world_size <= 1:
             return self.__iter__()
-        if len(files) > 1:
-            return self._iter_paths(files[rank::world_size])
+        if _is_dataset_path(self.path):
+            # Directory datasets (including Hive-partitioned ones): shard by
+            # file index via a directory-level dataset so partition metadata
+            # is preserved for filter pushdown.
+            return self._iter_directory_shard(rank, world_size)
         return self._iter_row_groups(rank, world_size)
 
     def _iter_paths(self, paths: list[str]) -> Iterator[Any]:
         pa, pq, ds = _require_pyarrow()
         expr = self._expr()
         for path in paths:
-            pf = pq.ParquetFile(path)
-            for batch in pf.iter_batches(batch_size=self.batch_size, columns=self.columns):
-                if expr is not None:
-                    batch = batch.filter(expr)
+            # Per-file scanner: predicate pushdown before column projection to
+            # avoid ArrowInvalid when the filter references a non-projected
+            # column.  Note: per-file datasets lose Hive partition metadata;
+            # callers that need partition-column filtering should call
+            # _iter_directory() instead of enumerating individual files here.
+            dataset = ds.dataset(path, format="parquet")
+            scanner = dataset.scanner(
+                columns=self.columns,
+                filter=expr,
+                batch_size=self.batch_size,
+            )
+            for batch in scanner.to_batches():
                 yield from _batches_to_rows(batch)
+
+    def _iter_directory(self) -> Iterator[Any]:
+        """Scan the source directory as a Hive-partitioned dataset.
+
+        ``partitioning="hive"`` instructs pyarrow to decode directory-name
+        key=value segments as columns, so filters on partition keys (e.g.
+        ``field("part") == "b"``) resolve correctly without those columns
+        being stored inside the individual Parquet files.
+        """
+        pa, pq, ds = _require_pyarrow()
+        expr = self._expr()
+        dataset = ds.dataset(self.path, format="parquet", partitioning="hive")
+        scanner = dataset.scanner(
+            columns=self.columns,
+            filter=expr,
+            batch_size=self.batch_size,
+        )
+        for batch in scanner.to_batches():
+            yield from _batches_to_rows(batch)
+
+    def _iter_directory_shard(self, rank: int, world_size: int) -> Iterator[Any]:
+        """Shard a directory dataset by file while preserving Hive metadata."""
+        pa, pq, ds = _require_pyarrow()
+        expr = self._expr()
+        dataset = ds.dataset(self.path, format="parquet", partitioning="hive")
+        files = sorted(dataset.files)
+        mine = files[rank::world_size]
+        if not mine:
+            return
+        shard = ds.dataset(mine, format="parquet", partitioning="hive")
+        scanner = shard.scanner(
+            columns=self.columns,
+            filter=expr,
+            batch_size=self.batch_size,
+        )
+        for batch in scanner.to_batches():
+            yield from _batches_to_rows(batch)
 
     def _iter_row_groups(self, rank: int, world_size: int) -> Iterator[Any]:
         pa, pq, ds = _require_pyarrow()
@@ -167,14 +217,22 @@ class ParquetSource(Source):
         mine = groups[rank::world_size]
         if not mine:
             return
+        # When a filter and a column projection are both active, read without
+        # restricting columns so the predicate can reference any column, then
+        # project down after filtering.
+        read_columns = (
+            None if (expr is not None and self.columns is not None) else self.columns
+        )
         for group in mine:
             for batch in pf.iter_batches(
                 batch_size=self.batch_size,
                 row_groups=[group],
-                columns=self.columns,
+                columns=read_columns,
             ):
                 if expr is not None:
                     batch = batch.filter(expr)
+                if read_columns is None and self.columns is not None:
+                    batch = batch.select(self.columns)
                 yield from _batches_to_rows(batch)
 
     @property

@@ -3,77 +3,147 @@
 Its API matches ``ProcessExecutor``; both reuse the shared bounded scheduler.
 Useful for IO-heavy record processing where GIL contention is acceptable.
 
-Each worker thread gets its own ``WorkerContext`` (via ``threading.local``)
-so that:
+Each worker thread gets its own deep copy of the compiled pipeline and its own
+``WorkerContext`` (via ``threading.local``) so that:
 
-- ``setup()`` runs once **per thread** (matching the "once per worker"
-  semantics of the process executor);
+- ``setup()`` runs once **per thread** and can safely store per-thread state
+  on ``self`` (including nested mutable objects) without racing against sibling
+  threads; ``Stage.__deepcopy__`` ensures non-picklable attributes like locks
+  are replaced with fresh equivalents rather than shared or copied wholesale;
 - concurrent writes to ``ctx.record_index`` do not race across threads;
-- ``teardown()`` is called once per thread that ran setup, at pool shutdown.
+- ``teardown()`` runs on the owning thread after all record processing finishes,
+  by submitting teardown futures to the still-live pool before it is closed.
 """
 
 from __future__ import annotations
 
+import copy
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from datapipe.context import WorkerContext
-from datapipe.execution.base import BoundedMapExecutor, _Job
+from datapipe.execution.base import BoundedMapExecutor, WorkerSetupError, _Job
 from datapipe.runtime.context import RuntimeContext
 
 
 class _ThreadLocalWorker:
-    """Per-thread worker state: a dedicated context and setup/teardown.
+    """Per-thread worker state.
 
-    The compiled ``worker`` object itself is shared (stages must be
-    thread-safe), but each thread's context is private.
+    Each thread pops a pre-copied worker from ``_worker_pool`` (populated in
+    ``_start_backend`` while still single-threaded) so ``setup()`` writes to an
+    isolated object graph rather than a shared one.
+
+    Setup failures are wrapped in ``WorkerSetupError`` so the scheduler aborts
+    instead of routing them through the per-record error policy.
+
+    Teardown is submitted back to the still-live pool via ``submit_teardown``,
+    so each ``_teardown_on_thread`` call executes on the thread that owns the
+    ``threading.local`` state.
     """
 
-    def __init__(self, worker, runtime: RuntimeContext) -> None:
+    def __init__(self, worker, runtime: RuntimeContext, worker_pool: list, max_workers: int) -> None:
         self._worker = worker
         self._runtime = runtime
         self._local = threading.local()
         self._lock = threading.Lock()
         self._done_teardown = False
+        self._thread_states: list[tuple] = []   # (worker_copy, ctx) per thread
+        self._torn_down: set[int] = set()       # id(worker_copy) of torn-down workers
+        self._worker_pool = worker_pool
+        self._max_workers = max_workers
 
     def _ensure_initialized(self, thread_id: int) -> None:
-        ctx = getattr(self._local, "ctx", None)
-        if ctx is None:
-            ctx = WorkerContext(
-                rank=self._runtime.rank,
-                world_size=self._runtime.world_size,
-                worker_id=thread_id,
-                local_rank=self._runtime.local_rank,
+        if getattr(self._local, "ctx", None) is not None:
+            return
+        ctx = WorkerContext(
+            rank=self._runtime.rank,
+            world_size=self._runtime.world_size,
+            worker_id=thread_id,
+            local_rank=self._runtime.local_rank,
+        )
+        with self._lock:
+            worker_copy = (
+                self._worker_pool.pop()
+                if self._worker_pool
+                else copy.deepcopy(self._worker)
             )
-            self._local.ctx = ctx
-            self._local.setup_done = False
-            if hasattr(self._worker, "setup"):
-                self._worker.setup(ctx)
-            self._local.setup_done = True
+        try:
+            if hasattr(worker_copy, "setup"):
+                worker_copy.setup(ctx)
+        except Exception as exc:  # noqa: BLE001
+            raise WorkerSetupError(exc) from exc
+        # Assign only after setup succeeds; a raised exception leaves
+        # _local.ctx unset so teardown is never called for a failed worker.
+        self._local.ctx = ctx
+        self._local.worker = worker_copy
+        with self._lock:
+            self._thread_states.append((worker_copy, ctx))
 
     def process(self, seq: int, value: Any) -> Any:
-        thread_id = threading.get_ident()
-        self._ensure_initialized(thread_id)
+        self._ensure_initialized(threading.get_ident())
         ctx = self._local.ctx
         ctx.record_index = seq
-        return self._worker.process(value, ctx)
+        return self._local.worker.process(value, ctx)
 
-    def teardown_all(self) -> None:
-        """Call teardown once for every thread that ran setup.
+    def _teardown_on_thread(self) -> None:
+        """Run teardown for the worker owned by the calling thread, if any.
 
-        ``ThreadPoolExecutor`` does not expose per-thread finalizers, so we
-        call teardown on this (pool) thread's own context and mark teardown
-        complete; per-thread teardown for retired threads is best-effort.
+        Reads from ``threading.local`` so it only tears down this thread's
+        own worker.  Idempotent: uses ``_local.teardown_done`` to ensure
+        at most one teardown per thread regardless of how many tasks land here.
+        Records the worker id in ``_torn_down`` so the coordinator fallback
+        can tell which workers still need cleanup.
+        """
+        if getattr(self._local, "teardown_done", False):
+            return
+        worker = getattr(self._local, "worker", None)
+        ctx = getattr(self._local, "ctx", None)
+        if worker is not None and ctx is not None:
+            self._local.teardown_done = True
+            with self._lock:
+                self._torn_down.add(id(worker))
+            if hasattr(worker, "teardown"):
+                worker.teardown(ctx)
+
+    def submit_teardown(self, pool: ThreadPoolExecutor) -> None:
+        """Tear down every initialized worker, preferring the owning thread.
+
+        Submits ``max_workers`` tasks so every pool thread has the opportunity
+        to pick up at least one and run teardown for its own local worker.
+        After all futures resolve, any worker not yet torn down (because its
+        thread never picked up a task) is torn down on the coordinator thread
+        as a best-effort fallback.
+
+        Must be called while the pool is still accepting submissions.
         """
         with self._lock:
             if self._done_teardown:
                 return
             self._done_teardown = True
-        ctx = getattr(self._local, "ctx", None)
-        if ctx is not None and getattr(self._local, "setup_done", False):
-            if hasattr(self._worker, "teardown"):
-                self._worker.teardown(ctx)
+            states = list(self._thread_states)
+
+        if not states:
+            return
+
+        futs = [pool.submit(self._teardown_on_thread) for _ in range(self._max_workers)]
+        for f in futs:
+            try:
+                f.result()
+            except Exception:  # noqa: BLE001
+                pass  # CompiledPipeline.teardown already logs stage errors
+
+        # Coordinator-thread fallback: tear down any worker whose thread never
+        # picked up a teardown task from the pool.
+        with self._lock:
+            already = set(self._torn_down)
+        for worker, ctx in states:
+            if id(worker) not in already:
+                if hasattr(worker, "teardown"):
+                    try:
+                        worker.teardown(ctx)
+                    except Exception:  # noqa: BLE001
+                        pass
 
 
 class ThreadExecutor(BoundedMapExecutor):
@@ -89,18 +159,35 @@ class ThreadExecutor(BoundedMapExecutor):
         self._thread_worker: _ThreadLocalWorker | None = None
 
     def _start_backend(self, runtime: RuntimeContext, worker) -> None:
-        self._thread_worker = _ThreadLocalWorker(worker, runtime)
+        # Pre-copy workers while single-threaded so deepcopy never races with
+        # live attributes that setup() will later write on thread-owned copies.
+        worker_pool = [worker.clone() for _ in range(self.workers)]
+        self._thread_worker = _ThreadLocalWorker(
+            worker, runtime, worker_pool, max_workers=self.workers
+        )
         self._pool = ThreadPoolExecutor(max_workers=self.workers)
 
     def _submit(self, job: _Job) -> Future:
+        assert self._pool is not None and self._thread_worker is not None
         return self._pool.submit(
             self._thread_worker.process, job.seq, job.value
         )
 
+    def _pre_shutdown(self) -> None:
+        """Submit teardown futures to the still-live pool before closing it.
+
+        Called by the scheduler after all records complete successfully.  The
+        pool is still accepting submissions at this point, so teardown tasks
+        run on the threads that own the worker copies and their resources.
+        On abort the pool is closed without teardown (resources are already
+        in an undefined state).
+        """
+        if self._pool is not None and self._thread_worker is not None:
+            self._thread_worker.submit_teardown(self._pool)
+
     def _shutdown_backend(self, cancel_futures: bool = False) -> None:
         if self._pool is not None:
-            self._pool.shutdown(wait=False, cancel_futures=cancel_futures)
+            pool = self._pool
             self._pool = None
-            if self._thread_worker is not None:
-                self._thread_worker.teardown_all()
             self._thread_worker = None
+            pool.shutdown(wait=True, cancel_futures=cancel_futures)

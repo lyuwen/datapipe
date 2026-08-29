@@ -81,6 +81,18 @@ class CompiledPipeline:
             except Exception:  # noqa: BLE001
                 logger.exception("error during stage teardown")
 
+    def clone(self) -> "CompiledPipeline":
+        """Return a new CompiledPipeline with deep-copied stage instances.
+
+        ``copy.deepcopy`` gives each thread worker a fully independent copy of
+        every stage's construction-time state (nested dicts, lists, objects),
+        matching the isolation guarantee of process workers.  ``Stage.__deepcopy__``
+        handles non-copyable attributes such as ``threading.Lock`` by substituting
+        fresh equivalents so deepcopy never raises ``TypeError``.
+        """
+        import copy as _copy
+        return CompiledPipeline([_copy.deepcopy(s) for s in self.stages])
+
     def __repr__(self) -> str:
         return f"CompiledPipeline(stages={self.stages!r})"
 

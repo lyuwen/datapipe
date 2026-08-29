@@ -326,3 +326,73 @@ def test_immediate_progress_before_source_exhausted():
     )
     # With ordered=False, every completion produces exactly one progress tick.
     assert reporter.updates == 2000
+
+
+# ---------------------------------------------------------------------------
+# A1. Fatal source errors propagate for every executor and error policy
+# ---------------------------------------------------------------------------
+
+
+class _BrokenSource:
+    """Yields one record then raises OSError to simulate an I/O failure."""
+
+    def __iter__(self):
+        yield 0
+        raise OSError("read failed")
+
+
+def _identity(x):
+    return x
+
+
+@pytest.mark.parametrize("exec_cls", ALL_EXECUTORS)
+@pytest.mark.parametrize("policy", ["skip", "return"])
+def test_fatal_source_error_propagates_for_all_executors(exec_cls, policy):
+    """An OSError from the source iterator must propagate regardless of executor
+    or record-error policy — it is not a resumable per-record failure."""
+    exec_ = _make_executor(exec_cls)
+    with pytest.raises(OSError, match="read failed"):
+        Pipeline([TransformStage(_identity, name="id")]).run(
+            source=_BrokenSource(),
+            sink=ListSink(),
+            executor=exec_,
+            errors=policy,
+            progress=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# A2. KeyboardInterrupt from the source is never normalized to a record error
+# ---------------------------------------------------------------------------
+
+
+class _KeyboardInterruptSource:
+    """Raises KeyboardInterrupt immediately on the first next() call."""
+
+    def __iter__(self):
+        raise KeyboardInterrupt
+        yield  # make it a generator
+
+
+@pytest.mark.parametrize("exec_cls", [
+    pytest.param(ThreadExecutor, id="thread"),
+    pytest.param(ProcessExecutor, id="process"),
+])
+@pytest.mark.parametrize("policy", ["skip", "return"])
+def test_source_keyboard_interrupt_is_not_skipped(exec_cls, policy):
+    """KeyboardInterrupt from the source must propagate unchanged; it must
+    never be converted into a per-record error payload."""
+    sink = ListSink()
+    error_sink = ListSink()
+    with pytest.raises(KeyboardInterrupt):
+        Pipeline([TransformStage(lambda x: x, name="id")]).run(
+            source=_KeyboardInterruptSource(),
+            sink=sink,
+            executor=_make_executor(exec_cls),
+            errors=policy,
+            error_sink=error_sink,
+            progress=False,
+        )
+    # No records or error payloads must have been written.
+    assert sink.items == []
+    assert error_sink.items == []

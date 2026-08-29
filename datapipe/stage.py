@@ -8,11 +8,62 @@ inserts queues between stages.
 from __future__ import annotations
 
 import json as _json
+import threading
 from typing import Any, Callable
 
 from datapipe.context import WorkerContext
 from datapipe.errors import PipelineValidationError
 from datapipe.sentinels import DROP
+
+
+def _patch_memo_with_fresh_locks(obj, memo, _visiting=None):
+    """Walk ``obj`` and pre-insert fresh lock replacements into ``memo``.
+
+    When ``copy.deepcopy`` later encounters a lock anywhere in the object
+    graph it finds the replacement in memo and returns it without trying to
+    pickle the original.  Only lock objects are inserted; everything else is
+    left for deepcopy to handle normally.
+
+    Traverses: dicts (values), lists, tuples, sets, and objects — both
+    ``__dict__``-based and slot-only (``__slots__`` without ``__dict__``).
+    """
+    if _visiting is None:
+        _visiting = set()
+    oid = id(obj)
+    if oid in _visiting:
+        return
+    _visiting.add(oid)
+
+    _LOCK_TYPE = type(threading.Lock())
+    _RLOCK_TYPE = type(threading.RLock())
+
+    if isinstance(obj, _LOCK_TYPE):
+        memo[oid] = threading.Lock()
+    elif isinstance(obj, _RLOCK_TYPE):
+        memo[oid] = threading.RLock()
+    elif isinstance(obj, dict):
+        for k in obj.keys():
+            _patch_memo_with_fresh_locks(k, memo, _visiting)
+        for v in obj.values():
+            _patch_memo_with_fresh_locks(v, memo, _visiting)
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        for v in obj:
+            _patch_memo_with_fresh_locks(v, memo, _visiting)
+    else:
+        # Handle both __dict__-based and slot-only objects.
+        if hasattr(obj, "__dict__"):
+            for v in vars(obj).values():
+                _patch_memo_with_fresh_locks(v, memo, _visiting)
+        # Walk any __slots__ that are not already covered by __dict__.
+        for cls in type(obj).__mro__:
+            for slot in getattr(cls, "__slots__", ()):
+                if slot == "__dict__":
+                    continue
+                try:
+                    v = getattr(obj, slot)
+                except AttributeError:
+                    continue
+                _patch_memo_with_fresh_locks(v, memo, _visiting)
 
 
 class Stage:
@@ -24,10 +75,43 @@ class Stage:
 
     ``_name_explicit`` records whether ``name`` was user-provided; it is used
     by ``Pipeline`` to decide how strict duplicate-name validation should be.
+
+    ``__deepcopy__`` is overridden so that ``threading.Lock`` and
+    ``threading.RLock`` instances are replaced with fresh equivalents rather
+    than failing with ``TypeError: cannot pickle '_thread.lock'``.  This
+    allows ``CompiledPipeline.clone()`` to deep-copy a stage's construction-
+    time state (dicts, lists, nested objects) so each thread worker gets truly
+    isolated mutable state, matching the isolation guarantee of process workers.
     """
 
     name: str = "stage"
     _name_explicit: bool = False
+
+    def __deepcopy__(self, memo: dict) -> "Stage":
+        import copy as _copy
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        # Collect all instance attribute values from both __dict__ and __slots__
+        # across the MRO so that slot-only objects are handled correctly.
+        all_values: dict[str, Any] = {}
+        if hasattr(self, "__dict__"):
+            all_values.update(vars(self))
+        for klass in type(self).__mro__:
+            for slot in getattr(klass, "__slots__", ()):
+                if slot == "__dict__" or slot in all_values:
+                    continue
+                try:
+                    all_values[slot] = getattr(self, slot)
+                except AttributeError:
+                    continue
+        # Pre-seed memo with fresh lock replacements anywhere in the object
+        # graph so copy.deepcopy never encounters a non-picklable lock directly.
+        for v in all_values.values():
+            _patch_memo_with_fresh_locks(v, memo)
+        for k, v in all_values.items():
+            setattr(result, k, _copy.deepcopy(v, memo))
+        return result
 
     def setup(self, ctx: WorkerContext) -> None:
         """Initialize per-worker state once."""

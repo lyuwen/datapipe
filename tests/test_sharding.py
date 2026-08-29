@@ -91,3 +91,60 @@ def test_range_sharding_rank_out_of_range():
     s = RangeSharding(total=100)
     with pytest.raises(ShardingError):
         s.owns(seq=0, value=None, rank=5, world_size=4)
+
+
+# ---------------------------------------------------------------------------
+# A3. RangeSharding resolves source totals per run without mutating the strategy
+# ---------------------------------------------------------------------------
+
+
+def test_range_sharding_resolves_total_per_run():
+    """Reusing one RangeSharding() across two runs with different sources must
+    produce the correct partition for each run, and the strategy's total must
+    remain None (caller-owned) after both runs."""
+    from datapipe import (
+        GenericStage,
+        IterableSource,
+        ListSink,
+        Pipeline,
+        RuntimeContext,
+        SequentialExecutor,
+    )
+
+    sharding = RangeSharding()  # no explicit total
+
+    def _collect_all_ranks(source_range, world):
+        per_rank = []
+        for rank in range(world):
+            sink = ListSink()
+            Pipeline([GenericStage(process=lambda r: r, name="id")]).run(
+                source=IterableSource(source_range),
+                sink=sink,
+                executor=SequentialExecutor(),
+                runtime=RuntimeContext(rank=rank, world_size=world),
+                sharding=sharding,
+                progress=False,
+            )
+            per_rank.append(set(sink.items))
+        return per_rank
+
+    world = 3
+
+    # First run: range(4)
+    per_rank_4 = _collect_all_ranks(range(4), world)
+    union_4 = set().union(*per_rank_4)
+    assert union_4 == set(range(4)), f"first run union wrong: {union_4}"
+    for i in range(world):
+        for j in range(i + 1, world):
+            assert not (per_rank_4[i] & per_rank_4[j]), "first run: ranks overlap"
+
+    # Second run: range(8) — must not be contaminated by the first run's total
+    per_rank_8 = _collect_all_ranks(range(8), world)
+    union_8 = set().union(*per_rank_8)
+    assert union_8 == set(range(8)), f"second run union wrong: {union_8}"
+    for i in range(world):
+        for j in range(i + 1, world):
+            assert not (per_rank_8[i] & per_rank_8[j]), "second run: ranks overlap"
+
+    # The caller's strategy must be unmodified.
+    assert sharding.total is None, f"strategy was mutated: total={sharding.total}"
