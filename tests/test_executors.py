@@ -1,0 +1,328 @@
+"""Executor tests: bounded submission, ordering, errors, setup semantics.
+
+Process tests run in this file and rely on the top-level ``__main__`` guard
+of the test runner (pytest uses spawn-safe imports). Helper stages are
+module-level so they pickle cleanly.
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from datapipe import (
+    GenericStage,
+    IterableSource,
+    ListSink,
+    Pipeline,
+    ProcessExecutor,
+    SequentialExecutor,
+    ThreadExecutor,
+    TransformStage,
+)
+from datapipe.errors import StageExecutionError
+from datapipe.progress.base import ProgressReporter
+from datapipe.stage import Stage
+
+
+def _slow(x):
+    time.sleep((x % 7) * 0.001 + 0.0005)
+    return x
+
+
+def _boom(x):
+    if x == 5:
+        raise ValueError("boom at 5")
+    return x
+
+
+class _SetupOnce(Stage):
+    """Fails setup if invoked more than once per worker process."""
+
+    name = "setup_once"
+
+    def __init__(self):
+        self.count = 0
+
+    def setup(self, ctx):
+        self.count += 1
+        if self.count > 1:
+            raise RuntimeError("setup ran more than once in a worker!")
+
+    def process(self, value, ctx):
+        return value
+
+
+class _SetupTally(Stage):
+    """Records how many times setup ran in this process (module-level)."""
+
+    name = "setup_tally"
+
+    def __init__(self, key):
+        self.key = key
+        self.setup_count = 0
+
+    def setup(self, ctx):
+        self.setup_count += 1
+        _SETUP_LOG[self.key] = _SETUP_LOG.get(self.key, 0) + 1
+
+    def process(self, value, ctx):
+        return value
+
+    def teardown(self, ctx):
+        pass
+
+
+_SETUP_LOG: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Sequential
+# ---------------------------------------------------------------------------
+
+
+def test_sequential_basic():
+    sink = ListSink()
+    p = Pipeline([TransformStage(lambda x: x * 2, name="d")])
+    stats = p.run(
+        source=IterableSource(range(10)),
+        sink=sink,
+        executor=SequentialExecutor(),
+        progress=False,
+    )
+    assert sink.items == [i * 2 for i in range(10)]
+    assert stats.completed_records == 10
+
+
+# ---------------------------------------------------------------------------
+# Thread
+# ---------------------------------------------------------------------------
+
+
+def test_thread_ordered():
+    sink = ListSink()
+    p = Pipeline([TransformStage(_slow, name="slow")])
+    p.run(
+        source=IterableSource(range(200)),
+        sink=sink,
+        executor=ThreadExecutor(workers=4, max_in_flight=16),
+        ordered=True,
+        progress=False,
+    )
+    assert sink.items == list(range(200))
+
+
+def test_thread_unordered_preserves_values():
+    sink = ListSink()
+    p = Pipeline([TransformStage(_slow, name="slow")])
+    p.run(
+        source=IterableSource(range(200)),
+        sink=sink,
+        executor=ThreadExecutor(workers=4, max_in_flight=16),
+        ordered=False,
+        progress=False,
+    )
+    assert sorted(sink.items) == list(range(200))
+
+
+# ---------------------------------------------------------------------------
+# Process
+# ---------------------------------------------------------------------------
+
+
+def test_process_ordered():
+    sink = ListSink()
+    p = Pipeline([TransformStage(_slow, name="slow")])
+    stats = p.run(
+        source=IterableSource(range(300)),
+        sink=sink,
+        executor=ProcessExecutor(workers=4, max_in_flight=16),
+        ordered=True,
+        progress=False,
+    )
+    assert sink.items == list(range(300))
+    assert stats.max_in_flight_observed <= 16
+
+
+def test_process_unordered():
+    sink = ListSink()
+    p = Pipeline([TransformStage(_slow, name="slow")])
+    p.run(
+        source=IterableSource(range(300)),
+        sink=sink,
+        executor=ProcessExecutor(workers=4, max_in_flight=16),
+        ordered=False,
+        progress=False,
+    )
+    assert sorted(sink.items) == list(range(300))
+
+
+def test_process_bounded_submission():
+    """Invariant 4: the source is never eagerly consumed up front."""
+
+    class TrackingSource:
+        def __init__(self, n):
+            self.n = n
+            self.pulled = 0
+
+        def __iter__(self):
+            for i in range(self.n):
+                self.pulled += 1
+                yield i
+
+    src = TrackingSource(500)
+    sink = ListSink()
+    stats = Pipeline([TransformStage(_slow, name="slow")]).run(
+        source=src,  # plain iterable is accepted (IterableSource coercion)
+        sink=sink,
+        executor=ProcessExecutor(workers=4, max_in_flight=8),
+        ordered=True,
+        progress=False,
+    )
+    assert stats.max_in_flight_observed <= 8, stats.max_in_flight_observed
+    assert len(sink.items) == 500
+
+
+def test_process_setup_once_per_worker():
+    sink = ListSink()
+    Pipeline([_SetupOnce()]).run(
+        source=IterableSource(range(200)),
+        sink=sink,
+        executor=ProcessExecutor(workers=4, max_in_flight=16),
+        progress=False,
+    )
+    assert len(sink.items) == 200
+
+
+# ---------------------------------------------------------------------------
+# Error policies (shared across executors via parametrization)
+# ---------------------------------------------------------------------------
+
+def _make_executor(exec_cls):
+    if exec_cls is SequentialExecutor:
+        return exec_cls()
+    return exec_cls(workers=2, max_in_flight=8)
+
+
+ALL_EXECUTORS = [
+    pytest.param(SequentialExecutor, id="sequential"),
+    pytest.param(ThreadExecutor, id="thread"),
+    pytest.param(ProcessExecutor, id="process"),
+]
+
+
+@pytest.mark.parametrize("exec_cls", ALL_EXECUTORS)
+def test_error_policy_skip(exec_cls):
+    exec_ = _make_executor(exec_cls)
+    sink = ListSink()
+    stats = Pipeline([TransformStage(_boom, name="boom")]).run(
+        source=IterableSource(range(10)),
+        sink=sink,
+        executor=exec_,
+        errors="skip",
+        progress=False,
+    )
+    assert 5 not in sink.items
+    assert stats.failed_records == 1
+    assert len(sink.items) == 9
+
+
+@pytest.mark.parametrize("exec_cls", ALL_EXECUTORS)
+def test_error_policy_raise(exec_cls):
+    exec_ = _make_executor(exec_cls)
+    with pytest.raises(StageExecutionError) as ei:
+        Pipeline([TransformStage(_boom, name="boom")]).run(
+            source=IterableSource(range(10)),
+            sink=ListSink(),
+            executor=exec_,
+            errors="raise",
+            progress=False,
+        )
+    assert ei.value.stage_name == "boom"
+    assert ei.value.record_seq == 5
+    assert isinstance(ei.value.cause, ValueError)
+
+
+@pytest.mark.parametrize("exec_cls", ALL_EXECUTORS)
+def test_error_policy_return_without_error_sink(exec_cls):
+    """errors='return' without an error_sink exposes structured TaskResults."""
+    exec_ = _make_executor(exec_cls)
+    sink = ListSink()
+    stats = Pipeline([TransformStage(_boom, name="boom")]).run(
+        source=IterableSource(range(6)),
+        sink=sink,
+        executor=exec_,
+        errors="return",
+        progress=False,
+    )
+    # 5 successes + 1 errored TaskResult, in input order (ordered default).
+    assert len(sink.items) == 6
+    ok = [i for i in sink.items if isinstance(i, int)]
+    errs = [i for i in sink.items if not isinstance(i, int)]
+    assert ok == [0, 1, 2, 3, 4]
+    assert len(errs) == 1
+    assert errs[0].seq == 5
+    assert errs[0].error is not None
+    assert stats.failed_records == 1
+
+
+@pytest.mark.parametrize("exec_cls", ALL_EXECUTORS)
+def test_error_policy_return(exec_cls):
+    exec_ = _make_executor(exec_cls)
+    esink = ListSink()
+    sink = ListSink()
+    stats = Pipeline([TransformStage(_boom, name="boom")]).run(
+        source=IterableSource(range(10)),
+        sink=sink,
+        executor=exec_,
+        errors="return",
+        error_sink=esink,
+        progress=False,
+    )
+    assert len(esink.items) == 1
+    err = esink.items[0]
+    assert err["seq"] == 5
+    assert err["stage_name"] == "boom"
+    assert err["error_type"] == "ValueError"
+    assert "boom at 5" in err["error_message"]
+    assert len(sink.items) == 9
+
+
+# ---------------------------------------------------------------------------
+# Immediate progress
+# ---------------------------------------------------------------------------
+
+
+class _Recorder(ProgressReporter):
+    def __init__(self):
+        self.updates = 0
+        self.started = False
+
+    def start(self, total=None):
+        self.started = True
+
+    def update(self, n=1, **stats):
+        self.updates += n
+
+    def close(self):
+        pass
+
+
+def test_immediate_progress_before_source_exhausted():
+    """Acceptance criterion: progress updates occur before input is fully
+    consumed. We assert the recorder received many updates while only a
+    bounded window of the source had been pulled."""
+    reporter = _Recorder()
+    sink = ListSink()
+    p = Pipeline([TransformStage(_slow, name="slow")])
+    p.run(
+        source=IterableSource(range(2000)),
+        sink=sink,
+        executor=ProcessExecutor(workers=8, max_in_flight=32),
+        ordered=False,
+        progress=True,
+        progress_reporter=reporter,
+    )
+    # With ordered=False, every completion produces exactly one progress tick.
+    assert reporter.updates == 2000

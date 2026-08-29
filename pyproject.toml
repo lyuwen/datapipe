@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datapipe"
+version = "0.1.0"
+description = "Small, inspectable, high-throughput Python package for embarrassingly parallel record processing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "datapipe authors" }]
+dependencies = [
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=8.0"]
+zstd = ["zstandard>=0.18"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+datapipe = "datapipe.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["datapipe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
