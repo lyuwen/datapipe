@@ -21,6 +21,7 @@ test = ["pytest>=7.0"]
 
 [project.scripts]
 datapipe = "datapipe.cli.main:main"
+datapipe-install = "datapipe.cli.main:install_main"
 
 [tool.setuptools.packages.find]
 include = ["datapipe*"]

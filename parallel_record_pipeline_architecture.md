@@ -1,5 +1,12 @@
 # Parallel Record Pipeline: Package Architecture and Implementation Plan
 
+> **Scope:** foundational record-processing runtime and Python API. The
+> higher-level jq-like transform CLI, typed tool contracts, and installable
+> provider system are specified in
+> [`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md).
+> That plan is an extension over this runtime, not an alternative execution
+> architecture.
+
 ## 1. Purpose
 
 Build a small, inspectable, high-throughput Python package for embarrassingly parallel record processing.
@@ -1778,13 +1785,25 @@ datapipe run ./pipeline.py:pipeline
 
 by importing the module dynamically.
 
-This is preferable to encoding complex stage definitions directly on the command line.
+This remains the preferred mechanism for unrestricted or complex pipelines.
+The product-layer extension in
+[`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md)
+adds a deliberately limited jq-like expression language for common,
+configurable map operations. Expressions compile into ordinary `Stage` objects
+before execution; the Python pipeline API remains the escape hatch for logic
+outside that language.
 
-The CLI should execute a pipeline object, not construct a chain of shell pipes.
+Whether loaded from Python or compiled from an expression, the CLI should
+execute one complete pipeline object. It must not construct a chain of Unix
+processes or introduce stage-by-stage scheduling.
 
 ---
 
 # 26. CLI Design
+
+This section defines the foundational Python-pipeline launcher. The transform
+expression and tool-management commands that build on it are specified in
+[`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md).
 
 Initial commands:
 
@@ -1799,6 +1818,19 @@ Possible later:
 datapipe merge
 datapipe validate
 ```
+
+The product-layer extension adds a second authoring path while retaining these
+commands:
+
+```text
+datapipe transform
+datapipe tools install|validate|list|inspect|remove
+datapipe-install
+```
+
+`datapipe run` loads a Python-authored pipeline. `datapipe transform` compiles
+a validated expression into stages. Both paths must converge on the same
+`Pipeline.run` implementation and executor abstractions.
 
 ---
 
@@ -1881,7 +1913,8 @@ Also display whether objects appear pickleable if feasible.
 
 Do not make YAML configuration a core dependency initially.
 
-Python pipeline definitions are sufficient and much more flexible.
+Python pipeline definitions remain the authoritative unrestricted
+configuration mechanism and are more flexible than a declarative format.
 
 A later config layer may represent execution settings:
 
@@ -1898,9 +1931,15 @@ errors:
   output: errors.jsonl
 ```
 
-But stage logic should remain Python-native.
+Arbitrary stage logic should remain Python-native. Do not attempt to serialize
+the complete `Stage` API or arbitrary Python control flow into YAML.
 
-Avoid building a large declarative DSL unless there is a concrete need.
+A concrete need now exists for reusable nested-value transformations over
+streaming records. The intentionally bounded DSL in
+[`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md)
+addresses that use case through selectors and typed tools. It compiles to the
+Python-native stage model described here and must not grow into a second
+runtime, general DAG language, or complete replacement for Python pipelines.
 
 ---
 
@@ -2658,6 +2697,10 @@ No inter-rank communication is required.
 
 ## Phase 4: CLI
 
+This phase delivers the foundational Python-pipeline launcher. The subsequent
+product-layer CLI, expression compiler, and installable tool phases are defined
+in [`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md).
+
 Implement:
 
 ```text
@@ -2687,6 +2730,10 @@ Acceptance criteria:
 - CLI and Python API use the exact same internal runtime;
 - no alternate CLI-specific execution implementation;
 - pipeline inspection works without running data.
+
+These criteria also constrain the product-layer extension: an expression must
+compile into the same pipeline runtime rather than introduce a DSL-specific
+executor.
 
 ---
 
@@ -2910,9 +2957,15 @@ Pipeline([
 ])
 ```
 
-Do not model the CLI as Unix pipes between multiple `datapipe` processes.
+Do not model the CLI as Unix pipes between multiple `datapipe` processes. The
+`|` syntax in the jq-like extension is in-process expression composition, not
+an operating-system process boundary.
 
-The CLI should load one complete pipeline definition and launch one runtime.
+The CLI should obtain one complete pipeline definition—either by loading a
+Python object or compiling a validated transform expression—and launch one
+runtime. See
+[`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md) for
+the expression compilation boundary.
 
 Do not make SQL a mandatory dependency.
 
