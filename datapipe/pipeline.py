@@ -432,7 +432,7 @@ def _error_payload(result: TaskResult) -> dict:
         tb = "".join(
             traceback.format_exception(type(detail), detail, detail.__traceback__)
         )
-    return {
+    payload = {
         "seq": result.seq,
         "error_type": type(detail).__name__ if detail is not None else None,
         "error_message": str(detail) if detail is not None else None,
@@ -440,3 +440,28 @@ def _error_payload(result: TaskResult) -> dict:
         "stage_name": getattr(exc, "stage_name", None) if exc is not None else None,
         "metadata": result.metadata,
     }
+
+    # Preserve the structured tool fields when the failure came from a tool
+    # invocation (§11 of the CLI plan).  Everything here is JSON-serializable:
+    # the span becomes a 2-element list.
+    from datapipe.tools.errors import ToolExecutionError
+
+    if isinstance(detail, ToolExecutionError):
+        payload["tool"] = {
+            "invocation_index": detail.invocation_index,
+            "tool_name": detail.tool_name,
+            "provider_id": detail.provider_id,
+            "expression_span": (
+                list(detail.expression_span)
+                if detail.expression_span is not None
+                else None
+            ),
+            "selector": detail.selector,
+            "matched_path": detail.matched_path,
+            "match_ordinal": detail.match_ordinal,
+            "expected_type": detail.expected_type,
+            "actual_type": detail.actual_type,
+            "stage": detail.stage,
+        }
+
+    return payload

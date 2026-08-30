@@ -209,3 +209,67 @@ def _matches_json_type(value: Any, jt: JsonType) -> bool:  # noqa: C901 (intenti
 def matches(value: Any, spec: "JsonType | TypeSpec") -> bool:
     """Check *value* against a ``JsonType`` or ``TypeSpec``."""
     return as_type_spec(spec).matches(value)
+
+
+# ---------------------------------------------------------------------------
+# Type-name inference and human-readable descriptions (for diagnostics)
+# ---------------------------------------------------------------------------
+
+
+def infer_json_type(value: Any) -> "JsonType | None":
+    """Return the most specific ``JsonType`` describing *value*.
+
+    Returns the narrowest concrete member of the JSON type vocabulary:
+    ``NULL``, ``BOOLEAN``, ``INTEGER``, ``NUMBER`` (non-integer finite float),
+    ``STRING``, ``ARRAY``, or ``OBJECT``.  The umbrella types (``ANY``,
+    ``SCALAR``, ``CONTAINER``) are never returned because they are not
+    specific.
+
+    Returns ``None`` when *value* is not JSON-representable at all — an
+    arbitrary object, a set, or a non-finite float.  Callers rendering an
+    "actual type" for an error message should treat ``None`` as "unknown"
+    and fall back to the Python type name.
+
+    ``bool`` is checked before ``int`` because ``bool`` is an ``int`` subclass.
+    """
+    if value is None:
+        return JsonType.NULL
+    # bool must precede int: isinstance(True, int) is True.
+    if isinstance(value, bool):
+        return JsonType.BOOLEAN
+    if isinstance(value, int):
+        return JsonType.INTEGER
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            # Not representable in strict JSON.
+            return None
+        # A float holding an exact integral value is still a NUMBER, not an
+        # INTEGER: INTEGER is reserved for Python ints so that round-tripping
+        # through JSON preserves the distinction.
+        return JsonType.NUMBER
+    if isinstance(value, str):
+        return JsonType.STRING
+    if isinstance(value, list):
+        return JsonType.ARRAY
+    if isinstance(value, dict):
+        return JsonType.OBJECT
+    return None
+
+
+def describe(spec: "JsonType | TypeSpec") -> str:
+    """Return a human-readable type name for *spec*, for error messages.
+
+    A ``JsonType`` renders as its value (``"string"``).  A ``OneOf`` renders
+    its members joined with ``" | "`` (``"string | array | object"``).
+    """
+    if isinstance(spec, JsonType):
+        return spec.value
+    if isinstance(spec, _SimpleTypeSpec):
+        return spec.json_type.value
+    if isinstance(spec, OneOf):
+        return " | ".join(describe(m) for m in spec.members)
+    if isinstance(spec, TypeSpec):
+        # Unknown third-party TypeSpec subclass: fall back to its repr rather
+        # than raising, since this is only ever used to build a message.
+        return repr(spec)
+    raise TypeError(f"expected JsonType or TypeSpec, got {type(spec).__name__!r}")

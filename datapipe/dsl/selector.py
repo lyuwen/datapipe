@@ -61,6 +61,19 @@ class Reference:
         self.parent[self.key] = new_value
 
 
+def _render_part(part: "_ast.SelectorPart") -> str:
+    """Render a single selector part back to its source syntax."""
+    if isinstance(part, _ast.Field):
+        return f".{part.name}"
+    if isinstance(part, _ast.QuotedKey):
+        return f'["{part.key}"]'
+    if isinstance(part, _ast.Index):
+        return f"[{part.index}]"
+    if isinstance(part, _ast.Each):
+        return "[]"
+    return str(part)  # pragma: no cover — defensive
+
+
 class _RootSentinel:
     """Marker so we can distinguish a root reference from a None parent."""
     pass
@@ -79,6 +92,31 @@ class CompiledSelector:
     def __init__(self, selector: "_ast.Selector") -> None:
         self._parts = selector.parts
         self._is_root = selector.is_root
+
+    @property
+    def has_wildcard(self) -> bool:
+        """True when the selector contains a ``[]`` wildcard part."""
+        return any(isinstance(p, _ast.Each) for p in self._parts)
+
+    def render(self) -> str:
+        """Return the original selector text, e.g. ``.tools[].function``.
+
+        This is the single renderer for selector display; diagnostics and CLI
+        output both go through it so there is only one source of truth for the
+        surface syntax.
+        """
+        if self._is_root:
+            return "."
+        # ``Field`` renders its own leading dot (".tools"), so only a selector
+        # that opens with a bracket needs the leading dot added back — the
+        # source text for those is ".[0]" / '.["k"]' / ".[]".
+        body = "".join(_render_part(p) for p in self._parts)
+        if isinstance(self._parts[0], _ast.Field):
+            return body
+        return "." + body
+
+    def __repr__(self) -> str:
+        return f"CompiledSelector({self.render()!r})"
 
     def resolve(self, record: Any) -> list[Reference]:
         """Return a list of ``Reference`` objects for all selector matches.

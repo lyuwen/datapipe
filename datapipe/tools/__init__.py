@@ -8,7 +8,15 @@ Phase 1 — tool contracts and built-ins:
 Phase 2-4 (registry, installer, loader) — not yet implemented.
 """
 
-from datapipe.tools.types import JsonType, OneOf, TypeSpec, as_type_spec, matches
+from datapipe.tools.types import (
+    JsonType,
+    OneOf,
+    TypeSpec,
+    as_type_spec,
+    describe,
+    infer_json_type,
+    matches,
+)
 from datapipe.tools.contract import (
     Cardinality,
     ParameterSpec,
@@ -30,6 +38,8 @@ __all__ = [
     "OneOf",
     "TypeSpec",
     "as_type_spec",
+    "describe",
+    "infer_json_type",
     "matches",
     # Contract model
     "Cardinality",

@@ -165,7 +165,9 @@ def transform_command(args: "argparse.Namespace") -> int:
 
     # 3. Build the pipeline: JsonLoadStage + tool program + JsonDumpStage.
     try:
-        pipeline = _build_pipeline(compiled)
+        pipeline = _build_pipeline(
+            compiled, validate=getattr(args, "validate_tools", "always")
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"error building pipeline: {exc}", file=sys.stderr)
         return 1
@@ -223,7 +225,7 @@ def transform_command(args: "argparse.Namespace") -> int:
 # ---------------------------------------------------------------------------
 
 
-def _build_pipeline(compiled):
+def _build_pipeline(compiled, validate: str = "always"):
     """Wrap a compiled expression in a Pipeline with outer JSON stages."""
     from datapipe.pipeline import Pipeline
     from datapipe.stage import JsonDumpStage, JsonLoadStage
@@ -231,7 +233,7 @@ def _build_pipeline(compiled):
 
     return Pipeline([
         JsonLoadStage(),
-        CompiledToolProgramStage(compiled),
+        CompiledToolProgramStage(compiled, validate=validate),
         JsonDumpStage(),
     ])
 
@@ -241,27 +243,13 @@ def _print_compiled(compiled, expression: str) -> None:
     print(f"Expression: {expression!r}")
     print(f"Invocations: {len(compiled.invocations)}")
     for i, inv in enumerate(compiled.invocations):
-        sel_parts = inv.selector._parts  # type: ignore[attr-defined]
-        sel_str = "." + "".join(_part_str(p) for p in sel_parts) if sel_parts else "."
+        sel_str = inv.selector.render()
         args_str = (
             ", ".join(f"{k}={v!r}" for k, v in inv.arguments.items())
             if inv.arguments
             else "(defaults)"
         )
         print(f"  [{i}] {inv.tool_name}({sel_str})  args={args_str}")
-
-
-def _part_str(part) -> str:
-    from datapipe.dsl.ast import Each, Field, Index, QuotedKey
-    if isinstance(part, Field):
-        return f".{part.name}"
-    if isinstance(part, QuotedKey):
-        return f'["{part.key}"]'
-    if isinstance(part, Index):
-        return f"[{part.index}]"
-    if isinstance(part, Each):
-        return "[]"
-    return str(part)
 
 
 def _print_stats(stats) -> None:

@@ -153,6 +153,11 @@ class ToolInvocation:
         Fully bound configuration dict (defaults filled in).
     expression_index:
         Zero-based position of this invocation in the pipeline expression.
+    expression_span:
+        ``(start, end)`` character offsets of this invocation within the source
+        expression, for diagnostics.  Stored as a plain tuple rather than a
+        ``Span`` so it stays trivially pickleable.  Optional: ``None`` when the
+        invocation was constructed without span information.
     """
     tool_fn: Callable
     tool_name: str
@@ -160,6 +165,7 @@ class ToolInvocation:
     selector: CompiledSelector
     arguments: dict[str, Any]
     expression_index: int
+    expression_span: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +220,7 @@ def compile_expression(expression: str) -> CompiledExpression:
             selector=selector,
             arguments=arguments,
             expression_index=i,
+            expression_span=(inv_node.span.start, inv_node.span.end),
         ))
 
     return CompiledExpression(
