@@ -376,7 +376,7 @@ def _bind_arguments(
 _ANNOTATION_TYPES: dict[type, tuple[type, ...]] = {
     str:        (str,),
     int:        (int,),
-    float:      (float, int),   # int is a valid float literal
+    float:      (float,),   # bool and int literals are not valid float args
     bool:       (bool,),
     list:       (list,),
     dict:       (dict,),
@@ -393,8 +393,9 @@ def _validate_argument_type(
 ) -> None:
     """Raise ``ToolConfigurationError`` when *value* does not match *param*'s annotation.
 
-    Bool must be checked before int because ``bool`` is a subclass of ``int``
-    in Python, so ``isinstance(True, int)`` is True.
+    Bool must be checked before int/float because ``bool`` is a subclass of
+    both in Python, so ``isinstance(True, int)`` and ``isinstance(True, float)``
+    are both True.
     """
     annotation = param.annotation
     if annotation is None:
@@ -402,14 +403,14 @@ def _validate_argument_type(
 
     expected = _ANNOTATION_TYPES.get(annotation)
     if expected is None:
-        return  # unsupported annotation type → skip
+        return  # unsupported annotation type → skip (e.g. Optional, Union)
 
-    # Special-case bool: True/False must not be accepted where int is declared
-    # unless the annotation is explicitly bool.
-    if annotation is int and isinstance(value, bool):
+    # Special-case bool: True/False must not be accepted where int or float is
+    # declared — the caller likely meant a numeric literal, not a boolean.
+    if annotation in (int, float) and isinstance(value, bool):
         raise ToolConfigurationError(
-            f"argument {param.name!r} for {tool_name!r}: expected int, "
-            f"got bool ({value!r})",
+            f"argument {param.name!r} for {tool_name!r}: expected "
+            f"{annotation.__name__}, got bool ({value!r})",
             expression=expression,
             span=span,
         )

@@ -341,8 +341,18 @@ class Pipeline:
                 # Advance progress as records *complete*, not as they are
                 # emitted.  A slow record at position zero can otherwise make
                 # progress appear frozen while many later records have already
-                # finished.  Sink-emission still happens in order below.
-                reporter.update(1, errors=stats.failed_records)
+                # finished.  Sink-emission still happens in order below.  The
+                # structured counts distinguish processed (completed) from
+                # written (emitted) so a straggler shows processed climbing
+                # while written lags.
+                reporter.update(
+                    1,
+                    errors=stats.failed_records,
+                    processed=stats.completed_records,
+                    written=stats.output_records,
+                    buffered=len(ordered_buffer),
+                    failed=stats.failed_records,
+                )
                 while next_to_emit in ordered_buffer:
                     emit = ordered_buffer.pop(next_to_emit)
                     next_to_emit += 1

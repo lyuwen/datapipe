@@ -172,7 +172,12 @@ def as_type_spec(value: "JsonType | TypeSpec") -> TypeSpec:
 def _matches_json_type(value: Any, jt: JsonType) -> bool:  # noqa: C901 (intentional)
     """Return True when *value* matches *jt* according to JSON semantics."""
     if jt is JsonType.ANY:
-        return True
+        # Accept only JSON-representable values: None, bool, int (not bool),
+        # finite float, str, list, dict.  Sets, tuples, arbitrary objects, and
+        # non-finite floats are not JSON-representable and must be rejected so
+        # that tool output failures are attributed to the tool rather than
+        # surfacing later as a JsonDumpStage error.
+        return infer_json_type(value) is not None
     if jt is JsonType.NULL:
         return value is None
     if jt is JsonType.BOOLEAN:

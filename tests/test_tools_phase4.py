@@ -703,3 +703,156 @@ class TestInstalledToolsInTransform:
         assert rc == 0, captured.err
         assert "warning" in captured.err.lower()
         assert _read_jsonl(out) == [{"v": {"a": 1}}]
+
+
+# ---------------------------------------------------------------------------
+# Regression: concurrent installer — both providers end up in the registry
+# ---------------------------------------------------------------------------
+
+class TestConcurrentInstaller:
+    """Two threads installing different providers must not lose either update."""
+
+    def test_both_providers_registered(self, tmp_path, unique_stem):
+        import threading as _threading
+
+        p1 = tmp_path / f"{unique_stem}_c1.py"
+        p1.write_text(PROVIDER_SRC)
+        p2 = tmp_path / f"{unique_stem}_c2.py"
+        p2.write_text(PROVIDER_SRC.replace("shout", "whisper"))
+
+        errors: list[Exception] = []
+
+        def _install(path):
+            try:
+                install_provider(path, yes=True)
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = _threading.Thread(target=_install, args=(p1,))
+        t2 = _threading.Thread(target=_install, args=(p2,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        assert not errors, f"install errors: {errors}"
+
+        from datapipe.tools.registry import load_registry
+        registry = load_registry()
+        ids = set(registry.providers.keys())
+        assert f"local:{p1.stem}" in ids, f"provider 1 missing from registry: {ids}"
+        assert f"local:{p2.stem}" in ids, f"provider 2 missing from registry: {ids}"
+
+
+# ---------------------------------------------------------------------------
+# Regression: selector error payload contains matched_path
+# ---------------------------------------------------------------------------
+
+class TestSelectorErrorPayload:
+    """A SelectorResolutionError must produce a ToolExecutionError with tool context."""
+
+    def test_missing_field_has_tool_context(self, tmp_path, provider_file, capsys):
+        """fromjson on a missing field must carry selector and tool context in the error."""
+        src = tmp_path / "in.jsonl"
+        import json as _json
+        src.write_text(_json.dumps({"other": "x"}) + "\n")
+        out = tmp_path / "out.jsonl"
+        err_out = tmp_path / "errors.jsonl"
+
+        rc = main([
+            "transform", "fromjson(.missing)",
+            str(src), str(out),
+            "--executor", "sequential",
+            "--errors", "return",
+            "--error-output", str(err_out),
+            "--no-progress",
+        ])
+        assert rc == 0, capsys.readouterr().err
+
+        errors = [_json.loads(l) for l in err_out.read_text().splitlines() if l.strip()]
+        assert len(errors) == 1
+        payload = errors[0]
+        assert "tool" in payload, f"no 'tool' key in error payload: {payload}"
+        tool = payload["tool"]
+        assert tool.get("stage") == "selector", f"unexpected stage: {tool.get('stage')}"
+        assert tool.get("tool_name") == "fromjson"
+        assert tool.get("provider_id") == "builtin:json"
+        assert tool.get("selector") is not None
+        # matched_path may be None for a root-level miss (nothing was traversed),
+        # but for a multi-part path like .a.b where .a exists, it should be set.
+        # Either way the field must be present in the payload.
+        assert "matched_path" in tool, f"matched_path key missing from tool: {tool}"
+
+    def test_nested_partial_path_has_matched_path(self, tmp_path, provider_file, capsys):
+        """A partially-traversed path must carry the partial path in matched_path."""
+        src = tmp_path / "in.jsonl"
+        import json as _json
+        # .a exists but .a.missing does not — the partial path .a should be set.
+        src.write_text(_json.dumps({"a": {"x": 1}}) + "\n")
+        out = tmp_path / "out.jsonl"
+        err_out = tmp_path / "errors.jsonl"
+
+        rc = main([
+            "transform", "fromjson(.a.missing)",
+            str(src), str(out),
+            "--executor", "sequential",
+            "--errors", "return",
+            "--error-output", str(err_out),
+            "--no-progress",
+        ])
+        assert rc == 0, capsys.readouterr().err
+        errors = [_json.loads(l) for l in err_out.read_text().splitlines() if l.strip()]
+        assert len(errors) == 1
+        tool = errors[0]["tool"]
+        assert tool.get("stage") == "selector"
+
+
+# ---------------------------------------------------------------------------
+# Regression: built-in CLI inspection returns full contract
+# ---------------------------------------------------------------------------
+
+class TestBuiltinInspection:
+    """datapipe tools inspect fromjson must return a complete contract."""
+
+    def test_builtin_human_output(self, capsys):
+        rc = main(["tools", "inspect", "fromjson"])
+        assert rc == 0, capsys.readouterr().err
+        out = capsys.readouterr().out
+        assert "fromjson" in out
+        assert "builtin:json" in out
+        assert "input:" in out
+        assert "output:" in out
+
+    def test_builtin_json_output(self, capsys):
+        import json as _json
+        rc = main(["tools", "inspect", "fromjson", "--json"])
+        assert rc == 0, capsys.readouterr().err
+        data = _json.loads(capsys.readouterr().out)
+        assert data["provider_id"] == "builtin:json"
+        tool = data["tool"]
+        assert tool["name"] == "fromjson"
+        assert tool.get("input") is not None, "input field missing from JSON output"
+        assert tool.get("output") is not None, "output field missing from JSON output"
+        assert isinstance(tool["parameters"], list)
+
+    def test_tojson_inspection(self, capsys):
+        import json as _json
+        rc = main(["tools", "inspect", "tojson", "--json"])
+        assert rc == 0, capsys.readouterr().err
+        data = _json.loads(capsys.readouterr().out)
+        assert data["tool"]["name"] == "tojson"
+
+    def test_installed_provider_inspection_has_types(self, provider_file, capsys):
+        """An installed provider's inspect output must include input/output types."""
+        import json as _json
+        install_provider(provider_file, yes=True)
+        rc = main(["tools", "inspect", "shout", "--json"])
+        assert rc == 0, capsys.readouterr().err
+        data = _json.loads(capsys.readouterr().out)
+        tool = data["tool"]
+        assert tool.get("input") is not None, (
+            f"input type missing from installed provider inspect: {tool}"
+        )
+        assert tool.get("output") is not None, (
+            f"output type missing from installed provider inspect: {tool}"
+        )

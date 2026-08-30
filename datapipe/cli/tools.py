@@ -298,6 +298,10 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             print(f"target:        {tool_contract.get('target', '?')}")
             print(f"cardinality:   {tool_contract.get('cardinality', '?')}")
             print(f"deterministic: {tool_contract.get('deterministic', '?')}")
+            if tool_contract.get("input"):
+                print(f"input:         {tool_contract['input']}")
+            if tool_contract.get("output"):
+                print(f"output:        {tool_contract['output']}")
             desc = tool_contract.get("description", "")
             if desc:
                 print(f"description:   {desc}")

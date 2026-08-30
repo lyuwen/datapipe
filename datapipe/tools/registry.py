@@ -14,6 +14,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,14 +120,24 @@ def _registry_from_dict(d: dict) -> RegistryData:
 # ---------------------------------------------------------------------------
 
 def load_registry() -> RegistryData:
-    """Load the registry from disk; return an empty registry if absent."""
+    """Load the registry from disk; return an empty registry if absent.
+
+    Emits a warning to stderr when the file exists but cannot be parsed, so
+    the user knows the registry is being treated as empty rather than silently
+    losing all installed providers.
+    """
     path = _registry_path()
     if not path.exists():
         return RegistryData()
     try:
         text = path.read_text(encoding="utf-8")
         return _registry_from_dict(json.loads(text))
-    except (json.JSONDecodeError, KeyError, TypeError, OSError):
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
+        print(
+            f"warning: registry at {path} is corrupt or unreadable ({exc}); "
+            "treating as empty — reinstall providers if needed",
+            file=sys.stderr,
+        )
         return RegistryData()
 
 

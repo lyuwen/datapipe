@@ -82,13 +82,21 @@ class TestJsonTypeMatching:
         assert matches({"k": "v"}, JsonType.CONTAINER)
         assert not matches("str", JsonType.CONTAINER)
 
-    def test_any_matches_everything(self):
+    def test_any_matches_every_json_value(self):
         for v in [None, True, 1, 3.14, "s", [], {}]:
             assert matches(v, JsonType.ANY)
 
-    def test_any_does_not_match_non_finite(self):
-        # ANY does not imply JSON-serializable; matching is structural
-        assert matches(float("nan"), JsonType.ANY)
+    def test_any_rejects_non_json_representable(self):
+        # ANY means JSON-representable, not "any Python object".  Non-finite
+        # floats, sets, tuples, and arbitrary objects are not representable in
+        # strict JSON and must be rejected so a bad tool output is attributed
+        # to the tool rather than surfacing later in JsonDumpStage.
+        assert not matches(float("nan"), JsonType.ANY)
+        assert not matches(float("inf"), JsonType.ANY)
+        assert not matches(float("-inf"), JsonType.ANY)
+        assert not matches({1, 2, 3}, JsonType.ANY)
+        assert not matches((1, 2), JsonType.ANY)
+        assert not matches(object(), JsonType.ANY)
 
 
 class TestOneOf:

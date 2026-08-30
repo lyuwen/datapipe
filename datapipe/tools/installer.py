@@ -126,11 +126,16 @@ def install_provider(
     pdir = provider_dir(provider_id)
     pdir.mkdir(parents=True, exist_ok=True)
 
+    # Track which files we write so we can clean them up if the registry
+    # update fails (keeping installation transactional).
+    files_written: list[Path] = []
+
     if editable:
         source_path = str(path)
     else:
         dest = pdir / "source.py"
         dest.write_bytes(source_bytes)
+        files_written.append(dest)
         source_path = str(dest)
 
     # --- Build and register entry -------------------------------------------
@@ -165,8 +170,20 @@ def install_provider(
         ),
         encoding="utf-8",
     )
+    files_written.append(provider_json)
 
-    add_provider(entry)
+    try:
+        add_provider(entry)
+    except Exception:
+        # Registry update failed — clean up any files we just wrote so the
+        # provider directory does not contain orphaned partial state.
+        for f in files_written:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
     return entry
 
 

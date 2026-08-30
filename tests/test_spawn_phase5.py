@@ -423,3 +423,168 @@ class TestToolExecutionErrorUnderSpawn:
         # expression_span must be JSON-serializable (list or null, not a tuple)
         span = tool["expression_span"]
         assert span is None or isinstance(span, list)
+
+
+# ---------------------------------------------------------------------------
+# Two providers under spawn
+# ---------------------------------------------------------------------------
+
+_APPEND_SRC = '''\
+from datapipe.tools import tool, JsonType
+
+
+@tool(
+    name="append_tag",
+    target="value",
+    input=JsonType.STRING,
+    output=JsonType.STRING,
+    description="Append a tag string.",
+)
+def append_tag(value, *, tag: str = ":tagged") -> str:
+    return value + tag
+'''
+
+
+class TestTwoProvidersUnderSpawn:
+    """Two distinct copied providers must both work under spawn."""
+
+    def test_two_providers_in_same_run(
+        self, tmp_path, unique_stem, capsys
+    ):
+        """Expressions referencing two different providers must execute correctly."""
+        p1 = tmp_path / f"{unique_stem}_a.py"
+        p1.write_text(_SHOUT_SRC)
+        install_provider(p1, yes=True)
+
+        stem2 = f"{unique_stem}_b"
+        p2 = tmp_path / f"{stem2}.py"
+        p2.write_text(_APPEND_SRC)
+        install_provider(p2, yes=True)
+
+        src = tmp_path / "in.jsonl"
+        _write_jsonl(src, [{"msg": f"item{i}"} for i in range(12)])
+        out = tmp_path / "out.jsonl"
+
+        rc = main([
+            "transform", f"shout(.msg) | {stem2}.append_tag(.msg)",
+            str(src), str(out),
+            "--executor", "process",
+            "--workers", "3",
+            "--ordered",
+            "--no-progress",
+        ])
+        assert rc == 0, capsys.readouterr().err
+
+        rows = _read_jsonl(out)
+        assert len(rows) == 12
+        for i, row in enumerate(rows):
+            assert row["msg"].endswith(":tagged"), f"row {i}: {row}"
+            assert "ITEM" in row["msg"].upper(), f"row {i}: {row}"
+
+
+# ---------------------------------------------------------------------------
+# Sequential-then-process pipeline reuse
+# ---------------------------------------------------------------------------
+
+
+class TestSequentialThenProcessReuse:
+    """A pipeline that ran sequentially must work when reused with ProcessExecutor.
+
+    The fix: _resolved_fns is excluded from pickling via __getstate__ so live
+    provider callables never cross the spawn boundary after a first sequential run.
+    """
+
+    def test_reuse_after_sequential_run(
+        self, tmp_path, unique_stem, capsys
+    ):
+        """Run a provider tool sequentially, then rerun with process executor.
+
+        The simplest verification: use the CLI transform command twice with
+        different executor flags.  If _resolved_fns leaked into the pickle
+        payload, the second run would raise ModuleNotFoundError.
+        """
+        provider = tmp_path / f"{unique_stem}.py"
+        provider.write_text(_SHOUT_SRC)
+        install_provider(provider, yes=True)
+
+        src = tmp_path / "in.jsonl"
+        _write_jsonl(src, [{"msg": "hello"}])
+
+        # First run: sequential executor (populates _resolved_fns with live callables).
+        out1 = tmp_path / "out1.jsonl"
+        rc = main([
+            "transform", "shout(.msg)",
+            str(src), str(out1),
+            "--executor", "sequential",
+            "--no-progress",
+        ])
+        assert rc == 0, capsys.readouterr().err
+        assert _read_jsonl(out1)[0]["msg"] == "HELLO!"
+
+        # Second run: process executor — must not fail with ModuleNotFoundError.
+        _write_jsonl(src, [{"msg": "world"}])
+        out2 = tmp_path / "out2.jsonl"
+        rc = main([
+            "transform", "shout(.msg)",
+            str(src), str(out2),
+            "--executor", "process",
+            "--workers", "2",
+            "--no-progress",
+        ])
+        assert rc == 0, capsys.readouterr().err
+        assert _read_jsonl(out2)[0]["msg"] == "WORLD!", f"process run failed"
+
+
+# ---------------------------------------------------------------------------
+# Editable recompilation in the same process without manual cache clear
+# ---------------------------------------------------------------------------
+
+
+class TestEditableInProcessRecompilation:
+    """Editing an editable provider and recompiling in the same process picks
+    up the change without manually clearing any caches.
+
+    This relies on the (provider_id, sha256)-keyed loader cache: a new digest
+    produces a new cache entry, so the updated implementation is imported
+    automatically.
+    """
+
+    def test_edit_picked_up_without_manual_cache_clear(
+        self, tmp_path, unique_stem, capsys
+    ):
+        provider = tmp_path / f"{unique_stem}.py"
+        provider.write_text(_SHOUT_SRC)
+        install_provider(provider, editable=True, yes=True)
+
+        src = tmp_path / "in.jsonl"
+        _write_jsonl(src, [{"msg": "hello"}])
+
+        # First run: should produce "HELLO!" (single exclamation mark).
+        out1 = tmp_path / "out1.jsonl"
+        rc = main([
+            "transform", "shout(.msg)",
+            str(src), str(out1),
+            "--executor", "process",
+            "--workers", "2",
+            "--no-progress",
+        ])
+        assert rc == 0, capsys.readouterr().err
+        assert _read_jsonl(out1)[0]["msg"] == "HELLO!"
+
+        # Edit the provider on disk — NO manual cache clear.
+        provider.write_text(_SHOUT_V2_SRC)
+
+        # Second run: compiler re-reads the file, detects the new digest, and
+        # loads the updated implementation.
+        out2 = tmp_path / "out2.jsonl"
+        rc = main([
+            "transform", "shout(.msg)",
+            str(src), str(out2),
+            "--executor", "process",
+            "--workers", "2",
+            "--no-progress",
+        ])
+        assert rc == 0, capsys.readouterr().err
+        assert _read_jsonl(out2)[0]["msg"] == "HELLO!!", (
+            "edit was not picked up without manual cache clear"
+        )

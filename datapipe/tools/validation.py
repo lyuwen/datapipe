@@ -121,17 +121,36 @@ def validate_static(path: Path) -> bytes:
 # ---------------------------------------------------------------------------
 
 # The helper script that runs inside the subprocess.
+#
+# Provider stdout is redirected to /dev/null during import so that top-level
+# print() calls in the provider cannot corrupt the JSON protocol line.  Only
+# the final json.dumps() output reaches the coordinator via stdout; all other
+# provider output goes to stderr where it is captured and included in any
+# error message.
 _HELPER_TEMPLATE = """\
-import sys, json, importlib.util, pathlib, types
+import sys, json, importlib.util, pathlib, os
 
 provider_path = sys.argv[1]
 p = pathlib.Path(provider_path)
 sys.path.insert(0, str(p.parent))
 
-spec = importlib.util.spec_from_file_location(p.stem, str(p))
-mod = importlib.util.module_from_spec(spec)
-sys.modules[p.stem] = mod
-spec.loader.exec_module(mod)
+# Redirect provider stdout to /dev/null during import to prevent top-level
+# print() calls from corrupting the JSON protocol output.
+_real_stdout = sys.stdout
+sys.stdout = open(os.devnull, "w")
+try:
+    spec = importlib.util.spec_from_file_location(p.stem, str(p))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[p.stem] = mod
+    spec.loader.exec_module(mod)
+finally:
+    sys.stdout = _real_stdout
+
+try:
+    from datapipe.tools.types import describe as _describe
+except Exception:
+    def _describe(t):
+        return repr(t)
 
 tools = []
 for attr_name in dir(mod):
@@ -146,12 +165,20 @@ for attr_name in dir(mod):
             "default": ps.default,
             "required": ps.required,
         })
+    try:
+        input_type = _describe(contract.input_type)
+        output_type = _describe(contract.output_type)
+    except Exception:
+        input_type = None
+        output_type = None
     tools.append({
         "name": contract.name,
         "target": contract.target,
         "cardinality": contract.cardinality.value,
         "deterministic": contract.deterministic,
         "description": contract.description,
+        "input": input_type,
+        "output": output_type,
         "parameters": params,
     })
 

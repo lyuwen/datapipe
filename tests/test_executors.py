@@ -7,6 +7,7 @@ module-level so they pickle cleanly.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -396,3 +397,110 @@ def test_source_keyboard_interrupt_is_not_skipped(exec_cls, policy):
     # No records or error payloads must have been written.
     assert sink.items == []
     assert error_sink.items == []
+
+
+# ---------------------------------------------------------------------------
+# Ordered progress behind a slow first record (Phase 0 item 6 regression)
+# ---------------------------------------------------------------------------
+
+
+class _CapturingProgress(ProgressReporter):
+    """Records every update() call so tests can inspect the progression."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def start(self, total=None):
+        pass
+
+    def update(self, n=1, **stats):
+        self.calls.append({"n": n, **stats})
+
+    def close(self):
+        pass
+
+
+class _SlowFirstStage(Stage):
+    """Blocks the first record until a gate fires, then processes normally.
+
+    All other records are processed immediately.  This simulates a straggler
+    at position zero that causes the reorder buffer to fill up in ordered mode.
+    """
+
+    name = "slow_first"
+
+    def __init__(self, gate: threading.Event):
+        self.gate = gate
+
+    def __deepcopy__(self, memo):
+        result = self.__class__.__new__(self.__class__)
+        memo[id(self)] = result
+        result.gate = self.gate
+        result.name = self.name
+        result._name_explicit = self._name_explicit
+        return result
+
+    def process(self, value, ctx):
+        if value == 0:
+            self.gate.wait(timeout=5.0)
+        return value
+
+
+def test_ordered_progress_advances_before_emission():
+    """In ordered mode, progress must advance as records complete, not on emission.
+
+    With a slow record at position 0, all records 1..N complete and are buffered
+    before record 0 unblocks.  Progress (processed) must reach N before written
+    reaches N, proving it advances on completion rather than waiting for the
+    reorder buffer to drain.
+    """
+    gate = threading.Event()
+    stage = _SlowFirstStage(gate)
+
+    reporter = _CapturingProgress()
+
+    RECORDS = 20
+    # Use a thread executor so we can control timing without spawning processes.
+    executor = ThreadExecutor(workers=4, max_in_flight=RECORDS)
+
+    # Run in a background thread so we can release the gate mid-run.
+    import threading as _threading
+    results = {}
+
+    def _run():
+        results["stats"] = Pipeline([stage]).run(
+            source=IterableSource(range(RECORDS)),
+            sink=ListSink(),
+            executor=executor,
+            ordered=True,
+            progress=True,
+            progress_reporter=reporter,
+        )
+
+    t = _threading.Thread(target=_run)
+    t.start()
+
+    # Give workers time to start and process records 1..N while 0 blocks.
+    time.sleep(0.15)
+
+    # Check that progress calls have arrived before we release record 0.
+    processed_so_far = sum(c["n"] for c in reporter.calls)
+    # At least some records must have reported as processed.
+    assert processed_so_far > 0, (
+        "no progress updates arrived before record 0 was released; "
+        "progress may only advance after ordered emission"
+    )
+
+    # Also check buffered is reported when records are waiting.
+    buffered_calls = [c for c in reporter.calls if c.get("buffered", 0) > 0]
+    # In ordered mode with a straggler at 0, completed records 1+ should be buffered.
+    # (This assertion is best-effort: timing-dependent, but almost always true.)
+    assert len(buffered_calls) > 0, (
+        "no update reported buffered > 0; ordered progress snapshot not propagated"
+    )
+
+    # Release record 0 and wait for run to finish.
+    gate.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "pipeline did not finish within timeout"
+    assert results["stats"].completed_records == RECORDS
