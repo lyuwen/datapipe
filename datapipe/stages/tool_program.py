@@ -92,6 +92,25 @@ class CompiledToolProgramStage(Stage):
     def validate(self) -> str:
         return self._validate
 
+    def __getstate__(self) -> dict:
+        """Exclude resolved callables from pickling.
+
+        ``_resolved_fns`` holds live provider callables whose ``__module__``
+        is a synthetic loader name that does not exist in spawned worker
+        processes.  Workers resolve callables fresh in ``setup()``, so the
+        dict must be absent from the pickle payload.
+        """
+        state = self.__dict__.copy()
+        state["_resolved_fns"] = {}
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        # Ensure the dict exists even if this object was pickled before the
+        # attribute was introduced.
+        if "_resolved_fns" not in self.__dict__:
+            self._resolved_fns = {}
+
     def setup(self, ctx: WorkerContext) -> None:
         """Resolve provider callables once per worker before any records arrive."""
         self._resolve_all()
@@ -141,7 +160,7 @@ class CompiledToolProgramStage(Stage):
                     provider_id=_provider_id(inv),
                     expression_span=inv.expression_span,
                     selector=inv.selector.render(),
-                    matched_path=None,
+                    matched_path=exc.path if exc.path else None,
                     match_ordinal=None,
                     stage="selector",
                     cause=exc,

@@ -24,8 +24,11 @@ class ProviderLoadError(Exception):
     """Raised when a provider cannot be loaded or verified."""
 
 
-# Module-level cache: provider_id → {"module": ..., "tools": {name: fn}}
-_loaded_providers: dict[str, dict[str, Any]] = {}
+# Module-level cache: (provider_id, sha256) -> {"module": ..., "tools": {name: fn}}
+#
+# Keyed on (provider_id, digest) so editable providers with a changed digest get
+# a fresh import rather than returning the stale cached callable.
+_loaded_providers: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _module_name_for(provider_id: str) -> str:
@@ -51,8 +54,9 @@ def load_provider(descriptor: ProviderDescriptor) -> dict[str, Any]:
     Raises :class:`ProviderLoadError` when the source file cannot be read,
     the digest does not match, or no ``@tool``-decorated functions are found.
     """
-    if descriptor.provider_id in _loaded_providers:
-        return _loaded_providers[descriptor.provider_id]
+    cache_key = (descriptor.provider_id, descriptor.sha256)
+    if cache_key in _loaded_providers:
+        return _loaded_providers[cache_key]
 
     source_path = Path(descriptor.source_path)
 
@@ -118,7 +122,7 @@ def load_provider(descriptor: ProviderDescriptor) -> dict[str, Any]:
             tools[contract.name] = obj
 
     entry: dict[str, Any] = {"module": module, "tools": tools}
-    _loaded_providers[descriptor.provider_id] = entry
+    _loaded_providers[cache_key] = entry
     return entry
 
 
