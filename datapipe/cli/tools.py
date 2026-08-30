@@ -218,6 +218,53 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
                 print()
         return 0
 
+    # Check built-in tools first so they are always inspectable.
+    _BUILTIN_TOOL_NAMES = {"fromjson", "tojson"}
+    if name in _BUILTIN_TOOL_NAMES:
+        from datapipe.tools.decorator import get_contract
+        from datapipe.tools.builtins.json import fromjson, tojson
+        _builtins = {"fromjson": fromjson, "tojson": tojson}
+        fn = _builtins[name]
+        contract = get_contract(fn)
+        if contract is None:
+            print(f"error: built-in {name!r} has no contract", file=sys.stderr)
+            return 1
+        from datapipe.tools.types import describe
+        data_tool: dict = {
+            "provider_id": "builtin:json",
+            "tool": {
+                "name": contract.name,
+                "target": contract.target,
+                "cardinality": contract.cardinality.value,
+                "deterministic": contract.deterministic,
+                "description": contract.description,
+                "input": describe(contract.input_type),
+                "output": describe(contract.output_type),
+                "parameters": [
+                    {"name": p.name, "default": p.default, "required": p.required}
+                    for p in contract.parameters
+                ],
+            },
+        }
+        if as_json:
+            print(json.dumps(data_tool, indent=2))
+        else:
+            t = data_tool["tool"]
+            print(f"tool:          {t['name']}")
+            print(f"provider:      builtin:json")
+            print(f"target:        {t['target']}")
+            print(f"cardinality:   {t['cardinality']}")
+            print(f"deterministic: {t['deterministic']}")
+            print(f"input:         {t['input']}")
+            print(f"output:        {t['output']}")
+            if t.get("description"):
+                print(f"description:   {t['description']}")
+            if t["parameters"]:
+                print("parameters:")
+                for p in t["parameters"]:
+                    print(f"  {p['name']} (default={p['default']!r})")
+        return 0
+
     # Try as provider_id first, then as alias, then as tool name.
     entry = registry.providers.get(name)
     if entry is None:
@@ -242,9 +289,9 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         return 1
 
     if tool_contract is not None:
-        data: dict = {"provider_id": entry.provider_id, "tool": tool_contract}
+        data_tc: dict = {"provider_id": entry.provider_id, "tool": tool_contract}
         if as_json:
-            print(json.dumps(data, indent=2))
+            print(json.dumps(data_tc, indent=2))
         else:
             print(f"tool:          {tool_contract.get('name', name)}")
             print(f"provider:      {entry.provider_id}")
@@ -261,7 +308,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
                     print(f"  {p['name']} (default={p['default']!r})")
         return 0
 
-    data = {
+    data_p: dict = {
         "provider_id": entry.provider_id,
         "alias": entry.alias,
         "mode": entry.mode,
@@ -272,7 +319,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         "tools": entry.tools,
     }
     if as_json:
-        print(json.dumps(data, indent=2))
+        print(json.dumps(data_p, indent=2))
     else:
         print(f"provider_id:   {entry.provider_id}")
         print(f"alias:         {entry.alias}")

@@ -338,10 +338,15 @@ class Pipeline:
                 stats.max_reorder_buffer_observed = max(
                     stats.max_reorder_buffer_observed, len(ordered_buffer)
                 )
+                # Advance progress as records *complete*, not as they are
+                # emitted.  A slow record at position zero can otherwise make
+                # progress appear frozen while many later records have already
+                # finished.  Sink-emission still happens in order below.
+                reporter.update(1, errors=stats.failed_records)
                 while next_to_emit in ordered_buffer:
                     emit = ordered_buffer.pop(next_to_emit)
                     next_to_emit += 1
-                    self._emit(emit, sink, stats, config, reporter)
+                    self._emit(emit, sink, stats, config, reporter=None)
             else:
                 self._emit(result, sink, stats, config, reporter)
 
@@ -373,18 +378,23 @@ class Pipeline:
         sink: Sink,
         stats: ExecutionStats,
         config: RunConfig,
-        reporter: ProgressReporter,
+        reporter: ProgressReporter | None,
     ) -> None:
         """Write one result per policy.
 
         ``errors == "raise"`` is never routed here (aborts in ``on_result``).
         For ``errors in ("skip", "return")``, error results reach this point
         at their sequence position (ordered mode) or immediately (unordered).
+        Pass ``reporter=None`` when the caller has already updated progress
+        (ordered mode: progress is updated on completion, not on emission).
         """
+        def _report(n: int) -> None:
+            if reporter is not None:
+                reporter.update(n, errors=stats.failed_records)
+
         if result.error is not None:
             if config.errors == "skip":
-                # Failed records are counted and omitted.
-                reporter.update(1, errors=stats.failed_records)
+                _report(1)
                 return
             # errors == "return": deliver to error_sink if given, else expose
             # the structured TaskResult to the main sink.
@@ -393,15 +403,15 @@ class Pipeline:
             else:
                 sink.write(result)
             stats.output_records += 1
-            reporter.update(1, errors=stats.failed_records)
+            _report(1)
             return
         if result.dropped:
             stats.dropped_records += 1
-            reporter.update(1, errors=stats.failed_records)
+            _report(1)
             return
         sink.write(result.value)
         stats.output_records += 1
-        reporter.update(1, errors=stats.failed_records)
+        _report(1)
 
     def _raise_result(self, result: TaskResult) -> None:
         """Raise the wrapped error (with stage attribution)."""

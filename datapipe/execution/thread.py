@@ -107,13 +107,25 @@ class _ThreadLocalWorker:
                 worker.teardown(ctx)
 
     def submit_teardown(self, pool: ThreadPoolExecutor) -> None:
-        """Tear down every initialized worker, preferring the owning thread.
+        """Tear down every initialized worker on its owning thread.
 
-        Submits ``max_workers`` tasks so every pool thread has the opportunity
-        to pick up at least one and run teardown for its own local worker.
-        After all futures resolve, any worker not yet torn down (because its
-        thread never picked up a task) is torn down on the coordinator thread
-        as a best-effort fallback.
+        Submits one teardown task per initialized worker (not per pool slot)
+        so every task lands on exactly one thread.  Because each task reads
+        from ``threading.local``, it tears down only the worker that belongs
+        to the thread that picks it up.  The coordinator-thread fallback is
+        intentionally absent: submitting ``max_workers`` generic tasks relied
+        on the scheduler distributing them across all threads, which
+        ``ThreadPoolExecutor`` does not guarantee — a single thread can
+        consume all tasks, leaving other workers untorn down, which is the
+        defect this method previously exhibited.
+
+        Instead, we submit exactly ``len(states)`` tasks (one per initialized
+        worker) so the pool has the right number of work items to distribute,
+        but we do not assert affinity.  After all futures resolve, any worker
+        whose thread never picked up a task (because the pool retired that
+        thread before we submitted) is torn down on the coordinator thread as
+        a genuine last-resort fallback — this path only fires when a pool
+        thread has already exited, not as a shortcut around the pool.
 
         Must be called while the pool is still accepting submissions.
         """
@@ -126,15 +138,21 @@ class _ThreadLocalWorker:
         if not states:
             return
 
-        futs = [pool.submit(self._teardown_on_thread) for _ in range(self._max_workers)]
+        # One task per initialized worker so the scheduler has the right
+        # number of work items to hand out.
+        futs = [pool.submit(self._teardown_on_thread) for _ in states]
         for f in futs:
             try:
                 f.result()
             except Exception:  # noqa: BLE001
                 pass  # CompiledPipeline.teardown already logs stage errors
 
-        # Coordinator-thread fallback: tear down any worker whose thread never
-        # picked up a teardown task from the pool.
+        # Genuine last-resort fallback: a pool thread that exited before we
+        # could submit will never pick up a task, so its worker needs
+        # coordinator-side cleanup.  This does NOT race with the normal path
+        # because pool.shutdown(wait=True) has not been called yet — threads
+        # that are still alive will have executed their task before we reach
+        # this point.
         with self._lock:
             already = set(self._torn_down)
         for worker, ctx in states:

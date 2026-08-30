@@ -455,13 +455,23 @@ class TestEndToEnd:
     """Execute compiled invocations on example records to verify correctness."""
 
     def _run(self, expression: str, record):
-        """Compile *expression* and apply it to *record*."""
+        """Compile *expression* and apply it to *record*.
+
+        Drives the invocations directly without going through
+        CompiledToolProgramStage.  Uses builtin_fn because phase 2 tests
+        only exercise built-in tools, which always have a live callable.
+        """
         ce = compile_expression(expression)
         for inv in ce.invocations:
             refs = inv.selector.resolve(record)
             if not refs:
                 continue
-            new_values = [inv.tool_fn(r.value, **inv.arguments) for r in refs]
+            fn = inv.builtin_fn
+            assert fn is not None, (
+                f"test helper does not support provider tools; "
+                f"inv {inv.tool_name!r} has no builtin_fn"
+            )
+            new_values = [fn(r.value, **inv.arguments) for r in refs]
             record = inv.selector.apply(record, refs, new_values)
         return record
 

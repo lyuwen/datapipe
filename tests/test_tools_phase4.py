@@ -411,16 +411,55 @@ class TestLoader:
         with pytest.raises(ProviderLoadError, match="digest"):
             load_provider(_descriptor_for(entry))
 
-    def test_editable_ignores_digest_and_reloads(self, provider_file):
-        """Editable mode must pick up edits; enforcing the digest would break it."""
+    def test_editable_reloads_when_descriptor_has_current_digest(self, provider_file):
+        """Editable mode picks up edits when the descriptor carries the current digest.
+
+        The compiler refreshes the digest on every expression compilation (§7.5
+        of the plan) and embeds the *current* hash in the descriptor.  The test
+        simulates that by computing the current digest after the edit and passing
+        it to the loader, matching what the compiler would produce.
+        """
+        import hashlib as _hashlib
         entry = install_provider(provider_file, editable=True, yes=True)
+        new_src = PROVIDER_SRC.replace("value.upper() + suffix", "value.lower() + suffix")
+        provider_file.write_text(new_src)
+
+        from datapipe.tools import loader as _loader
+        _loader._loaded_providers.clear()
+
+        # Build a descriptor with the current (post-edit) digest, as the
+        # compiler would after re-reading the file.
+        current_digest = "sha256:" + _hashlib.sha256(new_src.encode()).hexdigest()
+        from datapipe.tools.descriptor import ProviderDescriptor
+        fresh_desc = ProviderDescriptor(
+            provider_id=entry.provider_id,
+            alias=entry.alias,
+            mode=entry.mode,
+            source_path=entry.source_path,
+            sha256=current_digest,
+            api_version=entry.datapipe_api,
+        )
+        fn = resolve_tool(fresh_desc, "shout")
+        assert fn("ABC") == "abc!", "editable provider did not reload after edit"
+
+    def test_editable_stale_digest_raises(self, provider_file):
+        """If the file changed since compilation, workers must reject the stale digest.
+
+        This is the protection against a file edited between compilation time
+        and worker startup: the descriptor carries the compilation-time hash,
+        the worker reads the now-different bytes, and the mismatch aborts the run.
+        """
+        entry = install_provider(provider_file, editable=True, yes=True)
+        # Simulate a file change after compilation: rewrite the file but keep
+        # the descriptor pointing at the install-time digest.
         provider_file.write_text(
             PROVIDER_SRC.replace("value.upper() + suffix", "value.lower() + suffix")
         )
         from datapipe.tools import loader as _loader
         _loader._loaded_providers.clear()
-        fn = resolve_tool(_descriptor_for(entry), "shout")
-        assert fn("ABC") == "abc!", "editable provider did not reload after edit"
+        # Descriptor still has the old (install-time) digest.
+        with pytest.raises(ProviderLoadError, match="digest"):
+            load_provider(_descriptor_for(entry))
 
     def test_missing_source_raises(self, provider_file):
         entry = install_provider(provider_file, editable=True, yes=True)

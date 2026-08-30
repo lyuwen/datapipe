@@ -179,19 +179,92 @@ def list_providers() -> list[ProviderEntry]:
 
 
 def add_provider(entry: ProviderEntry) -> None:
-    """Add or replace *entry* in the registry atomically."""
-    data = load_registry()
-    data.providers[entry.provider_id] = entry
-    save_registry(data)
+    """Add or replace *entry* in the registry atomically.
+
+    The read-modify-write is performed entirely inside the exclusive file lock
+    so two concurrent installers cannot each read the same old registry and
+    then silently overwrite each other's update.
+    """
+    reg_path = _registry_path()
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = reg_path.with_suffix(".lock")
+
+    with open(lock_path, "a", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            # Read while holding the lock so no concurrent writer can sneak in.
+            if reg_path.exists():
+                try:
+                    text = reg_path.read_text(encoding="utf-8")
+                    data = _registry_from_dict(json.loads(text))
+                except (json.JSONDecodeError, KeyError, TypeError, OSError):
+                    data = RegistryData()
+            else:
+                data = RegistryData()
+
+            data.providers[entry.provider_id] = entry
+            payload = json.dumps(_registry_to_dict(data), indent=2, ensure_ascii=False)
+
+            fd, tmp_path = tempfile.mkstemp(
+                dir=reg_path.parent, prefix=".registry-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, reg_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
 
 def remove_provider(provider_id: str) -> None:
     """Remove *provider_id* from the registry atomically.
 
+    The read-modify-write is performed entirely inside the exclusive file lock.
     Raises ``KeyError`` if the provider is not installed.
     """
-    data = load_registry()
-    if provider_id not in data.providers:
-        raise KeyError(provider_id)
-    del data.providers[provider_id]
-    save_registry(data)
+    reg_path = _registry_path()
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = reg_path.with_suffix(".lock")
+
+    with open(lock_path, "a", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            if reg_path.exists():
+                try:
+                    text = reg_path.read_text(encoding="utf-8")
+                    data = _registry_from_dict(json.loads(text))
+                except (json.JSONDecodeError, KeyError, TypeError, OSError):
+                    data = RegistryData()
+            else:
+                data = RegistryData()
+
+            if provider_id not in data.providers:
+                raise KeyError(provider_id)
+            del data.providers[provider_id]
+            payload = json.dumps(_registry_to_dict(data), indent=2, ensure_ascii=False)
+
+            fd, tmp_path = tempfile.mkstemp(
+                dir=reg_path.parent, prefix=".registry-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, reg_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)

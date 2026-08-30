@@ -354,12 +354,18 @@ def phase5_bad_output(value):
 
 
 def _manual_expression(fn, selector_expr: str, source: str) -> CompiledExpression:
-    """Build a CompiledExpression around *fn*, bypassing the name registry."""
+    """Build a CompiledExpression around *fn*, bypassing the name registry.
+
+    Uses builtin_fn because test probes are plain @tool-decorated functions
+    that live in the test module and do not need worker-side descriptor
+    resolution.
+    """
     reference = compile_expression(f"fromjson({selector_expr})")
     template = reference.invocations[0]
     contract = get_contract(fn)
     inv = ToolInvocation(
-        tool_fn=fn,
+        tool_descriptor=None,
+        builtin_fn=fn,
         tool_name=contract.name,
         contract=contract,
         selector=template.selector,
@@ -684,10 +690,11 @@ class TestExpressionSpan:
         assert expr[spans[1][0]:spans[1][1]] == "tojson(.b)"
 
     def test_defaults_to_none_when_omitted(self):
-        # Existing constructor calls without the new field must keep working.
+        # Existing constructor calls without the expression_span field must keep working.
         template = compile_expression("fromjson(.v)").invocations[0]
         inv = ToolInvocation(
-            tool_fn=template.tool_fn,
+            tool_descriptor=template.tool_descriptor,
+            builtin_fn=template.builtin_fn,
             tool_name=template.tool_name,
             contract=template.contract,
             selector=template.selector,

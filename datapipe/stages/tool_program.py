@@ -1,30 +1,32 @@
 """CompiledToolProgramStage: a Stage that executes a compiled DSL expression.
 
 This is the bridge between the DSL compiler and the datapipe execution engine.
-A compiled expression is stored in this stage; ``setup()`` is a no-op (tools
-are simple functions in Phase 1), and ``process()`` executes the expression
-against each record.
+A compiled expression is stored in this stage; ``setup()`` resolves per-worker
+callables from ``ToolDescriptor`` objects for installed providers and stores
+them in ``self._resolved_fns``.  ``process()`` uses those resolved callables.
 
-The stage is pickleable — it holds a ``CompiledExpression`` which contains
-only frozen dataclasses and callables decorated with ``@tool``.  Worker
-processes receive the compiled stage and resolve tool functions from it
-without re-running the compiler.
+Provider callables cannot be pickled across ``spawn`` process boundaries
+because their ``__module__`` is a synthetic name that does not exist in worker
+processes.  Only the ``ToolDescriptor`` (a frozen dataclass of primitives)
+crosses the boundary; workers import the provider source and extract the
+callable in ``setup()``.
 
 Architecture (§10 of the CLI plan)
 -------------------------------------
-  setup(ctx)    — no-op for function tools in Phase 1
+  setup(ctx)    — resolve provider callables per worker; no-op for built-ins
   process(value, ctx)
       for each invocation:
+          look up resolved callable
           resolve selector references
           call tool function with bound configuration
           replace selected values
       return updated record
-  teardown(ctx) — no-op for function tools in Phase 1
+  teardown(ctx) — no-op
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from datapipe.context import WorkerContext
 from datapipe.dsl.compiler import CompiledExpression, ToolInvocation
@@ -78,6 +80,10 @@ class CompiledToolProgramStage(Stage):
         # the provider's contract, not a global budget, and keeping it local
         # avoids any cross-worker coordination.
         self._validated_records = 0
+        # Resolved callables keyed by expression_index, populated in setup().
+        # Built-in callables come straight from the ToolInvocation; provider
+        # callables are resolved here from the ToolDescriptor.
+        self._resolved_fns: dict[int, Callable] = {}
         # Truncate long expressions for the stage name.
         self.name = name or _short_name(compiled.source)
         self._name_explicit = name is not None
@@ -86,8 +92,35 @@ class CompiledToolProgramStage(Stage):
     def validate(self) -> str:
         return self._validate
 
+    def setup(self, ctx: WorkerContext) -> None:
+        """Resolve provider callables once per worker before any records arrive."""
+        self._resolve_all()
+
+    def _resolve_all(self) -> None:
+        """Resolve all tool callables into ``_resolved_fns`` if not already done."""
+        if len(self._resolved_fns) == len(self._compiled.invocations):
+            return  # already resolved (e.g. called twice or setup() was explicit)
+        from datapipe.tools.loader import resolve_tool
+        for inv in self._compiled.invocations:
+            if inv.expression_index in self._resolved_fns:
+                continue
+            if inv.tool_descriptor is not None:
+                fn = resolve_tool(inv.tool_descriptor.provider, inv.tool_descriptor.tool_name)
+            else:
+                assert inv.builtin_fn is not None, (
+                    f"ToolInvocation {inv.tool_name!r}: both tool_descriptor and "
+                    "builtin_fn are None — exactly one must be set"
+                )
+                fn = inv.builtin_fn
+            self._resolved_fns[inv.expression_index] = fn
+
     def process(self, value: Any, ctx: WorkerContext) -> Any:
         """Execute all invocations in sequence against *value*."""
+        # Lazy resolution: if setup() was not called (e.g. sequential executor
+        # or direct stage usage in tests), resolve on the first process() call.
+        if len(self._resolved_fns) < len(self._compiled.invocations):
+            self._resolve_all()
+
         record = value
         record_seq = ctx.record_index if ctx is not None else None
 
@@ -96,7 +129,24 @@ class CompiledToolProgramStage(Stage):
             self._validated_records += 1
 
         for inv in self._compiled.invocations:
-            refs = inv.selector.resolve(record)
+            tool_fn = self._resolved_fns[inv.expression_index]
+
+            try:
+                refs = inv.selector.resolve(record)
+            except SelectorResolutionError as exc:
+                raise ToolExecutionError(
+                    record_seq=record_seq,
+                    invocation_index=inv.expression_index,
+                    tool_name=inv.tool_name,
+                    provider_id=_provider_id(inv),
+                    expression_span=inv.expression_span,
+                    selector=inv.selector.render(),
+                    matched_path=None,
+                    match_ordinal=None,
+                    stage="selector",
+                    cause=exc,
+                ) from exc
+
             if not refs:
                 # Zero matches from an empty wildcard — no-op.
                 continue
@@ -121,7 +171,7 @@ class CompiledToolProgramStage(Stage):
                     )
 
                 try:
-                    result = inv.tool_fn(ref.value, **inv.arguments)
+                    result = tool_fn(ref.value, **inv.arguments)
                 except ToolExecutionError:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -203,14 +253,11 @@ _BUILTIN_JSON_MODULE = "datapipe.tools.builtins.json"
 
 
 def _provider_id(inv: ToolInvocation) -> str:
-    """Return the provider identity string for *inv*.
-
-    ``ToolInvocation`` does not carry a provider descriptor yet, so the value
-    is derived from the tool function's defining module.  Kept in one place so
-    it can be replaced with a real descriptor lookup once provider identity is
-    threaded through the compiler.
-    """
-    module = getattr(inv.tool_fn, "__module__", None) or "<unknown>"
+    """Return the provider identity string for *inv*."""
+    if inv.tool_descriptor is not None:
+        return inv.tool_descriptor.provider.provider_id
+    # Built-in or test-local callable stored directly in builtin_fn.
+    module = getattr(inv.builtin_fn, "__module__", None) or "<unknown>"
     if module == _BUILTIN_JSON_MODULE:
         return "builtin:json"
     return f"provider:{module}"

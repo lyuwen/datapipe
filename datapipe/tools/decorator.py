@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import typing
 from typing import Any, Callable
 
 from datapipe.tools.contract import (
@@ -124,6 +125,13 @@ def _validate_signature(
     sig = inspect.signature(fn)
     params = list(sig.parameters.values())
 
+    # Resolve string annotations (PEP 563 / from __future__ import annotations)
+    # so that ParameterSpec.annotation holds the actual type object, not a string.
+    try:
+        hints = typing.get_type_hints(fn)
+    except Exception:  # noqa: BLE001
+        hints = {}
+
     if not params:
         raise ToolDecoratorError(
             f"tool {tool_name!r}: function must have at least one positional "
@@ -179,11 +187,12 @@ def _validate_signature(
                 "JSON-serializable defaults in Phase 1"
             )
         _validate_default(p.default, p.name, tool_name)
-        annotation = (
-            p.annotation
-            if p.annotation is not inspect.Parameter.empty
-            else None
-        )
+        # Use the resolved type hint when available; fall back to the raw
+        # annotation from inspect (which may be a string if PEP 563 is active)
+        # or None when no annotation is present at all.
+        annotation = hints.get(p.name)
+        if annotation is None and p.annotation is not inspect.Parameter.empty:
+            annotation = p.annotation  # keep as-is (string or type)
         param_specs.append(
             ParameterSpec(
                 name=p.name,

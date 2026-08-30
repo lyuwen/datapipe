@@ -11,20 +11,23 @@ Compilation is a sequence of explicit passes (§9 of the CLI plan):
   7. Produce ``ToolInvocation`` descriptors.
 
 The output is a ``CompiledExpression`` containing a list of ``ToolInvocation``
-instances, each holding a reference to the tool function, the compiled
-selector, and the bound configuration.  These are then passed to
-``CompiledToolProgramStage`` for execution.
+instances.  Built-in tools carry the live callable directly (they live in a
+proper importable module and pickle fine under spawn).  Provider tools carry
+a ``ToolDescriptor`` instead; ``CompiledToolProgramStage.setup()`` resolves
+the callable per-worker so that only pickleable primitives cross the process
+boundary.
 """
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from datapipe.dsl import ast as _ast
 from datapipe.dsl.errors import (
-    ExpressionSyntaxError,
     Span,
     ToolConfigurationError,
     ToolResolutionError,
@@ -33,6 +36,7 @@ from datapipe.dsl.parser import parse
 from datapipe.dsl.selector import CompiledSelector
 from datapipe.tools.contract import ParameterSpec, ToolContract
 from datapipe.tools.decorator import get_contract
+from datapipe.tools.descriptor import ProviderDescriptor, ToolDescriptor
 
 
 # ---------------------------------------------------------------------------
@@ -63,10 +67,13 @@ def _get_builtin_registry() -> dict[str, Callable]:
     return _BUILTIN_REGISTRY
 
 
-def _build_full_registry() -> dict[str, Callable]:
-    """Return a registry of all available tools: built-ins plus installed providers.
+def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
+    """Return a registry mapping tool name → (callable, descriptor_or_None).
 
     Built-in names are reserved and cannot be shadowed by provider tools.
+    The descriptor is None for built-ins (they live in real importable modules
+    and pickle fine) and a ToolDescriptor for provider tools (which must be
+    resolved per-worker from the descriptor rather than pickled directly).
 
     Entries are keyed by:
       - Unqualified name (e.g. ``"my_tool"``) — for provider tools whose name
@@ -74,12 +81,14 @@ def _build_full_registry() -> dict[str, Callable]:
       - Qualified name (e.g. ``"my_provider.my_tool"``) — for all provider tools,
         always available alongside the unqualified form.
     """
-    registry: dict[str, Callable] = dict(_get_builtin_registry())
+    registry: dict[str, tuple[Callable, ToolDescriptor | None]] = {
+        name: (fn, None) for name, fn in _get_builtin_registry().items()
+    }
 
     try:
-        from datapipe.tools.registry import load_registry as _load_reg
+        from datapipe.tools.registry import load_registry as _load_reg, add_provider as _add_provider
         from datapipe.tools.loader import load_provider
-        from datapipe.tools.descriptor import ProviderDescriptor
+        from datapipe.tools.validation import validate_dynamic
     except ImportError:
         return registry
 
@@ -96,12 +105,29 @@ def _build_full_registry() -> dict[str, Callable]:
         if not entry.tools and entry.mode != "editable":
             continue
         try:
+            # For editable providers, recompute the current file digest.  The
+            # plan (§7.5) requires that on every expression compilation we
+            # re-read and hash the file; if the hash changed we re-validate,
+            # update the registry, and embed the *current* digest in the
+            # descriptor so every worker verifies the same snapshot that was
+            # used during compilation.
+            sha256 = entry.digest
+            if entry.mode == "editable":
+                current_bytes = Path(entry.source_path).read_bytes()
+                current_digest = "sha256:" + hashlib.sha256(current_bytes).hexdigest()
+                if current_digest != entry.digest:
+                    metadata = validate_dynamic(Path(entry.source_path), current_bytes)
+                    entry.digest = current_digest
+                    entry.tools = {t["name"]: t for t in metadata.tools}
+                    _add_provider(entry)
+                sha256 = current_digest
+
             desc = ProviderDescriptor(
                 provider_id=entry.provider_id,
                 alias=entry.alias,
                 mode=entry.mode,
                 source_path=entry.source_path,
-                sha256=entry.digest,
+                sha256=sha256,
                 api_version=entry.datapipe_api,
             )
             provider_entry = load_provider(desc)
@@ -119,12 +145,13 @@ def _build_full_registry() -> dict[str, Callable]:
             continue
 
         for tool_name, fn in tools.items():
+            tool_desc = ToolDescriptor(provider=desc, tool_name=tool_name)
             # Always register the qualified form: alias.tool_name.
             qualified = f"{entry.alias}.{tool_name}"
-            registry[qualified] = fn
+            registry[qualified] = (fn, tool_desc)
             # Register unqualified only when the name is not a reserved built-in.
             if tool_name not in _BUILTIN_NAMES:
-                registry.setdefault(tool_name, fn)
+                registry.setdefault(tool_name, (fn, tool_desc))
 
     return registry
 
@@ -140,9 +167,15 @@ class ToolInvocation:
 
     Attributes
     ----------
-    tool_fn:
-        The resolved callable.  Do not store this in a pickleable descriptor;
-        it is resolved at compilation time in the coordinator process.
+    tool_descriptor:
+        For installed provider tools: the ``ToolDescriptor`` used to resolve
+        the callable per-worker in ``setup()``.  ``None`` for built-in tools,
+        which live in real importable modules and can be pickled directly.
+    builtin_fn:
+        For built-in tools only: the live callable.  ``None`` for provider
+        tools (they cannot be pickled across spawn boundaries because their
+        ``__module__`` is a synthetic name that does not exist in worker
+        processes).
     tool_name:
         Canonical tool name (for diagnostics and logging).
     contract:
@@ -159,7 +192,8 @@ class ToolInvocation:
         ``Span`` so it stays trivially pickleable.  Optional: ``None`` when the
         invocation was constructed without span information.
     """
-    tool_fn: Callable
+    tool_descriptor: ToolDescriptor | None   # None for built-ins
+    builtin_fn: Callable | None              # None for provider tools
     tool_name: str
     contract: ToolContract
     selector: CompiledSelector
@@ -198,7 +232,7 @@ def compile_expression(expression: str) -> CompiledExpression:
     invocations: list[ToolInvocation] = []
 
     for i, inv_node in enumerate(ast.invocations):
-        tool_fn = _resolve_tool(inv_node.qualified_name, registry, expression)
+        tool_fn, tool_desc = _resolve_tool(inv_node.qualified_name, registry, expression)
         contract = get_contract(tool_fn)
         if contract is None:
             raise ToolResolutionError(
@@ -213,8 +247,13 @@ def compile_expression(expression: str) -> CompiledExpression:
             inv_node.arguments, contract, expression, inv_node.span
         )
 
+        # Built-in callables live in a real importable module and pickle fine.
+        # Provider callables have a synthetic module name that does not exist
+        # in spawned worker processes, so they must never be pickled.  Workers
+        # resolve them from the ToolDescriptor in setup() instead.
         invocations.append(ToolInvocation(
-            tool_fn=tool_fn,
+            tool_descriptor=tool_desc,
+            builtin_fn=tool_fn if tool_desc is None else None,
             tool_name=contract.name,
             contract=contract,
             selector=selector,
@@ -236,14 +275,11 @@ def compile_expression(expression: str) -> CompiledExpression:
 
 def _resolve_tool(
     qname: "_ast.QualifiedName",
-    registry: dict[str, Callable],
+    registry: dict[str, tuple[Callable, ToolDescriptor | None]],
     expression: str,
-) -> Callable:
-    """Look up *qname* in *registry* and return the callable."""
+) -> tuple[Callable, ToolDescriptor | None]:
+    """Look up *qname* in *registry* and return (callable, descriptor_or_None)."""
     if qname.namespace is not None:
-        # Namespaced lookup: alias.tool_name for installed providers (Phase 4+).
-        # Unknown namespaced names still raise a helpful error mentioning Phase 2
-        # to preserve the expectation set by the Phase 2 test suite.
         full = f"{qname.namespace}.{qname.name}"
         if full in registry:
             return registry[full]
@@ -287,11 +323,14 @@ def _bind_arguments(
     arg_nodes: "tuple[_ast.Argument, ...]",
     contract: ToolContract,
     expression: str,
-    invocation_span: Span,
+    _invocation_span: Span,
 ) -> dict[str, Any]:
     """Bind expression arguments to the contract's ParameterSpec list.
 
     Returns a complete configuration dict with defaults filled in.
+    Validates each supplied value against the parameter's Python annotation
+    so type errors (e.g. passing a string where a bool is expected) are caught
+    at compile time rather than silently accepted.
     """
     param_map: dict[str, ParameterSpec] = {p.name: p for p in contract.parameters}
     bound: dict[str, Any] = {}
@@ -318,7 +357,10 @@ def _bind_arguments(
                 expression=expression,
                 span=arg.span,
             )
-        bound[arg.name] = arg.value.value
+        value = arg.value.value
+        param = param_map[arg.name]
+        _validate_argument_type(value, param, contract.name, expression, arg.span)
+        bound[arg.name] = value
 
     # Fill in defaults for unspecified parameters.
     for param in contract.parameters:
@@ -326,3 +368,57 @@ def _bind_arguments(
             bound[param.name] = param.default
 
     return bound
+
+
+# Mapping from Python annotation types to the set of Python types that are
+# acceptable values for that annotation.  Only the types the @tool decorator
+# permits as annotations are listed here.
+_ANNOTATION_TYPES: dict[type, tuple[type, ...]] = {
+    str:        (str,),
+    int:        (int,),
+    float:      (float, int),   # int is a valid float literal
+    bool:       (bool,),
+    list:       (list,),
+    dict:       (dict,),
+    type(None): (type(None),),
+}
+
+
+def _validate_argument_type(
+    value: Any,
+    param: ParameterSpec,
+    tool_name: str,
+    expression: str,
+    span: Span,
+) -> None:
+    """Raise ``ToolConfigurationError`` when *value* does not match *param*'s annotation.
+
+    Bool must be checked before int because ``bool`` is a subclass of ``int``
+    in Python, so ``isinstance(True, int)`` is True.
+    """
+    annotation = param.annotation
+    if annotation is None:
+        return  # no annotation → no static check
+
+    expected = _ANNOTATION_TYPES.get(annotation)
+    if expected is None:
+        return  # unsupported annotation type → skip
+
+    # Special-case bool: True/False must not be accepted where int is declared
+    # unless the annotation is explicitly bool.
+    if annotation is int and isinstance(value, bool):
+        raise ToolConfigurationError(
+            f"argument {param.name!r} for {tool_name!r}: expected int, "
+            f"got bool ({value!r})",
+            expression=expression,
+            span=span,
+        )
+
+    if not isinstance(value, expected):
+        actual_type = type(value).__name__
+        raise ToolConfigurationError(
+            f"argument {param.name!r} for {tool_name!r}: expected "
+            f"{annotation.__name__}, got {actual_type} ({value!r})",
+            expression=expression,
+            span=span,
+        )
