@@ -1,16 +1,48 @@
-"""datapipe.tools: tool contracts, registry, and installer (Phase 1-4 stub).
+"""datapipe.tools: public authoring API for tool contracts and built-ins.
 
-This package will contain:
+Phase 1 — tool contracts and built-ins:
 
-  tool contract and decorator API     datapipe.tools.contract
-  JSON type system                    datapipe.tools.types
-  tool descriptor model               datapipe.tools.descriptor
-  provider registry                   datapipe.tools.registry
-  provider installer                  datapipe.tools.installer
-  provider validation pipeline        datapipe.tools.validation
-  worker-side provider loader         datapipe.tools.loader
-  built-in tools (fromjson, tojson)   datapipe.tools.builtins
+    from datapipe.tools import JsonType, OneOf, tool, ToolContract, ParameterSpec
+    from datapipe.tools import fromjson, tojson
 
-None of these modules are implemented yet.  See
-configurable_transform_cli_plan.md phases 1–4 for the full specification.
+Phase 2-4 (registry, installer, loader) — not yet implemented.
 """
+
+from datapipe.tools.types import JsonType, OneOf, TypeSpec, as_type_spec, matches
+from datapipe.tools.contract import (
+    Cardinality,
+    ParameterSpec,
+    ToolContract,
+    ToolExample,
+    make_contract,
+)
+from datapipe.tools.decorator import (
+    ToolDecoratorError,
+    get_contract,
+    is_tool,
+    tool,
+)
+from datapipe.tools.builtins.json import fromjson, tojson
+
+__all__ = [
+    # Type system
+    "JsonType",
+    "OneOf",
+    "TypeSpec",
+    "as_type_spec",
+    "matches",
+    # Contract model
+    "Cardinality",
+    "ParameterSpec",
+    "ToolContract",
+    "ToolExample",
+    "make_contract",
+    # Decorator
+    "ToolDecoratorError",
+    "get_contract",
+    "is_tool",
+    "tool",
+    # Built-ins
+    "fromjson",
+    "tojson",
+]
