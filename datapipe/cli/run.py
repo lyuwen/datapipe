@@ -54,22 +54,31 @@ def add_run_parser(subparsers) -> None:
         "--source", "--input", dest="source",
         metavar="[FORMAT:]PATH",
         help=(
-            "input source; optionally prefix with 'jsonl:', 'parquet:', or "
-            "'csv:' to force the format (default: inferred from extension)"
+            "input source; optionally prefix with 'jsonl:' or 'parquet:' to "
+            "force the format (default: inferred from extension)"
         ),
     )
     p.add_argument(
         "--sink", "--output", dest="sink",
         metavar="[FORMAT:]PATH",
         help=(
-            "output sink; optionally prefix with 'jsonl:', 'parquet:', or "
-            "'csv:' to force the format (default: inferred from extension)"
+            "output sink; optionally prefix with 'jsonl:' or 'parquet:' to "
+            "force the format (default: inferred from extension)"
         ),
     )
     p.add_argument(
         "--error-output", dest="error_output",
         metavar="PATH",
         help="JSONL file to write per-record error payloads to",
+    )
+    p.add_argument(
+        "--raw", dest="raw", action="store_true", default=False,
+        help=(
+            "open JSONL source and sink in raw mode so the coordinator yields "
+            "unparsed lines and workers handle JSON parsing/serialization "
+            "(use with pipelines that begin with JsonLoadStage and end with "
+            "JsonDumpStage, matching the architecture's worker-side JSON mode)"
+        ),
     )
 
     # -- Executor -------------------------------------------------------------
@@ -81,12 +90,12 @@ def add_run_parser(subparsers) -> None:
     p.add_argument(
         "--workers", type=int, default=None,
         metavar="N",
-        help="number of worker processes/threads (default: CPU count)",
+        help="number of worker processes/threads (default: CPU count); must be >= 1",
     )
     p.add_argument(
         "--max-in-flight", dest="max_in_flight", type=int, default=None,
         metavar="N",
-        help="maximum number of in-flight futures (default: workers × 4)",
+        help="maximum number of in-flight futures (default: workers × 4); must be >= 1",
     )
 
     # -- Ordering & error policy ----------------------------------------------
@@ -156,9 +165,10 @@ def run_command(args: "argparse.Namespace") -> int:
         return 1
 
     # --- 2. Build source / sink ---------------------------------------------
+    raw = getattr(args, "raw", False)
     try:
-        source = _resolve_source(args.source) if args.source else None
-        sink = _resolve_sink(args.sink) if args.sink else None
+        source = _resolve_source(args.source, raw=raw) if args.source else None
+        sink = _resolve_sink(args.sink, raw=raw) if args.sink else None
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -176,13 +186,15 @@ def run_command(args: "argparse.Namespace") -> int:
         from datapipe.io.jsonl import JsonlSink
         error_sink = JsonlSink(args.error_output)
 
-    # --- 4. Build executor --------------------------------------------------
-    executor = _build_executor(args.executor, args.workers, args.max_in_flight)
+    # --- 4. Build executor, runtime (inside error boundary) -----------------
+    try:
+        executor = _build_executor(args.executor, args.workers, args.max_in_flight)
+        runtime = _build_runtime(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
-    # --- 5. Build runtime context -------------------------------------------
-    runtime = _build_runtime(args)
-
-    # --- 6. Run -------------------------------------------------------------
+    # --- 5. Run -------------------------------------------------------------
     try:
         stats = pipeline.run(
             source=source,
@@ -212,7 +224,7 @@ def run_command(args: "argparse.Namespace") -> int:
 # ---------------------------------------------------------------------------
 
 
-_FORMAT_PREFIXES = ("jsonl:", "parquet:", "csv:")
+_FORMAT_PREFIXES = ("jsonl:", "parquet:")
 
 
 def _parse_format_and_path(spec: str) -> tuple[str | None, str]:
@@ -223,20 +235,20 @@ def _parse_format_and_path(spec: str) -> tuple[str | None, str]:
     return None, spec
 
 
-def _resolve_source(spec: str):
+def _resolve_source(spec: str, *, raw: bool = False):
     """Turn a ``[FORMAT:]PATH`` string into a Source object."""
     fmt, path = _parse_format_and_path(spec)
     if fmt is None:
         fmt = _infer_format(path)
-    return _build_source(fmt, path, spec)
+    return _build_source(fmt, path, spec, raw=raw)
 
 
-def _resolve_sink(spec: str):
+def _resolve_sink(spec: str, *, raw: bool = False):
     """Turn a ``[FORMAT:]PATH`` string into a Sink object."""
     fmt, path = _parse_format_and_path(spec)
     if fmt is None:
         fmt = _infer_format(path)
-    return _build_sink(fmt, path, spec)
+    return _build_sink(fmt, path, spec, raw=raw)
 
 
 def _infer_format(path: str) -> str:
@@ -257,11 +269,11 @@ def _infer_format(path: str) -> str:
     return "jsonl"
 
 
-def _build_source(fmt: str, path: str, original: str):
+def _build_source(fmt: str, path: str, original: str, *, raw: bool = False):
     """Construct a Source object for *fmt*/*path*."""
     if fmt == "jsonl":
         from datapipe.io.jsonl import JsonlSource
-        return JsonlSource(path)
+        return JsonlSource(path, raw=raw)
     if fmt == "parquet":
         from datapipe.io.parquet import ParquetSource
         return ParquetSource(path)
@@ -271,11 +283,11 @@ def _build_source(fmt: str, path: str, original: str):
     )
 
 
-def _build_sink(fmt: str, path: str, original: str):
+def _build_sink(fmt: str, path: str, original: str, *, raw: bool = False):
     """Construct a Sink object for *fmt*/*path*."""
     if fmt == "jsonl":
         from datapipe.io.jsonl import JsonlSink
-        return JsonlSink(path)
+        return JsonlSink(path, raw=raw)
     if fmt == "parquet":
         from datapipe.io.parquet import ParquetSink
         return ParquetSink(path)
@@ -309,30 +321,23 @@ def _build_executor(name: str, workers: int | None, max_in_flight: int | None):
 
 
 def _build_runtime(args: "argparse.Namespace"):
-    """Build a RuntimeContext, respecting explicit CLI overrides."""
+    """Build a RuntimeContext, respecting explicit CLI overrides.
+
+    Starts with environment detection (``RuntimeContext.auto()``) so that
+    Slurm/torchrun/K8s metadata, node_rank, job_id, and environment strings
+    are preserved.  Only the fields explicitly supplied via CLI flags are
+    overridden; unrelated detected fields are left intact.
+    """
     from datapipe.runtime.context import RuntimeContext
 
-    # Start from environment detection, then override with explicit flags.
-    runtime = RuntimeContext.auto()
+    overrides: dict = {}
     if args.rank is not None:
-        runtime = RuntimeContext(
-            rank=args.rank,
-            world_size=args.world_size if args.world_size is not None else runtime.world_size,
-            local_rank=args.local_rank if args.local_rank is not None else runtime.local_rank,
-        )
-    elif args.world_size is not None:
-        runtime = RuntimeContext(
-            rank=runtime.rank,
-            world_size=args.world_size,
-            local_rank=args.local_rank if args.local_rank is not None else runtime.local_rank,
-        )
-    elif args.local_rank is not None:
-        runtime = RuntimeContext(
-            rank=runtime.rank,
-            world_size=runtime.world_size,
-            local_rank=args.local_rank,
-        )
-    return runtime
+        overrides["rank"] = args.rank
+    if args.world_size is not None:
+        overrides["world_size"] = args.world_size
+    if args.local_rank is not None:
+        overrides["local_rank"] = args.local_rank
+    return RuntimeContext.auto(**overrides)
 
 
 def _print_stats(stats) -> None:

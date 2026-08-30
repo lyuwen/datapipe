@@ -86,7 +86,14 @@ def _import_by_name(module_name: str):
 
 
 def _import_from_file(file_path: str):
-    """Import a module from a .py file path."""
+    """Import a module from a .py file path.
+
+    The module is registered in ``sys.modules`` under its synthetic name so
+    that ``pickle`` (used by ``ProcessExecutor`` under the ``spawn`` start
+    method) can resolve functions and classes defined in the file.  Without
+    this registration, pickling any callable from the file raises
+    ``AttributeError: Can't pickle … import of module '…' failed``.
+    """
     path = os.path.abspath(file_path)
     if not os.path.isfile(path):
         raise PipelineLoadError(f"pipeline file not found: {path!r}")
@@ -108,9 +115,15 @@ def _import_from_file(file_path: str):
         sys.path.insert(0, directory)
 
     module = importlib.util.module_from_spec(spec)
+    # Register before exec so that any module-level self-imports resolve, and
+    # so that pickle can find the module by name in spawned worker processes.
+    sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)  # type: ignore[union-attr]
     except Exception as exc:
+        # Unregister on failure so a retry or a different file doesn't see
+        # a half-initialised module under the same name.
+        sys.modules.pop(module_name, None)
         raise PipelineLoadError(
             f"error executing {path!r}: {exc}"
         ) from exc
@@ -118,11 +131,38 @@ def _import_from_file(file_path: str):
 
 
 def _module_name_from_path(path: str) -> str:
-    """Derive a stable, unique module name from an absolute file path."""
-    # Use the bare filename (without extension) as the module name.  Prefix
-    # with a synthetic package to avoid clobbering any real top-level module.
+    """Return the module name under which this file should be registered.
+
+    Requirements:
+
+    1. Spawned worker processes must be able to re-import it.  Under the
+       ``spawn`` start method workers start fresh; pickle resolves the module
+       by calling ``import <name>``, so the name must be importable via
+       ``sys.path``.  ``_import_from_file`` adds the file's directory to
+       ``sys.path``, so the bare stem is always importable from there.
+
+    2. The name must not clash with an existing *package* (e.g. a stem of
+       ``datapipe`` would shadow the whole library).  We detect that case and
+       raise a clear error.  For modules (single-file entries), re-registration
+       under the same stem is intentional — the caller always wants the newly
+       loaded file.
+
+    We deliberately do NOT use a synthetic dotted namespace such as
+    ``_datapipe_loader.X`` because dotted names require the parent package to
+    also exist in ``sys.modules`` and to be importable by workers, which a
+    synthetic prefix cannot satisfy under ``spawn``.
+    """
     stem = os.path.splitext(os.path.basename(path))[0]
-    return f"_datapipe_loader.{stem}"
+
+    # Guard against shadowing a real *package* (has __path__ but no __file__),
+    # such as accidentally naming a pipeline file ``datapipe.py``.
+    existing = sys.modules.get(stem)
+    if existing is not None and hasattr(existing, "__path__") and not getattr(existing, "__file__", None):
+        raise PipelineLoadError(
+            f"cannot load {path!r} as module {stem!r}: that name is already "
+            f"used by a package. Rename your file to avoid the collision."
+        )
+    return stem
 
 
 def _resolve_attr(module, attr_path: str) -> Any:

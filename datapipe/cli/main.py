@@ -72,11 +72,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="manage installable tool providers (Phase 4)",
     )
     tools_sub = tools_p.add_subparsers(dest="tools_command")
-    tools_sub.add_parser("install", help="install a tool provider")
-    tools_sub.add_parser("validate", help="validate a tool provider file")
+
+    install_p = tools_sub.add_parser("install", help="install a tool provider")
+    install_p.add_argument(
+        "path", nargs="?", metavar="PATH",
+        help="path to the .py provider file to install",
+    )
+    install_p.add_argument(
+        "--editable", "-e", action="store_true",
+        help="install in editable mode (live-reload on each run)",
+    )
+    install_p.add_argument(
+        "--force", action="store_true",
+        help="replace an existing provider with the same name",
+    )
+    install_p.add_argument(
+        "--yes", "-y", action="store_true",
+        help="skip the interactive confirmation prompt (for CI)",
+    )
+
+    validate_p = tools_sub.add_parser("validate", help="validate a tool provider file")
+    validate_p.add_argument("path", nargs="?", metavar="PATH")
+
     tools_sub.add_parser("list", help="list installed tool providers")
-    tools_sub.add_parser("inspect", help="inspect a tool or provider")
-    tools_sub.add_parser("remove", help="remove a tool provider")
+
+    inspect_p2 = tools_sub.add_parser("inspect", help="inspect a tool or provider")
+    inspect_p2.add_argument("name", nargs="?", metavar="NAME")
+    inspect_p2.add_argument("--json", dest="as_json", action="store_true")
+
+    remove_p = tools_sub.add_parser("remove", help="remove a tool provider")
+    remove_p.add_argument("name", nargs="?", metavar="PROVIDER_OR_NAME")
 
     return parser
 
