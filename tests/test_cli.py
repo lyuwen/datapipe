@@ -121,16 +121,18 @@ class TestMainVersion:
         assert rc == 0
 
     def test_unknown_command_shows_help_for_expression_shorthand(self, capsys):
-        # An unrecognised first arg is treated as a transform expression stub
-        rc = main(["some_expression"])
-        assert rc == 2  # transform stub returns 2
-        err = capsys.readouterr().err
-        assert "not yet implemented" in err
+        # An unrecognised first arg is treated as a transform expression.
+        # Without input/output paths, argparse exits with an error.
+        with pytest.raises(SystemExit) as exc_info:
+            main(["some_expression"])
+        assert exc_info.value.code != 0
 
-    def test_transform_stub(self, capsys):
-        rc = main(["transform", "expr"])
-        assert rc == 2
-        assert "not yet implemented" in capsys.readouterr().err
+    def test_transform_requires_input_output(self, capsys):
+        # The real transform command requires expression, input, and output.
+        # Calling with only an expression should produce an argparse error.
+        with pytest.raises(SystemExit) as exc_info:
+            main(["transform", "expr"])
+        assert exc_info.value.code != 0
 
     def test_tools_stub(self, capsys):
         rc = main(["tools"])

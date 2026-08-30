@@ -52,19 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_parser(sub)
     add_inspect_parser(sub)
 
-    # -- transform (Phase 3 stub) --------------------------------------------
-    transform_p = sub.add_parser(
-        "transform",
-        help="apply a jq-like expression to records (Phase 3)",
-        description=(
-            "Apply a jq-like transform expression to a JSONL source.\n\n"
-            "This command is not yet implemented. See the CLI plan for the\n"
-            "full expression language specification."
-        ),
-    )
-    transform_p.add_argument("expression", nargs="?", help="transform expression")
-    transform_p.add_argument("input", nargs="?", help="input path")
-    transform_p.add_argument("output", nargs="?", help="output path")
+    # -- transform (Phase 3) -------------------------------------------------
+    from datapipe.cli.transform import add_transform_parser
+    add_transform_parser(sub)
 
     # -- tools (Phase 4 stub) ------------------------------------------------
     tools_p = sub.add_parser(
@@ -160,12 +150,8 @@ def main(argv: list[str] | None = None) -> int:
         return inspect_command(args)
 
     if args.command == "transform":
-        print(
-            "datapipe transform is not yet implemented (Phase 3 of the CLI plan).\n"
-            "Use 'datapipe run pipeline.py:pipeline ...' for a Python-defined pipeline.",
-            file=sys.stderr,
-        )
-        return 2
+        from datapipe.cli.transform import transform_command
+        return transform_command(args)
 
     if args.command == "tools":
         print(
