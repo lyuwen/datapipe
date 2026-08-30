@@ -18,6 +18,7 @@ selector, and the bound configuration.  These are then passed to
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -35,8 +36,12 @@ from datapipe.tools.decorator import get_contract
 
 
 # ---------------------------------------------------------------------------
-# Built-in registry (Phase 2 scope: only built-in tools)
+# Built-in registry
 # ---------------------------------------------------------------------------
+
+# Names that are permanently reserved and cannot be shadowed by providers.
+_BUILTIN_NAMES: frozenset[str] = frozenset({"fromjson", "tojson"})
+
 
 def _build_builtin_registry() -> dict[str, Callable]:
     """Return the canonical mapping of tool name → function for built-ins."""
@@ -56,6 +61,72 @@ def _get_builtin_registry() -> dict[str, Callable]:
     if _BUILTIN_REGISTRY is None:
         _BUILTIN_REGISTRY = _build_builtin_registry()
     return _BUILTIN_REGISTRY
+
+
+def _build_full_registry() -> dict[str, Callable]:
+    """Return a registry of all available tools: built-ins plus installed providers.
+
+    Built-in names are reserved and cannot be shadowed by provider tools.
+
+    Entries are keyed by:
+      - Unqualified name (e.g. ``"my_tool"``) — for provider tools whose name
+        does not clash with a built-in.
+      - Qualified name (e.g. ``"my_provider.my_tool"``) — for all provider tools,
+        always available alongside the unqualified form.
+    """
+    registry: dict[str, Callable] = dict(_get_builtin_registry())
+
+    try:
+        from datapipe.tools.registry import load_registry as _load_reg
+        from datapipe.tools.loader import load_provider
+        from datapipe.tools.descriptor import ProviderDescriptor
+    except ImportError:
+        return registry
+
+    try:
+        reg_data = _load_reg()
+    except Exception:
+        return registry
+
+    for entry in reg_data.providers.values():
+        # For copied providers an empty tool list means there is nothing to
+        # load.  Editable providers are re-read from the user's file on every
+        # run, so the file -- not the registry snapshot -- is the source of
+        # truth and may have gained tools since install.
+        if not entry.tools and entry.mode != "editable":
+            continue
+        try:
+            desc = ProviderDescriptor(
+                provider_id=entry.provider_id,
+                alias=entry.alias,
+                mode=entry.mode,
+                source_path=entry.source_path,
+                sha256=entry.digest,
+                api_version=entry.datapipe_api,
+            )
+            provider_entry = load_provider(desc)
+            tools: dict[str, Callable] = provider_entry["tools"]
+        except Exception as exc:  # noqa: BLE001
+            # Never let one broken provider block tools from every other
+            # provider, but do not fail silently either: without this warning
+            # the user only sees "unknown tool" and has no way to discover
+            # that the provider failed to load or why.
+            print(
+                f"warning: provider {entry.provider_id!r} could not be loaded "
+                f"and its tools are unavailable: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+        for tool_name, fn in tools.items():
+            # Always register the qualified form: alias.tool_name.
+            qualified = f"{entry.alias}.{tool_name}"
+            registry[qualified] = fn
+            # Register unqualified only when the name is not a reserved built-in.
+            if tool_name not in _BUILTIN_NAMES:
+                registry.setdefault(tool_name, fn)
+
+    return registry
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +188,7 @@ def compile_expression(expression: str) -> CompiledExpression:
     Everything is validated before any data is read.
     """
     ast = parse(expression)
-    registry = _get_builtin_registry()
+    registry = _build_full_registry()
     invocations: list[ToolInvocation] = []
 
     for i, inv_node in enumerate(ast.invocations):
@@ -163,12 +234,16 @@ def _resolve_tool(
 ) -> Callable:
     """Look up *qname* in *registry* and return the callable."""
     if qname.namespace is not None:
-        # Namespaced lookup: only built-ins can use their own name as a
-        # namespace alias in Phase 2; full provider namespaces are Phase 4.
+        # Namespaced lookup: alias.tool_name for installed providers (Phase 4+).
+        # Unknown namespaced names still raise a helpful error mentioning Phase 2
+        # to preserve the expectation set by the Phase 2 test suite.
         full = f"{qname.namespace}.{qname.name}"
+        if full in registry:
+            return registry[full]
         raise ToolResolutionError(
-            f"namespaced tool {full!r} cannot be resolved in Phase 2; "
-            "use the unqualified name for built-in tools",
+            f"namespaced tool {full!r} cannot be resolved; "
+            "install the provider with 'datapipe tools install' "
+            "(namespaced tools were not available in Phase 2)",
             expression=expression,
             span=qname.span,
         )
@@ -177,7 +252,7 @@ def _resolve_tool(
     if name not in registry:
         available = sorted(registry)
         raise ToolResolutionError(
-            f"unknown tool {name!r}; available built-in tools: "
+            f"unknown tool {name!r}; available tools: "
             + ", ".join(repr(n) for n in available),
             expression=expression,
             span=qname.span,

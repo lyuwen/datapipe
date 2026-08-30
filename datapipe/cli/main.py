@@ -56,42 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     from datapipe.cli.transform import add_transform_parser
     add_transform_parser(sub)
 
-    # -- tools (Phase 4 stub) ------------------------------------------------
-    tools_p = sub.add_parser(
-        "tools",
-        help="manage installable tool providers (Phase 4)",
-    )
-    tools_sub = tools_p.add_subparsers(dest="tools_command")
-
-    install_p = tools_sub.add_parser("install", help="install a tool provider")
-    install_p.add_argument(
-        "path", nargs="?", metavar="PATH",
-        help="path to the .py provider file to install",
-    )
-    install_p.add_argument(
-        "--editable", "-e", action="store_true",
-        help="install in editable mode (live-reload on each run)",
-    )
-    install_p.add_argument(
-        "--force", action="store_true",
-        help="replace an existing provider with the same name",
-    )
-    install_p.add_argument(
-        "--yes", "-y", action="store_true",
-        help="skip the interactive confirmation prompt (for CI)",
-    )
-
-    validate_p = tools_sub.add_parser("validate", help="validate a tool provider file")
-    validate_p.add_argument("path", nargs="?", metavar="PATH")
-
-    tools_sub.add_parser("list", help="list installed tool providers")
-
-    inspect_p2 = tools_sub.add_parser("inspect", help="inspect a tool or provider")
-    inspect_p2.add_argument("name", nargs="?", metavar="NAME")
-    inspect_p2.add_argument("--json", dest="as_json", action="store_true")
-
-    remove_p = tools_sub.add_parser("remove", help="remove a tool provider")
-    remove_p.add_argument("name", nargs="?", metavar="PROVIDER_OR_NAME")
+    # -- tools (Phase 4) ------------------------------------------------
+    from datapipe.cli.tools import add_tools_parser
+    add_tools_parser(sub)
 
     return parser
 
@@ -154,11 +121,8 @@ def main(argv: list[str] | None = None) -> int:
         return transform_command(args)
 
     if args.command == "tools":
-        print(
-            "datapipe tools is not yet implemented (Phase 4 of the CLI plan).",
-            file=sys.stderr,
-        )
-        return 2
+        from datapipe.cli.tools import tools_command
+        return tools_command(args)
 
     parser.print_help()
     return 0
