@@ -1,14 +1,65 @@
-"""datapipe.dsl: jq-like expression language parser and compiler (Phase 2-3 stub).
+"""datapipe.dsl: jq-like expression language parser and compiler.
 
-This package will contain:
+Phase 2 exports:
 
-  tokenizer        datapipe.dsl.lexer
-  AST types        datapipe.dsl.ast
-  parser           datapipe.dsl.parser
-  selector engine  datapipe.dsl.selector
-  semantic compiler datapipe.dsl.compiler
-  DSL errors       datapipe.dsl.errors
+    from datapipe.dsl import parse, compile_expression
+    from datapipe.dsl import Expression, Invocation, Selector, Span
+    from datapipe.dsl.errors import ExpressionSyntaxError, ToolResolutionError
+    from datapipe.dsl.selector import CompiledSelector
+    from datapipe.dsl.compiler import CompiledExpression, ToolInvocation
 
-None of these modules are implemented yet.  See
-configurable_transform_cli_plan.md phases 2–3 for the full specification.
+Phase 3 (datapipe transform CLI) and Phase 4 (provider registry) not yet
+implemented.
 """
+
+from datapipe.dsl.errors import (
+    ExpressionSyntaxError,
+    SelectorResolutionError,
+    Span,
+    ToolConfigurationError,
+    ToolResolutionError,
+)
+from datapipe.dsl.ast import (
+    Argument,
+    Each,
+    Expression,
+    Field,
+    Index,
+    Invocation,
+    Literal,
+    QualifiedName,
+    QuotedKey,
+    Selector,
+)
+from datapipe.dsl.parser import parse
+from datapipe.dsl.selector import CompiledSelector, Reference
+from datapipe.dsl.compiler import CompiledExpression, ToolInvocation, compile_expression
+
+__all__ = [
+    # Errors
+    "ExpressionSyntaxError",
+    "SelectorResolutionError",
+    "Span",
+    "ToolConfigurationError",
+    "ToolResolutionError",
+    # AST nodes
+    "Argument",
+    "Each",
+    "Expression",
+    "Field",
+    "Index",
+    "Invocation",
+    "Literal",
+    "QualifiedName",
+    "QuotedKey",
+    "Selector",
+    # Parser
+    "parse",
+    # Selector runtime
+    "CompiledSelector",
+    "Reference",
+    # Compiler
+    "CompiledExpression",
+    "ToolInvocation",
+    "compile_expression",
+]
