@@ -189,7 +189,7 @@ sys.exit(0)
 
 def validate_dynamic(
     path: Path,
-    source_bytes: bytes,  # noqa: ARG001 — reserved for future digest pre-check
+    source_bytes: bytes,
     timeout: float = 30.0,
 ) -> ProviderMetadata:
     """Import the provider in a fresh subprocess and collect tool metadata.
@@ -224,6 +224,7 @@ def validate_dynamic(
         try:
             result = subprocess.run(
                 [sys.executable, tmp_helper, str(path)],
+                input=source_bytes,
                 capture_output=True,
                 timeout=timeout,
                 env=child_env,

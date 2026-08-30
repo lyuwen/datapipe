@@ -87,9 +87,14 @@ whether by accident, by a concurrent process, or deliberately — the worker
 rejects it and logs a warning. The run continues with other providers intact;
 only the broken provider's tools become unavailable.
 
-For editable providers, digest enforcement is intentionally skipped because
-live editing is the entire purpose of the mode. Workers always load the current
-bytes on disk.
+For editable providers, digest enforcement applies at compilation time rather
+than install time. On every expression compilation, datapipe re-reads and
+re-hashes the current file. If the hash differs from the registry value, the
+file is re-validated and the registry is updated. The resulting compilation
+descriptor carries the current hash; every worker then verifies that the file
+on disk still matches that hash before importing. A file changed between
+compilation and worker startup causes the run to fail rather than allowing
+workers to load different code versions.
 
 ## Subprocess isolation during validation
 

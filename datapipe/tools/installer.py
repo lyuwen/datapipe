@@ -123,17 +123,38 @@ def install_provider(
             return None
 
     # --- Copy or editable install -------------------------------------------
+    import json as _json
     pdir = provider_dir(provider_id)
     pdir.mkdir(parents=True, exist_ok=True)
 
-    # Track which files we write so we can clean them up if the registry
-    # update fails (keeping installation transactional).
-    files_written: list[Path] = []
+    # For a transactional install: back up any pre-existing files so that if
+    # the registry update fails we can restore them and leave the installation
+    # in its previous (valid) state rather than a partially-overwritten one.
+    backups: dict[Path, bytes | None] = {}  # path → original bytes (None = did not exist)
+    files_written: list[Path] = []          # paths we created or overwrote
+
+    def _backup(p: Path) -> None:
+        """Record the original bytes of *p* before we write to it."""
+        if p not in backups:
+            backups[p] = p.read_bytes() if p.exists() else None
+
+    def _rollback() -> None:
+        """Restore every touched file to its pre-install state."""
+        for p in files_written:
+            original = backups.get(p)
+            try:
+                if original is None:
+                    p.unlink(missing_ok=True)
+                else:
+                    p.write_bytes(original)
+            except OSError:
+                pass
 
     if editable:
         source_path = str(path)
     else:
         dest = pdir / "source.py"
+        _backup(dest)
         dest.write_bytes(source_bytes)
         files_written.append(dest)
         source_path = str(dest)
@@ -153,35 +174,34 @@ def install_provider(
 
     # Write a provider.json alongside the source (even for editable).
     provider_json = pdir / "provider.json"
-    import json as _json
-    provider_json.write_text(
-        _json.dumps(
-            {
-                "provider_id": entry.provider_id,
-                "alias": entry.alias,
-                "mode": entry.mode,
-                "source_path": entry.source_path,
-                "digest": entry.digest,
-                "installed_at": entry.installed_at,
-                "datapipe_api": entry.datapipe_api,
-                "tools": entry.tools,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    _backup(provider_json)
+    try:
+        provider_json.write_text(
+            _json.dumps(
+                {
+                    "provider_id": entry.provider_id,
+                    "alias": entry.alias,
+                    "mode": entry.mode,
+                    "source_path": entry.source_path,
+                    "digest": entry.digest,
+                    "installed_at": entry.installed_at,
+                    "datapipe_api": entry.datapipe_api,
+                    "tools": entry.tools,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        _rollback()
+        raise
     files_written.append(provider_json)
 
     try:
         add_provider(entry)
     except Exception:
-        # Registry update failed — clean up any files we just wrote so the
-        # provider directory does not contain orphaned partial state.
-        for f in files_written:
-            try:
-                f.unlink(missing_ok=True)
-            except OSError:
-                pass
+        # Registry update failed — restore everything to its pre-install state.
+        _rollback()
         raise
 
     return entry

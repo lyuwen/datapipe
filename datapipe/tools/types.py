@@ -169,15 +169,38 @@ def as_type_spec(value: "JsonType | TypeSpec") -> TypeSpec:
 # Runtime matching
 # ---------------------------------------------------------------------------
 
+def _is_json_representable(value: Any) -> bool:
+    """Return True when *value* is recursively JSON-representable.
+
+    Checks that the top-level value and all nested contents (list elements,
+    dict keys and values) are JSON-compatible types with finite numeric values.
+    """
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return not (math.isnan(value) or math.isinf(value))
+    if isinstance(value, str):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_representable(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(k, str) and _is_json_representable(v)
+            for k, v in value.items()
+        )
+    return False
+
+
 def _matches_json_type(value: Any, jt: JsonType) -> bool:  # noqa: C901 (intentional)
     """Return True when *value* matches *jt* according to JSON semantics."""
     if jt is JsonType.ANY:
-        # Accept only JSON-representable values: None, bool, int (not bool),
-        # finite float, str, list, dict.  Sets, tuples, arbitrary objects, and
-        # non-finite floats are not JSON-representable and must be rejected so
-        # that tool output failures are attributed to the tool rather than
-        # surfacing later as a JsonDumpStage error.
-        return infer_json_type(value) is not None
+        # Accept only recursively JSON-representable values so invalid tool
+        # output (sets, tuples, non-finite floats, arbitrary objects in
+        # containers) is caught here and attributed to the tool rather than
+        # surfacing later as a JsonDumpStage serialization error.
+        return _is_json_representable(value)
     if jt is JsonType.NULL:
         return value is None
     if jt is JsonType.BOOLEAN:

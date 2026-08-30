@@ -403,7 +403,18 @@ def _validate_argument_type(
 
     expected = _ANNOTATION_TYPES.get(annotation)
     if expected is None:
-        return  # unsupported annotation type → skip (e.g. Optional, Union)
+        # Unsupported annotation (Optional, Union, enum, typed container, etc.).
+        # Emit a warning so authors know their annotation isn't being validated
+        # rather than silently accepting any value.
+        import warnings as _warnings
+        ann_name = getattr(annotation, "__name__", repr(annotation))
+        _warnings.warn(
+            f"argument {param.name!r} for tool {tool_name!r} has annotation "
+            f"{ann_name!r} which is not validated at compile time; "
+            "only str, int, float, bool, list, dict, and None are checked",
+            stacklevel=4,
+        )
+        return
 
     # Special-case bool: True/False must not be accepted where int or float is
     # declared — the caller likely meant a numeric literal, not a boolean.

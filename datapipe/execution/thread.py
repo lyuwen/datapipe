@@ -11,9 +11,8 @@ Each worker thread gets its own deep copy of the compiled pipeline and its own
   threads; ``Stage.__deepcopy__`` ensures non-picklable attributes like locks
   are replaced with fresh equivalents rather than shared or copied wholesale;
 - concurrent writes to ``ctx.record_index`` do not race across threads;
-- ``teardown()`` runs on the owning thread after all record processing
-  finishes, guaranteed by having each thread run its own teardown inline
-  before the pool is shut down.
+- ``teardown()`` runs on the owning thread via a per-thread ``threading.Event``
+  mechanism that guarantees the correct thread performs its own teardown.
 """
 
 from __future__ import annotations
@@ -31,24 +30,28 @@ from datapipe.runtime.context import RuntimeContext
 class _ThreadLocalWorker:
     """Per-thread worker state.
 
-    Each thread pops a pre-copied worker from ``_worker_pool`` (populated in
-    ``_start_backend`` while still single-threaded) so ``setup()`` writes to an
-    isolated object graph rather than a shared one.
-
     Teardown guarantee
     ------------------
-    ``ThreadPoolExecutor`` provides no thread-affinity for submitted tasks, so
-    submitting a generic teardown task cannot guarantee it runs on the owning
-    thread.  Instead, each thread performs its own teardown by executing a
-    sentinel task: we set a ``_shutdown_flag`` then submit exactly
-    ``max_workers`` sentinel tasks (one per pool thread).  Each sentinel calls
-    ``_teardown_on_thread()``, which reads from ``threading.local`` and tears
-    down only the worker that belongs to the executing thread.  Every live
-    thread picks up exactly one sentinel and tears down its own worker.
+    During ``_ensure_initialized``, each thread stores a ``threading.Event``
+    (its "teardown signal") both in ``threading.local`` and in a shared dict
+    keyed by thread id.  When ``submit_teardown`` is called:
 
-    The coordinator-thread fallback handles the rare case where the pool
-    retired a thread before we submitted sentinels (thread did not pick up any
-    task because it had already exited).
+    1. It sets every initialized thread's teardown-signal event.
+    2. It submits ``max_workers`` tasks.  Each task checks
+       ``threading.local`` for a teardown signal.  If the signal is set and
+       teardown hasn't run yet, the thread tears down its own worker, then
+       clears the signal so re-entry is impossible.
+    3. After all task futures resolve, the coordinator verifies that every
+       initialized thread has been torn down.  Any that haven't (their thread
+       exited before running the pool task) are torn down on the coordinator
+       thread as a genuine last resort.
+
+    Key invariant: a task only runs teardown when its own teardown signal is
+    set AND it hasn't been done yet.  Because signals are stored in
+    ``threading.local``, a task executing on thread T can only see T's own
+    signal.  Setting ALL signals before submitting tasks means every idle pool
+    thread will find its own signal set and run its own teardown the moment it
+    picks up a task.
     """
 
     def __init__(self, worker, runtime: RuntimeContext, worker_pool: list, max_workers: int) -> None:
@@ -57,11 +60,10 @@ class _ThreadLocalWorker:
         self._local = threading.local()
         self._lock = threading.Lock()
         self._done_teardown = False
-        self._thread_states: list[tuple] = []   # (worker_copy, ctx) per thread
-        self._torn_down: set[int] = set()       # id(worker_copy) of torn-down workers
+        self._thread_states: list[tuple] = []   # (worker_copy, ctx, thread_id, signal_event)
+        self._torn_down: set[int] = set()       # thread_ids that completed teardown
         self._worker_pool = worker_pool
         self._max_workers = max_workers
-        self._teardown_barrier: threading.Barrier | None = None
 
     def _ensure_initialized(self, thread_id: int) -> None:
         if getattr(self._local, "ctx", None) is not None:
@@ -83,12 +85,15 @@ class _ThreadLocalWorker:
                 worker_copy.setup(ctx)
         except Exception as exc:  # noqa: BLE001
             raise WorkerSetupError(exc) from exc
-        # Assign only after setup succeeds; a raised exception leaves
-        # _local.ctx unset so teardown is never called for a failed worker.
+
+        # Each thread gets a unique teardown-signal event stored in both
+        # threading.local and the shared state list.
+        signal = threading.Event()
         self._local.ctx = ctx
         self._local.worker = worker_copy
+        self._local.teardown_signal = signal
         with self._lock:
-            self._thread_states.append((worker_copy, ctx))
+            self._thread_states.append((worker_copy, ctx, thread_id, signal))
 
     def process(self, seq: int, value: Any) -> Any:
         self._ensure_initialized(threading.get_ident())
@@ -96,46 +101,44 @@ class _ThreadLocalWorker:
         ctx.record_index = seq
         return self._local.worker.process(value, ctx)
 
-    def _teardown_on_thread(self) -> None:
-        """Run teardown for the worker owned by the calling thread.
+    def _check_and_run_teardown(self) -> None:
+        """If this thread has a pending teardown signal, run teardown now.
 
-        Reads from ``threading.local`` so it only acts on this thread's own
-        worker.  Idempotent via ``_local.teardown_done``.
+        Each thread stores its own teardown-signal event in threading.local.
+        This method checks only the calling thread's own signal, so it never
+        accidentally tears down a different thread's worker.  Idempotent.
         """
+        signal = getattr(self._local, "teardown_signal", None)
+        if signal is None or not signal.is_set():
+            return
         if getattr(self._local, "teardown_done", False):
             return
+        self._local.teardown_done = True
+        # Record by thread id (not worker object id) so the coordinator check works.
+        with self._lock:
+            self._torn_down.add(threading.get_ident())
         worker = getattr(self._local, "worker", None)
         ctx = getattr(self._local, "ctx", None)
-        if worker is not None and ctx is not None:
-            self._local.teardown_done = True
-            with self._lock:
-                self._torn_down.add(id(worker))
-            if hasattr(worker, "teardown"):
+        if worker is not None and ctx is not None and hasattr(worker, "teardown"):
+            try:
                 worker.teardown(ctx)
+            except Exception:  # noqa: BLE001
+                pass
 
     def submit_teardown(self, pool: ThreadPoolExecutor) -> None:
         """Tear down every initialized worker on its owning thread.
 
-        All record processing is complete before this is called, so every pool
-        thread is idle.  We use a ``threading.Barrier`` sized to the number of
-        initialized threads.  Each sentinel task:
+        1. Snapshots all initialized states.
+        2. Sets every thread's teardown-signal event so the next pool task
+           on each thread will call teardown.
+        3. Submits ``max_workers`` tasks.  Each task calls
+           ``_check_and_run_teardown()``, which acts only on the calling
+           thread's own signal.  Since every signal is already set, each
+           thread tears down its worker on its first available task.
+        4. Coordinator fallback: any thread whose signal was never consumed
+           (thread exited before picking up a task) is handled here.
 
-        1. Arrives at the barrier — this synchronises all live pool threads so
-           we know exactly which ones will participate.
-        2. After the barrier, calls ``_teardown_on_thread()`` which reads from
-           ``threading.local`` and tears down only that thread's own worker.
-
-        The barrier size equals ``len(states)`` (the number of threads that
-        actually initialized workers), not ``max_workers``, because fewer
-        threads may have started if the record count was smaller than the pool.
-
-        After all sentinel futures resolve, a coordinator-thread fallback
-        handles any worker that did NOT participate in the barrier (a pool
-        thread that retired before sentinel submission — extremely rare but
-        possible when the pool implementation recycles threads aggressively).
-
-        Must be called while the pool is still accepting submissions and all
-        record futures have been awaited.
+        Must be called while the pool is still accepting submissions.
         """
         with self._lock:
             if self._done_teardown:
@@ -146,35 +149,25 @@ class _ThreadLocalWorker:
         if not states:
             return
 
-        n_threads = len(states)
-        barrier = threading.Barrier(n_threads, timeout=30.0)
+        # Signal every initialized thread to tear down on its next task.
+        for _, _, _, signal in states:
+            signal.set()
 
-        def _sentinel() -> None:
-            """Arrive at the barrier, then tear down this thread's own worker."""
-            try:
-                barrier.wait()
-            except threading.BrokenBarrierError:
-                # A thread raised or timed out; fall back to coordinator cleanup.
-                return
-            self._teardown_on_thread()
-
-        # Submit exactly n_threads sentinels.  All record work is done, so all
-        # n_threads pool threads are idle and will each pick up exactly one
-        # sentinel.  The barrier ensures every participating thread has arrived
-        # (i.e. we can confirm affinity) before any proceeds to teardown.
-        futs = [pool.submit(_sentinel) for _ in range(n_threads)]
+        # Submit max_workers tasks — enough for every live thread to get one.
+        futs = [pool.submit(self._check_and_run_teardown) for _ in range(self._max_workers)]
         for f in futs:
             try:
                 f.result()
             except Exception:  # noqa: BLE001
                 pass
 
-        # Coordinator-thread fallback: covers any worker whose thread did not
-        # participate in the barrier (pool thread that retired early).
+        # Coordinator-thread fallback for threads whose tasks were cancelled
+        # or whose threads exited before running a task.
         with self._lock:
             already = set(self._torn_down)
-        for worker, ctx in states:
-            if id(worker) not in already:
+        for worker, ctx, tid, signal in states:
+            if tid not in already:
+                # Thread didn't run its own teardown — do it on coordinator.
                 if hasattr(worker, "teardown"):
                     try:
                         worker.teardown(ctx)
@@ -210,13 +203,10 @@ class ThreadExecutor(BoundedMapExecutor):
         )
 
     def _pre_shutdown(self) -> None:
-        """Submit teardown futures to the still-live pool before closing it.
+        """Submit teardown tasks to the still-live pool before closing it.
 
-        Called by the scheduler after all records complete successfully.  The
-        pool is still accepting submissions at this point, so teardown tasks
-        run on the threads that own the worker copies and their resources.
-        On abort the pool is closed without teardown (resources are already
-        in an undefined state).
+        Called by the scheduler's finally block on both normal completion and
+        abort so worker resources are always released.
         """
         if self._pool is not None and self._thread_worker is not None:
             self._thread_worker.submit_teardown(self._pool)

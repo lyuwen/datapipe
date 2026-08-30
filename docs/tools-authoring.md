@@ -168,8 +168,7 @@ correctness.
 
 ## Adding examples
 
-`ToolExample` pairs are run as smoke tests during installation. They do not
-replace a proper test suite but they catch basic contract violations early:
+`ToolExample` pairs are declared for documentation and future smoke-test support. They are not yet executed during installation — a planned later release will run them as part of the installation validation pipeline. Declaring them now means they will be picked up automatically when that support ships:
 
 ```python
 @tool(
