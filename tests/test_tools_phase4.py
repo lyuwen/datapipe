@@ -856,3 +856,76 @@ class TestBuiltinInspection:
         assert tool.get("output") is not None, (
             f"output type missing from installed provider inspect: {tool}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: validate_dynamic executes supplied bytes, not the on-disk file
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDynamicStdin:
+    """validate_dynamic must execute the bytes passed as source_bytes, not re-read the path.
+
+    Previously the helper used spec.loader.exec_module(mod) which re-read the
+    file from disk, letting a concurrent edit slip in between static validation
+    and dynamic execution. The fix: read bytes from stdin and compile+exec them
+    directly so the coordinator's bytes are exactly what the subprocess runs.
+    """
+
+    def test_validates_supplied_bytes_not_disk_contents(self, tmp_path, unique_stem):
+        """When source_bytes differ from the file on disk, the in-memory bytes win."""
+        # Write a provider file with one tool name.
+        p = tmp_path / f"{unique_stem}.py"
+        p.write_text(PROVIDER_SRC)
+        disk_bytes = validate_static(p)
+
+        # Now overwrite the file with a different tool name — this simulates
+        # a concurrent edit between static validation and dynamic execution.
+        alt_src = PROVIDER_SRC.replace('name="shout"', 'name="whisper"')
+        p.write_text(alt_src)
+
+        # Pass the *original* (pre-overwrite) bytes to validate_dynamic.
+        meta = validate_dynamic(p, disk_bytes)
+        names = {t["name"] for t in meta.tools}
+
+        # The subprocess must have executed our bytes, seeing "shout" — not the
+        # disk bytes which now declare "whisper".
+        assert "shout" in names, (
+            "validate_dynamic used on-disk bytes instead of the supplied source_bytes"
+        )
+        assert "whisper" not in names, (
+            "validate_dynamic executed the modified on-disk file instead of supplied bytes"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: install_provider rolls back the provider directory on failure
+# ---------------------------------------------------------------------------
+
+
+class TestInstallRollback:
+    """A failed first-time install must leave no provider directory behind."""
+
+    def test_no_orphan_directory_after_registry_failure(self, tmp_path, unique_stem, monkeypatch):
+        """If the registry update fails, the newly created provider directory is removed."""
+        from datapipe.tools import registry as _reg
+
+        p = tmp_path / f"{unique_stem}.py"
+        p.write_text(PROVIDER_SRC)
+
+        provider_id = f"local:{unique_stem}"
+        pdir = _reg.provider_dir(provider_id)
+        assert not pdir.exists(), "provider dir should not exist before install"
+
+        # Monkey-patch add_provider to simulate a registry failure.
+        def _fail(_entry):
+            raise RuntimeError("simulated registry failure")
+
+        monkeypatch.setattr("datapipe.tools.installer.add_provider", _fail)
+
+        with pytest.raises(RuntimeError, match="simulated registry failure"):
+            install_provider(p, yes=True)
+
+        assert not pdir.exists(), (
+            "install_provider left an orphaned provider directory after registry failure"
+        )

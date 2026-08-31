@@ -128,21 +128,30 @@ def validate_static(path: Path) -> bytes:
 # provider output goes to stderr where it is captured and included in any
 # error message.
 _HELPER_TEMPLATE = """\
-import sys, json, importlib.util, pathlib, os
+import sys, json, pathlib, os, types
 
+# argv[1] names the provider file (used for sys.path seeding, the module
+# __file__, and traceback filenames).  The bytes to execute arrive on stdin
+# rather than being re-read from disk: the coordinator has already hashed
+# and statically validated exactly these bytes, and re-reading the file here
+# would open a TOCTOU window where a concurrent edit means we validate
+# different content than we hashed.
 provider_path = sys.argv[1]
 p = pathlib.Path(provider_path)
 sys.path.insert(0, str(p.parent))
+
+source_bytes = sys.stdin.buffer.read()
 
 # Redirect provider stdout to /dev/null during import to prevent top-level
 # print() calls from corrupting the JSON protocol output.
 _real_stdout = sys.stdout
 sys.stdout = open(os.devnull, "w")
 try:
-    spec = importlib.util.spec_from_file_location(p.stem, str(p))
-    mod = importlib.util.module_from_spec(spec)
+    mod = types.ModuleType(p.stem)
+    mod.__file__ = str(p)
     sys.modules[p.stem] = mod
-    spec.loader.exec_module(mod)
+    code = compile(source_bytes, str(p), "exec")
+    exec(code, mod.__dict__)
 finally:
     sys.stdout = _real_stdout
 

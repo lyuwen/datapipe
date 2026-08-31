@@ -26,6 +26,12 @@ from datapipe.context import WorkerContext
 from datapipe.execution.base import BoundedMapExecutor, WorkerSetupError, _Job
 from datapipe.runtime.context import RuntimeContext
 
+#: Seconds a teardown task waits at the gate for its sibling pool threads to
+#: arrive.  Reaching this timeout means the expected threads never showed up
+#: (already exited, or cancelled), so teardown proceeds and any worker still
+#: untorn-down is handled by the coordinator fallback.
+_TEARDOWN_GATE_TIMEOUT = 30.0
+
 
 class _ThreadLocalWorker:
     """Per-thread worker state.
@@ -128,15 +134,25 @@ class _ThreadLocalWorker:
     def submit_teardown(self, pool: ThreadPoolExecutor) -> None:
         """Tear down every initialized worker on its owning thread.
 
-        1. Snapshots all initialized states.
-        2. Sets every thread's teardown-signal event so the next pool task
-           on each thread will call teardown.
-        3. Submits ``max_workers`` tasks.  Each task calls
-           ``_check_and_run_teardown()``, which acts only on the calling
-           thread's own signal.  Since every signal is already set, each
-           thread tears down its worker on its first available task.
-        4. Coordinator fallback: any thread whose signal was never consumed
-           (thread exited before picking up a task) is handled here.
+        The affinity problem: ``ThreadPoolExecutor`` pulls work from a single
+        shared queue, so submitting N tasks does **not** give one task to each
+        of N threads — a fast thread can consume several while another gets
+        none, leaving that thread's worker to be torn down on the coordinator.
+
+        The fix is to park every pool thread at a gate before any teardown
+        runs.  Each submitted task blocks at ``gate.wait()`` immediately on
+        entry; a blocked thread cannot return to the queue for a second item,
+        so once ``max_workers`` tasks are submitted every pool thread is
+        holding exactly one of them.  The gate opens as soon as every thread
+        that owns a worker has arrived, at which point each thread runs
+        ``_check_and_run_teardown()`` against its own ``threading.local``.
+
+        Threads with no worker also park (rather than returning early) — this
+        is what stops them from stealing the items destined for worker
+        threads — but they do not count toward the gate.
+
+        The wait carries a timeout so a pool that cannot muster the expected
+        threads degrades to the coordinator fallback instead of hanging.
 
         Must be called while the pool is still accepting submissions.
         """
@@ -153,8 +169,29 @@ class _ThreadLocalWorker:
         for _, _, _, signal in states:
             signal.set()
 
-        # Submit max_workers tasks — enough for every live thread to get one.
-        futs = [pool.submit(self._check_and_run_teardown) for _ in range(self._max_workers)]
+        n_workers = len(states)
+        gate = threading.Event()
+        gate_lock = threading.Lock()
+        arrived = 0
+
+        def _gated_teardown() -> None:
+            nonlocal arrived
+            # Only threads that own a worker count toward opening the gate.
+            has_worker = getattr(self._local, "teardown_signal", None) is not None
+            if has_worker:
+                with gate_lock:
+                    arrived += 1
+                    if arrived >= n_workers:
+                        gate.set()
+            # Every thread parks here, worker-owning or not, so that no thread
+            # can loop back and consume a second task.
+            gate.wait(timeout=_TEARDOWN_GATE_TIMEOUT)
+            if has_worker:
+                self._check_and_run_teardown()
+
+        # One task per pool thread, so every thread is parked and therefore
+        # every worker-owning thread holds exactly one task.
+        futs = [pool.submit(_gated_teardown) for _ in range(self._max_workers)]
         for f in futs:
             try:
                 f.result()

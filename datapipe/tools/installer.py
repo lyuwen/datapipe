@@ -125,6 +125,11 @@ def install_provider(
     # --- Copy or editable install -------------------------------------------
     import json as _json
     pdir = provider_dir(provider_id)
+    # Record whether the provider directory already existed.  A rollback must
+    # remove a directory this install created, otherwise a failed first-time
+    # install leaves an empty directory behind that later reads mistake for a
+    # real (but empty) installation.
+    pdir_preexisted = pdir.exists()
     pdir.mkdir(parents=True, exist_ok=True)
 
     # For a transactional install: back up any pre-existing files so that if
@@ -139,7 +144,7 @@ def install_provider(
             backups[p] = p.read_bytes() if p.exists() else None
 
     def _rollback() -> None:
-        """Restore every touched file to its pre-install state."""
+        """Restore every touched path to its pre-install state."""
         for p in files_written:
             original = backups.get(p)
             try:
@@ -149,6 +154,13 @@ def install_provider(
                     p.write_bytes(original)
             except OSError:
                 pass
+        # Remove the provider directory only if this install created it and
+        # nothing else has since been written into it.
+        if not pdir_preexisted:
+            try:
+                pdir.rmdir()
+            except OSError:
+                pass  # non-empty or already gone — leave it alone
 
     if editable:
         source_path = str(path)
