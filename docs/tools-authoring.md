@@ -56,7 +56,7 @@ def normalize_text(value: str, *, lowercase: bool = False, strip: bool = True) -
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `name` | `str` | yes | Name used in DSL expressions |
-| `api_version` | `int` | yes | Must be `1` |
+| `api_version` | `int` | no | Defaults to `1`; must be `1` if given |
 | `target` | `str` | yes | `"value"` or `"record"` (see below) |
 | `input` | `JsonType \| TypeSpec` | yes | Acceptable input type |
 | `output` | `JsonType \| TypeSpec` | yes | Expected output type |
@@ -168,7 +168,11 @@ correctness.
 
 ## Adding examples
 
-`ToolExample` pairs are declared for documentation and future smoke-test support. They are not yet executed during installation — a planned later release will run them as part of the installation validation pipeline. Declaring them now means they will be picked up automatically when that support ships:
+`ToolExample` pairs are executed during installation and their output is
+validated against the tool's declared output contract.  A provider with a
+failing example is rejected and nothing is registered, so examples act as a
+functional smoke test in addition to documenting intent.  Examples run in an
+isolated subprocess, like the rest of dynamic validation:
 
 ```python
 @tool(
@@ -206,16 +210,24 @@ import os, tempfile
 from datapipe.tools.installer import install_provider
 from datapipe.tools import loader as _loader
 from datapipe.dsl.compiler import compile_expression
+from datapipe.stages.tool_program import CompiledToolProgramStage
+from datapipe.context import WorkerContext
 
 def test_via_dsl(tmp_path, monkeypatch):
     monkeypatch.setenv("DATAPIPE_USER_DATA", str(tmp_path / "data"))
     _loader._loaded_providers.clear()
     install_provider("my_tools.py", yes=True)
 
-    ce = compile_expression("normalize_text(.text, lowercase=true)")
-    inv = ce.invocations[0]
-    result = inv.tool_fn({"text": "  Hello  "}, **inv.arguments)
-    assert result == "hello"
+    # Drive the real stage rather than calling the tool directly: the stage
+    # resolves the selector, applies the tool to the selected value, and
+    # writes the result back into the record.  Provider tools are resolved
+    # per-worker from a descriptor, so a compiled ToolInvocation does not
+    # carry a callable you can invoke here.
+    stage = CompiledToolProgramStage(
+        compile_expression("normalize_text(.text, lowercase=true)")
+    )
+    ctx = WorkerContext(rank=0, world_size=1, worker_id=0, local_rank=None)
+    assert stage.process({"text": "  Hello  World "}, ctx) == {"text": "hello world"}
 ```
 
 ## Installing

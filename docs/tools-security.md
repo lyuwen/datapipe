@@ -27,11 +27,12 @@ without reviewing the source code first.
 
 ## Installation confirmation prompt
 
-The installer always prints a confirmation prompt showing the provider ID,
-source path, mode, and tool names before writing anything to the registry:
+Unless `--yes` is passed, the installer prints a confirmation prompt showing
+the provider ID, source path, mode, and tool names before writing anything to
+the registry:
 
 ```
-Provider: local:my-tools
+Provider: local:my_tools
 Source:   /absolute/path/my_tools.py
 Mode:     copied
 Tools:    normalize_text, redact
@@ -84,8 +85,16 @@ can change between runs without any registry action.
 For copied providers, every worker verifies the SHA-256 digest of the snapshot
 before importing it. If the snapshot has been modified after installation —
 whether by accident, by a concurrent process, or deliberately — the worker
-rejects it and logs a warning. The run continues with other providers intact;
-only the broken provider's tools become unavailable.
+raises `ProviderLoadError` and **the run aborts**. This is deliberate: a
+tampered provider is a trust failure, and continuing with some workers running
+verified code and others running modified code would be worse than stopping.
+Reinstall the provider to recover.
+
+A separate, narrower degradation path exists at *compile* time: if a provider
+cannot be enumerated while the coordinator is building its tool registry, that
+provider's tools become unavailable and a warning is printed, but expressions
+using only other providers and built-ins still run. That path does not apply to
+a worker-side digest mismatch, which always aborts.
 
 For editable providers, digest enforcement applies at compilation time rather
 than install time. On every expression compilation, datapipe re-reads and
@@ -98,10 +107,14 @@ workers to load different code versions.
 
 ## Subprocess isolation during validation
 
-Dynamic validation imports the provider in a fresh subprocess with a configurable
-timeout (default 30 seconds). The subprocess has a separate Python interpreter
+Dynamic validation imports the provider in a fresh subprocess with a 30 second
+timeout.  The timeout is a parameter of the Python API (`validate_dynamic`) and
+is not currently exposed as a CLI flag or environment variable. The subprocess has a separate Python interpreter
 and cannot interfere with the installer process. Its stdout is strictly
-captured; any accidental prints are separated from the protocol output.
+redirected to /dev/null during provider import, so accidental prints are
+discarded rather than corrupting the JSON protocol line.  They are not
+retained for inspection.  The redirect is applied at the Python level, so
+output written directly to fd 1 by native code can still reach the stream.
 
 If the provider hangs during import, the subprocess is killed after the timeout
 and installation fails cleanly.
