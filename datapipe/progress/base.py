@@ -14,6 +14,10 @@ class ProgressSnapshot:
 
     Attributes
     ----------
+    submitted:
+        Records pulled from the source and accounted for by the scheduler —
+        either dispatched to a worker or short-circuited as a per-record source
+        error. Always ``>= processed``.
     processed:
         Worker results received by the coordinator (advances on completion,
         before ordered buffering drains).
@@ -25,9 +29,14 @@ class ProgressSnapshot:
         Completed results waiting in the reorder buffer for an ordering gap
         to close (always 0 in unordered mode).
     in_flight:
-        Submitted tasks that have not yet completed.
+        Dispatched tasks that have not yet been delivered to the coordinator.
+        Owned by the scheduler, which is the only component that knows the
+        true dispatch state; never negative.
     failed:
         Records that produced an error (across all error policies).
+
+    The identity ``submitted - processed == in_flight`` holds for every
+    snapshot published from the gather loop.
     """
 
     processed: int = 0
@@ -36,6 +45,7 @@ class ProgressSnapshot:
     buffered: int = 0
     in_flight: int = 0
     failed: int = 0
+    submitted: int = 0
 
 
 class ProgressReporter:

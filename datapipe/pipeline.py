@@ -121,9 +121,11 @@ class Pipeline:
     def _dedupe_stage_names(self) -> None:
         """Reject explicit duplicate names; dedupe auto-generated ones."""
         seen: set[str] = set()
-        counts: dict[str, int] = {}
-        for stage in self.stages:
-            counts[stage.name] = counts.get(stage.name, 0) + 1
+        # Suffixes must skip names already claimed anywhere in the pipeline,
+        # including explicit names that appear later, so an auto-generated
+        # "loads_2" never collides with a user-chosen one.
+        taken: set[str] = {s.name for s in self.stages}
+        next_suffix: dict[str, int] = {}
         for stage in self.stages:
             name = stage.name
             if stage._name_explicit:
@@ -135,8 +137,11 @@ class Pipeline:
                 seen.add(name)
             else:
                 if name in seen:
-                    counts[name] += 1
-                    stage.name = f"{name}_{counts[name]}"
+                    n = next_suffix.get(name, 2)
+                    while f"{name}_{n}" in taken or f"{name}_{n}" in seen:
+                        n += 1
+                    next_suffix[name] = n + 1
+                    stage.name = f"{name}_{n}"
                 seen.add(stage.name)
 
     # -- compilation -------------------------------------------------------
@@ -319,31 +324,34 @@ class Pipeline:
         stats = ExecutionStats(rank=runtime.rank, world_size=runtime.world_size)
         ordered_buffer: dict[int, TaskResult] = {}
         next_to_emit = 0
-        in_flight = 0  # tracks submitted-but-not-yet-completed records
 
-        # Wrap the records iterator to count submissions into in_flight.
-        def _counting_records():
-            nonlocal in_flight
-            for record in records:
-                in_flight += 1
-                yield record
+        # Submitted / in-flight counts are owned by the executor's scheduler,
+        # which is the only component that sees every dispatch decision — a
+        # coordinator-side counting wrapper cannot observe SourceRecordError
+        # markers (which consume a sequence number without being dispatched)
+        # and so undercounted, and could even report a negative in_flight.
+        # A third-party executor that does not derive from ``Executor`` still
+        # works; it simply reports zeros for these two fields.
+        accounting = getattr(config.executor, "accounting", None)
+        if accounting is None:
+            from datapipe.execution.base import SubmissionAccounting
 
-        counting_records = _counting_records()
+            accounting = SubmissionAccounting()
 
         def _snapshot(extra_buffered: int = 0) -> ProgressSnapshot:
             return ProgressSnapshot(
+                submitted=accounting.submitted,
                 processed=stats.completed_records,
                 written=stats.output_records,
                 dropped=stats.dropped_records,
                 buffered=len(ordered_buffer) + extra_buffered,
-                in_flight=in_flight,
+                in_flight=accounting.in_flight,
                 failed=stats.failed_records,
             )
 
         def on_result(result: TaskResult) -> None:
             """Single entry point for every completed record."""
-            nonlocal next_to_emit, in_flight
-            in_flight -= 1
+            nonlocal next_to_emit
             stats.completed_records += 1
 
             if result.error is not None:
@@ -391,7 +399,7 @@ class Pipeline:
 
         try:
             stats = config.executor.run(
-                records=counting_records,
+                records=records,
                 worker=compiled,
                 runtime=runtime,
                 on_result=on_result,

@@ -21,7 +21,9 @@ The decorator validates the function signature immediately at import time:
 - no ``*args`` or ``**kwargs``;
 - all keyword-only parameters must have JSON-serializable defaults;
 - the declared tool ``input`` type must not directly contradict an explicit
-  Python annotation on the first parameter.
+  Python annotation on the first parameter.  Only clear conflicts are
+  rejected: an absent, ``Any``, or non-JSON annotation is accepted, as is any
+  annotation compatible with at least one member of a ``OneOf`` input.
 
 The resulting callable is unchanged; the contract is stored as the
 ``__tool_contract__`` attribute.
@@ -41,15 +43,33 @@ from datapipe.tools.contract import (
     ToolExample,
     make_contract,
 )
-from datapipe.tools.types import JsonType, TypeSpec, as_type_spec
+from datapipe.tools.types import JsonType, TypeSpec, as_type_spec, describe
 
 
 class ToolDecoratorError(Exception):
     """Raised when ``@tool`` detects a contract or signature problem."""
 
 
-# Annotation types that are allowed on keyword-only config parameters.
-_ALLOWED_ANNOTATIONS = {str, int, float, bool, type(None), list, dict}
+# Representative JSON values for each Python annotation that has a JSON
+# counterpart.  The declared input contract is probed with these through the
+# public ``TypeSpec.matches`` API, so ``OneOf`` and any future TypeSpec
+# subclass are handled without special-casing.
+#
+# ``float`` maps to both 1.5 and 1 because PEP 484's numeric tower makes an
+# ``int`` argument acceptable wherever ``float`` is annotated: a tool annotated
+# ``value: float`` declaring ``input=JsonType.INTEGER`` is consistent, not a
+# contradiction.  The reverse widening is deliberately absent — JSON semantics
+# keep ``bool`` disjoint from ``INTEGER``/``NUMBER`` (see ``_matches_json_type``)
+# even though ``bool`` subclasses ``int`` in Python.
+_ANNOTATION_PROBES: dict[Any, tuple[Any, ...]] = {
+    str: ("",),
+    int: (1,),
+    float: (1.5, 1),
+    bool: (True,),
+    list: ([],),
+    dict: ({},),
+    type(None): (None,),
+}
 
 
 def tool(
@@ -102,6 +122,7 @@ def tool(
             parameters=params,
             examples=list(examples),
         )
+        _validate_first_param_annotation(fn, name, contract.input_type)
         fn.__tool_contract__ = contract  # type: ignore[attr-defined]
         return fn
 
@@ -203,6 +224,48 @@ def _validate_signature(
         )
 
     return tuple(param_specs)
+
+
+def _validate_first_param_annotation(
+    fn: Callable,
+    tool_name: str,
+    input_type: TypeSpec,
+) -> None:
+    """Reject a first-parameter annotation that contradicts the declared input.
+
+    The explicit ``input=`` contract is authoritative (§5.4); the annotation is
+    documentation.  Only a *clear* conflict is rejected — one where no value of
+    the annotated Python type could ever satisfy the contract.  Absent,
+    ``Any``, and unmapped annotations are not conflicts, and a ``OneOf``
+    contract conflicts only when every member rejects the annotated type.
+    """
+    params = list(inspect.signature(fn).parameters.values())
+    first = params[0]
+
+    try:
+        annotation = typing.get_type_hints(fn).get(first.name)
+    except Exception:  # noqa: BLE001 — unresolvable hints are not a conflict
+        annotation = first.annotation if isinstance(first.annotation, type) else None
+    if annotation is None:
+        return
+
+    probes = _ANNOTATION_PROBES.get(annotation)
+    if probes is None:
+        # Reduce a parameterized generic (dict[str, int], list[str]) to its
+        # origin so container annotations are still checked.
+        probes = _ANNOTATION_PROBES.get(typing.get_origin(annotation))
+    if probes is None:
+        return
+
+    if any(input_type.matches(probe) for probe in probes):
+        return
+
+    raise ToolDecoratorError(
+        f"tool {tool_name!r}: first parameter {first.name!r} is annotated "
+        f"{getattr(annotation, '__name__', annotation)!r}, which contradicts "
+        f"the declared input type {describe(input_type)!r}; remove the "
+        "annotation or correct the input= declaration"
+    )
 
 
 def _validate_default(value: Any, param_name: str, tool_name: str) -> None:

@@ -195,6 +195,11 @@ def run_command(args: "argparse.Namespace") -> int:
         return 1
 
     # --- 5. Run -------------------------------------------------------------
+    from datapipe.cli.transform import describe_io
+    import logging as _logging
+    _logging.getLogger("datapipe").info(
+        "IO | %s", describe_io(source, sink, error_sink)
+    )
     try:
         stats = pipeline.run(
             source=source,

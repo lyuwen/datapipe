@@ -7,8 +7,9 @@ Compilation is a sequence of explicit passes (§9 of the CLI plan):
   3. Validate selector compatibility with tool target scope.
   4. Bind configuration literals to ``ParameterSpec`` definitions.
   5. Apply defaults and produce normalized argument values.
-  6. Perform statically provable input/output compatibility checks.
-  7. Produce ``ToolInvocation`` descriptors.
+  6. Produce ``ToolInvocation`` descriptors.
+  7. Perform statically provable input/output compatibility checks between
+     adjacent invocations on identical concrete paths.
 
 The output is a ``CompiledExpression`` containing a list of ``ToolInvocation``
 instances.  Built-in tools carry the live callable directly (they live in a
@@ -37,6 +38,253 @@ from datapipe.dsl.selector import CompiledSelector
 from datapipe.tools.contract import ParameterSpec, ToolContract
 from datapipe.tools.decorator import get_contract
 from datapipe.tools.descriptor import ProviderDescriptor, ToolDescriptor
+from datapipe.tools.types import TypeSpec, matches as _matches
+
+
+# ---------------------------------------------------------------------------
+# Decoding registry metadata back into live type objects
+#
+# ``datapipe.tools.validation`` runs providers in a subprocess and stores a
+# structured encoding of each contract's TypeSpecs and parameter annotations
+# in the registry JSON.  These decoders are the exact inverse.  A registry
+# entry written before the structured encoding existed has only the human
+# ``describe()`` string, so both decoders accept that as a fallback.
+# ---------------------------------------------------------------------------
+
+_BASE_ANNOTATIONS: dict[str, Any] = {
+    "str": str, "int": int, "float": float, "bool": bool,
+    "list": list, "dict": dict, "None": type(None),
+}
+
+
+class UnsupportedAnnotation:
+    """Marker for an annotation the provider subprocess could not encode.
+
+    Carries the reason so ``_validate_argument_type`` can reject the argument
+    with a message naming what went wrong, instead of silently accepting any
+    value (which is what a plain ``None`` annotation would do).
+    """
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, UnsupportedAnnotation) and self.reason == other.reason
+
+    def __hash__(self) -> int:
+        return hash(self.reason)
+
+    def __repr__(self) -> str:
+        return f"UnsupportedAnnotation({self.reason!r})"
+
+
+def decode_type_spec(spec: Any, description: str | None = None) -> TypeSpec:
+    """Rebuild a ``TypeSpec`` from its structured registry encoding.
+
+    Falls back to parsing *description* (the ``describe()`` string) when
+    *spec* is absent, and finally to ``JsonType.ANY``.
+    """
+    from datapipe.tools.types import JsonType, OneOf, as_type_spec
+
+    if isinstance(spec, dict):
+        kind = spec.get("kind")
+        if kind == "json_type":
+            try:
+                return as_type_spec(JsonType[str(spec.get("name"))])
+            except KeyError:
+                pass
+        elif kind == "one_of":
+            members = [decode_type_spec(m) for m in spec.get("members", [])]
+            if len(members) >= 2:
+                return OneOf(*members)
+            if len(members) == 1:
+                return members[0]
+
+    return _type_spec_from_description(description)
+
+
+def _type_spec_from_description(description: str | None) -> TypeSpec:
+    """Best-effort parse of a ``describe()`` string, for legacy registry entries."""
+    from datapipe.tools.types import JsonType, OneOf, as_type_spec
+
+    if not description:
+        return as_type_spec(JsonType.ANY)
+
+    parts = [p.strip() for p in description.split("|")]
+    resolved: list[JsonType] = []
+    for part in parts:
+        for jt in JsonType:
+            if jt.value == part or jt.name.lower() == part.lower():
+                resolved.append(jt)
+                break
+        else:
+            return as_type_spec(JsonType.ANY)
+
+    if len(resolved) == 1:
+        return as_type_spec(resolved[0])
+    return OneOf(*resolved)
+
+
+def decode_annotation(spec: Any, legacy_name: str | None = None) -> Any:
+    """Rebuild a parameter annotation from its structured registry encoding.
+
+    Returns a live type (``str``, ``list[int]``, a synthesized enum, ...), an
+    :class:`UnsupportedAnnotation` marker, or ``None`` when the parameter was
+    genuinely unannotated.
+    """
+    import typing
+
+    if spec is None:
+        return _BASE_ANNOTATIONS.get(legacy_name) if legacy_name else None
+
+    if not isinstance(spec, dict):
+        return UnsupportedAnnotation(f"malformed annotation encoding {spec!r}")
+
+    kind = spec.get("kind")
+
+    if kind == "base":
+        name = spec.get("name")
+        if name in _BASE_ANNOTATIONS:
+            return _BASE_ANNOTATIONS[name]
+        return UnsupportedAnnotation(f"unknown base type {name!r}")
+
+    if kind == "any":
+        return typing.Any
+
+    if kind == "enum":
+        values = spec.get("values")
+        if not isinstance(values, list) or not values:
+            return UnsupportedAnnotation("enum encoding has no member values")
+        return EnumValues(str(spec.get("name") or "enum"), tuple(values))
+
+    if kind == "literal":
+        values = spec.get("values")
+        if not isinstance(values, list) or not values:
+            return UnsupportedAnnotation("Literal encoding has no values")
+        return EnumValues(spec.get("name") or "Literal", tuple(values))
+
+    if kind == "union":
+        members = [decode_annotation(m) for m in spec.get("members", [])]
+        if not members:
+            return UnsupportedAnnotation("union encoding has no members")
+        bad = next((m for m in members if isinstance(m, UnsupportedAnnotation)), None)
+        if bad is not None:
+            return UnsupportedAnnotation(f"union member unsupported: {bad.reason}")
+        return UnionAnnotation(tuple(members))
+
+    if kind == "container":
+        origin = _BASE_ANNOTATIONS.get(spec.get("origin"))
+        if origin not in (list, dict):
+            return UnsupportedAnnotation(
+                f"container origin {spec.get('origin')!r} is not JSON-representable"
+            )
+        args = [decode_annotation(a) for a in spec.get("args", [])]
+        bad = next((a for a in args if isinstance(a, UnsupportedAnnotation)), None)
+        if bad is not None:
+            return UnsupportedAnnotation(f"container element unsupported: {bad.reason}")
+        return ContainerAnnotation(origin, tuple(args))
+
+    if kind == "unresolved":
+        return UnsupportedAnnotation(
+            f"annotation {spec.get('text')!r} could not be resolved to a type"
+        )
+
+    if kind == "unsupported":
+        return UnsupportedAnnotation(str(spec.get("reason") or "unsupported annotation"))
+
+    return UnsupportedAnnotation(f"unknown annotation kind {kind!r}")
+
+
+class UnionAnnotation:
+    """A decoded ``Union[...]`` / ``X | None`` annotation."""
+
+    __slots__ = ("members",)
+
+    def __init__(self, members: tuple[Any, ...]) -> None:
+        self.members = members
+
+    @property
+    def __name__(self) -> str:
+        return " | ".join(_annotation_name(m) for m in self.members)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, UnionAnnotation) and self.members == other.members
+
+    def __hash__(self) -> int:
+        return hash(("union", self.members))
+
+    def __repr__(self) -> str:
+        return f"UnionAnnotation({self.__name__})"
+
+
+class EnumValues:
+    """A decoded ``enum.Enum`` subclass or ``Literal``, reduced to allowed values."""
+
+    __slots__ = ("name", "values")
+
+    def __init__(self, name: str, values: tuple[Any, ...]) -> None:
+        self.name = name
+        self.values = values
+
+    @property
+    def __name__(self) -> str:
+        return self.name
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, EnumValues)
+            and self.name == other.name
+            and self.values == other.values
+        )
+
+    def __hash__(self) -> int:
+        return hash(("enum", self.name, self.values))
+
+    def __repr__(self) -> str:
+        return f"EnumValues({self.name!r}, {self.values!r})"
+
+
+class ContainerAnnotation:
+    """A decoded typed container annotation such as ``list[int]``/``dict[str, int]``."""
+
+    __slots__ = ("origin", "args")
+
+    def __init__(self, origin: type, args: tuple[Any, ...]) -> None:
+        self.origin = origin
+        self.args = args
+
+    @property
+    def __name__(self) -> str:
+        if not self.args:
+            return self.origin.__name__
+        inner = ", ".join(_annotation_name(a) for a in self.args)
+        return f"{self.origin.__name__}[{inner}]"
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, ContainerAnnotation)
+            and self.origin is other.origin
+            and self.args == other.args
+        )
+
+    def __hash__(self) -> int:
+        return hash(("container", self.origin, self.args))
+
+    def __repr__(self) -> str:
+        return f"ContainerAnnotation({self.__name__})"
+
+
+def _annotation_name(annotation: Any) -> str:
+    """Render an annotation for an error message."""
+    import typing
+
+    if annotation is typing.Any:
+        return "Any"
+    if annotation is type(None):
+        return "None"
+    return getattr(annotation, "__name__", None) or repr(annotation)
 
 
 # ---------------------------------------------------------------------------
@@ -184,35 +432,23 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
                 ParameterSpec as _ParameterSpec,
                 ToolContract as _ToolContract,
             )
-            from datapipe.tools.types import JsonType as _JsonType, as_type_spec as _as_type_spec
 
             # Build parameters from registry metadata, restoring annotation
-            # from the stored type-name string so compile-time type checking
-            # works for installed providers the same way it does for built-ins.
-            _ANN_MAP = {
-                "str": str, "int": int, "float": float, "bool": bool,
-                "list": list, "dict": dict, "None": type(None),
-            }
+            # from the structured ``annotation_spec`` when present (which
+            # round-trips Optional/Union/enum/container annotations) and
+            # falling back to the legacy type-name string for registry
+            # entries written before that field existed.
             params = []
             for p in tool_meta_.get("parameters", []):
-                ann_name = p.get("annotation")
-                annotation = _ANN_MAP.get(ann_name) if ann_name else None
+                annotation = decode_annotation(
+                    p.get("annotation_spec"), p.get("annotation")
+                )
                 params.append(_ParameterSpec(
                     name=p["name"],
                     default=p.get("default"),
                     required=p.get("required", False),
                     annotation=annotation,
                 ))
-
-            # Build input/output TypeSpecs; fall back to ANY when the stored
-            # description cannot be matched to a known JsonType.
-            def _jt_from_desc(desc: str | None) -> _JsonType:
-                if desc is None:
-                    return _JsonType.ANY
-                for jt in _JsonType:
-                    if jt.value == desc or jt.name.lower() == (desc or "").lower():
-                        return jt
-                return _JsonType.ANY
 
             try:
                 cardinality = _Cardinality(
@@ -225,8 +461,12 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
                 name=tool_name_,
                 api_version=1,
                 target=tool_meta_.get("target", "value"),
-                input_type=_as_type_spec(_jt_from_desc(tool_meta_.get("input"))),
-                output_type=_as_type_spec(_jt_from_desc(tool_meta_.get("output"))),
+                input_type=decode_type_spec(
+                    tool_meta_.get("input_spec"), tool_meta_.get("input")
+                ),
+                output_type=decode_type_spec(
+                    tool_meta_.get("output_spec"), tool_meta_.get("output")
+                ),
                 cardinality=cardinality,
                 deterministic=bool(tool_meta_.get("deterministic", True)),
                 description=tool_meta_.get("description", ""),
@@ -384,10 +624,80 @@ def compile_expression(expression: str) -> CompiledExpression:
             expression_span=(inv_node.span.start, inv_node.span.end),
         ))
 
+    _check_static_compatibility(invocations, expression)
+
     return CompiledExpression(
         invocations=tuple(invocations),
         source=expression,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pass 7: statically provable input/output compatibility
+# ---------------------------------------------------------------------------
+
+# Concrete values used to probe whether an output TypeSpec and the next
+# input TypeSpec can ever agree.  A pair is only reported as incompatible
+# when no probe satisfies both, which keeps the pass conservative: an
+# unfamiliar TypeSpec subclass simply fails to prove anything and stays silent.
+_PROBES: tuple[Any, ...] = (
+    None, True, False, 0, 1, -1, 1.5, "", "x", [], [1], {}, {"k": 1},
+)
+
+
+def _check_static_compatibility(
+    invocations: list[ToolInvocation],
+    expression: str,
+) -> None:
+    """Reject consecutive invocations that provably cannot agree on a type.
+
+    Static propagation is necessarily conservative — JSONL has no schema, so
+    the only sound inference is between two adjacent invocations writing and
+    reading the exact same concrete path.  A pair is flagged only when no
+    JSON value at all satisfies both the producer's declared output and the
+    consumer's declared input.  Wildcards, differing paths, and anything
+    involving ``ANY`` are left to runtime validation.
+    """
+    from datapipe.tools.types import JsonType, as_type_spec
+
+    any_spec = as_type_spec(JsonType.ANY)
+
+    for producer, consumer in zip(invocations, invocations[1:]):
+        if producer.selector.has_wildcard or consumer.selector.has_wildcard:
+            continue
+        if producer.selector.render() != consumer.selector.render():
+            continue
+        # A record-target tool rewrites the whole row, so its declared output
+        # says nothing about what sits at the consumer's path.
+        if producer.contract.target != consumer.contract.target:
+            continue
+
+        out_spec = producer.contract.output_type
+        in_spec = consumer.contract.input_type
+        if out_spec == any_spec or in_spec == any_spec:
+            continue
+
+        if any(
+            _matches(v, out_spec) and _matches(v, in_spec) for v in _PROBES
+        ):
+            continue
+        # No probe matched the producer's output at all: we cannot prove the
+        # output is inhabited, so we cannot prove a contradiction either.
+        if not any(_matches(v, out_spec) for v in _PROBES):
+            continue
+
+        from datapipe.tools.types import describe as _describe
+        raise ToolConfigurationError(
+            f"tool {producer.tool_name!r} outputs "
+            f"{_describe(out_spec)} at {producer.selector.render()}, but "
+            f"{consumer.tool_name!r} accepts only {_describe(in_spec)} there; "
+            "no value can satisfy both",
+            expression=expression,
+            span=Span(
+                consumer.expression_span[0],
+                consumer.expression_span[1],
+            ) if consumer.expression_span else None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -489,18 +799,28 @@ def _bind_arguments(
         if param.name not in bound:
             default = param.default
             bound[param.name] = default
+            if param.annotation is None:
+                continue
+            # An annotation that cannot be validated is a broken contract
+            # regardless of the value, so check it even when the default is
+            # None; that error is already self-explanatory and passes through.
+            if isinstance(param.annotation, (UnsupportedAnnotation, str)):
+                _validate_argument_type(
+                    default, param, contract.name, expression, _invocation_span
+                )
+                continue
             # Check default against its annotation so that a badly declared
             # default (e.g. annotation=bool but default="yes") is caught at
             # compile time rather than silently passing through to the worker.
-            if default is not None and param.annotation is not None:
+            if default is not None:
                 try:
                     _validate_argument_type(default, param, contract.name, expression, _invocation_span)
                 except ToolConfigurationError:
                     # Re-raise with a clearer message about it being a default.
-                    ann_name = getattr(param.annotation, "__name__", repr(param.annotation))
                     raise ToolConfigurationError(
                         f"default value {default!r} for argument {param.name!r} of "
-                        f"{contract.name!r} does not match its annotation {ann_name!r}",
+                        f"{contract.name!r} does not match its annotation "
+                        f"{_annotation_name(param.annotation)!r}",
                         expression=expression,
                         span=_invocation_span,
                     )
@@ -522,6 +842,45 @@ _ANNOTATION_TYPES: dict[type, tuple[type, ...]] = {
 }
 
 
+def _matches_annotation(value: Any, annotation: Any) -> bool:
+    """Return True when *value* satisfies *annotation*.
+
+    Bool is deliberately not accepted where ``int``/``float`` is declared:
+    ``bool`` is a subclass of both in Python, but a boolean literal in an
+    expression is never what a numeric parameter meant.
+    """
+    import typing
+
+    if annotation is typing.Any:
+        return True
+
+    if isinstance(annotation, UnionAnnotation):
+        return any(_matches_annotation(value, m) for m in annotation.members)
+
+    if isinstance(annotation, EnumValues):
+        return any(v == value and type(v) is type(value) for v in annotation.values)
+
+    if isinstance(annotation, ContainerAnnotation):
+        if not isinstance(value, annotation.origin):
+            return False
+        if annotation.origin is list and len(annotation.args) == 1:
+            return all(_matches_annotation(item, annotation.args[0]) for item in value)
+        if annotation.origin is dict and len(annotation.args) == 2:
+            key_ann, val_ann = annotation.args
+            return all(
+                _matches_annotation(k, key_ann) and _matches_annotation(v, val_ann)
+                for k, v in value.items()
+            )
+        return True
+
+    expected = _ANNOTATION_TYPES.get(annotation)
+    if expected is None:
+        return False
+    if annotation in (int, float) and isinstance(value, bool):
+        return False
+    return isinstance(value, expected)
+
+
 def _validate_argument_type(
     value: Any,
     param: ParameterSpec,
@@ -531,44 +890,65 @@ def _validate_argument_type(
 ) -> None:
     """Raise ``ToolConfigurationError`` when *value* does not match *param*'s annotation.
 
-    Bool must be checked before int/float because ``bool`` is a subclass of
-    both in Python, so ``isinstance(True, int)`` and ``isinstance(True, float)``
-    are both True.
+    Every annotation the encoder can represent is checked deterministically
+    before any data is read (§2.4).  An annotation that cannot be checked is
+    rejected rather than skipped: silently accepting an unvalidated value is
+    indistinguishable from having no contract at all.
     """
+    import typing
+
     annotation = param.annotation
     if annotation is None:
         return  # no annotation → no static check
 
-    expected = _ANNOTATION_TYPES.get(annotation)
-    if expected is None:
-        # Unsupported annotation (Optional, Union, enum, typed container, etc.).
-        # Emit a warning so authors know their annotation isn't being validated
-        # rather than silently accepting any value.
-        import warnings as _warnings
-        ann_name = getattr(annotation, "__name__", repr(annotation))
-        _warnings.warn(
-            f"argument {param.name!r} for tool {tool_name!r} has annotation "
-            f"{ann_name!r} which is not validated at compile time; "
-            "only str, int, float, bool, list, dict, and None are checked",
-            stacklevel=4,
-        )
-        return
-
-    # Special-case bool: True/False must not be accepted where int or float is
-    # declared — the caller likely meant a numeric literal, not a boolean.
-    if annotation in (int, float) and isinstance(value, bool):
+    if isinstance(annotation, UnsupportedAnnotation):
         raise ToolConfigurationError(
-            f"argument {param.name!r} for {tool_name!r}: expected "
-            f"{annotation.__name__}, got bool ({value!r})",
+            f"argument {param.name!r} for {tool_name!r} has an annotation that "
+            f"cannot be validated at compile time ({annotation.reason}); "
+            "use str, int, float, bool, list, dict, None, Optional/Union of "
+            "those, an enum, or a typed container",
             expression=expression,
             span=span,
         )
 
-    if not isinstance(value, expected):
-        actual_type = type(value).__name__
+    if isinstance(annotation, str):
+        raise ToolConfigurationError(
+            f"argument {param.name!r} for {tool_name!r} has the unresolved "
+            f"string annotation {annotation!r}; it must resolve to a type at "
+            "import time so configuration can be validated before data is read",
+            expression=expression,
+            span=span,
+        )
+
+    if isinstance(annotation, EnumValues) and not _matches_annotation(value, annotation):
+        allowed = ", ".join(repr(v) for v in annotation.values)
+        raise ToolConfigurationError(
+            f"argument {param.name!r} for {tool_name!r}: {value!r} is not one of "
+            f"the allowed values for {annotation.__name__} ({allowed})",
+            expression=expression,
+            span=span,
+        )
+
+    known = (
+        annotation is typing.Any
+        or annotation in _ANNOTATION_TYPES
+        or isinstance(annotation, (UnionAnnotation, EnumValues, ContainerAnnotation))
+    )
+    if not known:
+        ann_name = _annotation_name(annotation)
+        raise ToolConfigurationError(
+            f"argument {param.name!r} for {tool_name!r} has annotation "
+            f"{ann_name} which is not supported for compile-time validation; "
+            "use str, int, float, bool, list, dict, None, Optional/Union of "
+            "those, an enum, or a typed container",
+            expression=expression,
+            span=span,
+        )
+
+    if not _matches_annotation(value, annotation):
         raise ToolConfigurationError(
             f"argument {param.name!r} for {tool_name!r}: expected "
-            f"{annotation.__name__}, got {actual_type} ({value!r})",
+            f"{_annotation_name(annotation)}, got {type(value).__name__} ({value!r})",
             expression=expression,
             span=span,
         )

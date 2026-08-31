@@ -48,16 +48,18 @@ class TqdmProgress(ProgressReporter):
         if self._bar is None:
             return
         self._bar.update(n)
+        # The bar surfaces the §12 fields: processed/written/buffered/in_flight
+        # (plus failed when non-zero).  Every field is set unconditionally so
+        # the postfix reflects current state — omitting zeros would leave a
+        # stale non-zero value stuck on the bar after the count drains.
         postfix: dict[str, Any] = {}
-        if self._error_count:
-            postfix["errors"] = self._error_count
         if snapshot is not None:
-            if snapshot.buffered:
-                postfix["buffered"] = snapshot.buffered
-            if snapshot.in_flight:
-                postfix["in_flight"] = snapshot.in_flight
-        if postfix:
-            self._bar.set_postfix(postfix)
+            postfix["processed"] = snapshot.processed
+            postfix["written"] = snapshot.written
+            postfix["buffered"] = snapshot.buffered
+            postfix["in_flight"] = snapshot.in_flight
+        postfix["errors"] = self._error_count
+        self._bar.set_postfix(postfix)
 
     def close(self) -> None:
         if self._bar is not None:

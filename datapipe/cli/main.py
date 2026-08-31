@@ -2,11 +2,17 @@
 
 Commands
 --------
-datapipe run       Execute a Python-defined Pipeline
-datapipe inspect   Inspect a Pipeline's stage structure
-datapipe transform jq-like transform expression
-datapipe tools     tool provider management sub-commands
-datapipe --version Print the installed version
+datapipe run                Execute a Python-defined Pipeline
+datapipe inspect            Inspect a Pipeline's stage structure
+datapipe transform          jq-like transform expression
+datapipe inspect-expression Compile an expression and show how it resolves
+datapipe tools              tool provider management sub-commands
+datapipe --version          Print the installed version
+
+Logging
+-------
+Set ``DATAPIPE_LOG_LEVEL`` (DEBUG/INFO/WARNING/ERROR) to control CLI log
+verbosity.  At INFO the run start-up summary is logged before execution.
 
 The shorthand positional form (§3.1 of the CLI plan) dispatches to
 ``transform`` when the first argument is neither a recognized sub-command
@@ -25,7 +31,7 @@ import sys
 # Parser construction
 # ---------------------------------------------------------------------------
 
-_RECOGNIZED_COMMANDS = {"run", "inspect", "transform", "tools"}
+_RECOGNIZED_COMMANDS = {"run", "inspect", "inspect-expression", "transform", "tools"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,7 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Parallel record processing pipeline.\n\n"
             "Run a Python-defined pipeline:  datapipe run pipeline.py:obj ...\n"
             "Inspect a pipeline definition:  datapipe inspect pipeline.py:obj\n"
-            "Transform records (jq-like):    datapipe 'EXPR' input.jsonl output.jsonl"
+            "Transform records (jq-like):    datapipe 'EXPR' input.jsonl output.jsonl\n"
+            "Inspect an expression:          datapipe inspect-expression 'EXPR'\n\n"
+            "Set DATAPIPE_LOG_LEVEL=INFO for verbose run logging."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -52,8 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_parser(sub)
     add_inspect_parser(sub)
 
-    from datapipe.cli.transform import add_transform_parser
+    from datapipe.cli.transform import (
+        add_inspect_expression_parser,
+        add_transform_parser,
+    )
     add_transform_parser(sub)
+    add_inspect_expression_parser(sub)
 
     from datapipe.cli.tools import add_tools_parser
     add_tools_parser(sub)
@@ -125,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "transform":
         from datapipe.cli.transform import transform_command
         return transform_command(args)
+
+    if args.command == "inspect-expression":
+        from datapipe.cli.transform import inspect_expression_command
+        return inspect_expression_command(args)
 
     if args.command == "tools":
         from datapipe.cli.tools import tools_command

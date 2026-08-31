@@ -44,29 +44,42 @@ class SequentialExecutor(Executor):
         # Setup once.
         if hasattr(worker, "setup"):
             worker.setup(ctx)
+        # Sequential execution keeps the same submitted / in-flight semantics
+        # as the bounded scheduler: a record counts as submitted when it is
+        # pulled from the source, is in flight only while the worker runs it,
+        # and is out of flight by the time its result reaches ``on_result``.
+        acc = self.accounting
+        acc.reset()
         try:
             for seq, value in enumerate(records):
                 ctx.record_index = seq
+                acc.submitted += 1
                 if isinstance(value, SourceRecordError):
                     # Resumable per-record source failure: report it without
-                    # running the pipeline and keep processing.
+                    # running the pipeline and keep processing.  Never becomes
+                    # in-flight because no work is dispatched for it.
                     on_result(_wrap_error(_seq_job(seq), value.exc))
                     stats.max_in_flight_observed = max(
                         stats.max_in_flight_observed, 1
                     )
                     continue
+                acc.in_flight = 1
                 try:
                     result = worker.process(value, ctx)
                 except (KeyboardInterrupt, SystemExit):
+                    acc.in_flight = 0
                     raise
                 except BaseException as exc:  # noqa: BLE001
+                    acc.in_flight = 0
                     on_result(_wrap_error(_seq_job(seq), exc))
                 else:
+                    acc.in_flight = 0
                     on_result(_wrap_result(_seq_job(seq), result))
                 stats.max_in_flight_observed = max(
                     stats.max_in_flight_observed, 1
                 )
         finally:
+            acc.in_flight = 0
             if hasattr(worker, "teardown"):
                 worker.teardown(ctx)
         return stats

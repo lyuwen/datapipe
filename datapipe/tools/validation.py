@@ -138,7 +138,7 @@ def validate_static(path: Path) -> bytes:
 # provider output goes to stderr where it is captured and included in any
 # error message.
 _HELPER_TEMPLATE = """\
-import sys, json, pathlib, os, types
+import sys, json, pathlib, os, types, enum, typing
 
 # argv[1] names the provider file (used for sys.path seeding, the module
 # __file__, and traceback filenames).  The bytes to execute arrive on stdin
@@ -171,6 +171,103 @@ except Exception:
     def _describe(t):
         return repr(t)
 
+# ---------------------------------------------------------------------------
+# Structured, reversible encoding of TypeSpec and parameter annotations.
+#
+# ``describe()`` is lossy: OneOf(STRING, ARRAY) renders as "string | array",
+# which the coordinator cannot reliably parse back, so every composite
+# contract used to degrade to JsonType.ANY and accept anything.  These
+# encoders emit a tagged JSON structure that datapipe.dsl.compiler decodes
+# exactly.  Both are defensive: anything they cannot represent becomes an
+# {"kind": "unsupported", "reason": ...} node so a single odd annotation
+# degrades one parameter instead of failing the whole validation run.
+# ---------------------------------------------------------------------------
+
+try:
+    from datapipe.tools.types import JsonType as _JsonType, OneOf as _OneOf, TypeSpec as _TypeSpec
+except Exception:
+    _JsonType = _OneOf = _TypeSpec = None
+
+
+def _encode_type_spec(spec, depth=0):
+    if depth > 8:
+        return {"kind": "unsupported", "reason": "type nesting too deep"}
+    if _JsonType is None:
+        return {"kind": "unsupported", "reason": "datapipe.tools.types unavailable"}
+    if isinstance(spec, _JsonType):
+        return {"kind": "json_type", "name": spec.name}
+    if _OneOf is not None and isinstance(spec, _OneOf):
+        return {
+            "kind": "one_of",
+            "members": [_encode_type_spec(m, depth + 1) for m in spec.members],
+        }
+    jt = getattr(spec, "json_type", None)
+    if isinstance(jt, _JsonType):
+        return {"kind": "json_type", "name": jt.name}
+    return {
+        "kind": "unsupported",
+        "reason": "unrecognised TypeSpec subclass " + type(spec).__name__,
+    }
+
+
+_ANN_BASE_NAMES = {
+    str: "str", int: "int", float: "float", bool: "bool",
+    list: "list", dict: "dict", type(None): "None",
+}
+
+
+def _encode_annotation(ann, depth=0):
+    if depth > 8:
+        return {"kind": "unsupported", "reason": "annotation nesting too deep"}
+    if ann is None or ann is type(None):
+        return {"kind": "base", "name": "None"}
+    if ann is typing.Any:
+        return {"kind": "any"}
+    if isinstance(ann, str):
+        # PEP 563 annotation the provider's own get_type_hints() could not
+        # resolve; pass the text through so the coordinator can report it.
+        return {"kind": "unresolved", "text": ann}
+    if isinstance(ann, type) and ann in _ANN_BASE_NAMES:
+        return {"kind": "base", "name": _ANN_BASE_NAMES[ann]}
+    if isinstance(ann, type) and issubclass(ann, enum.Enum):
+        try:
+            values = [m.value for m in ann]
+            json.dumps(values)
+        except Exception:
+            return {
+                "kind": "unsupported",
+                "reason": "enum " + ann.__name__ + " has non-JSON member values",
+            }
+        return {"kind": "enum", "name": ann.__name__, "values": values}
+
+    origin = typing.get_origin(ann)
+    args = typing.get_args(ann)
+    if origin is typing.Union or (
+        getattr(types, "UnionType", None) is not None and origin is types.UnionType
+    ):
+        return {
+            "kind": "union",
+            "members": [_encode_annotation(a, depth + 1) for a in args],
+        }
+    if origin is typing.Literal:
+        try:
+            json.dumps(list(args))
+        except Exception:
+            return {"kind": "unsupported", "reason": "Literal has non-JSON values"}
+        return {"kind": "literal", "values": list(args)}
+    if origin in (list, set, frozenset, tuple, dict) and origin in _ANN_BASE_NAMES:
+        return {
+            "kind": "container",
+            "origin": _ANN_BASE_NAMES[origin],
+            "args": [_encode_annotation(a, depth + 1) for a in args],
+        }
+
+    return {
+        "kind": "unsupported",
+        "reason": "annotation " + repr(ann) + " has no structured encoding",
+    }
+
+
 tools = []
 for attr_name in dir(mod):
     obj = getattr(mod, attr_name)
@@ -185,11 +282,16 @@ for attr_name in dir(mod):
         ann_name = None
         if ann is not None:
             ann_name = getattr(ann, "__name__", None) if ann is not type(None) else "None"
+        try:
+            ann_spec = _encode_annotation(ann) if ann is not None else None
+        except Exception as exc:
+            ann_spec = {"kind": "unsupported", "reason": "encoder failed: " + str(exc)}
         params.append({
             "name": ps.name,
             "default": ps.default,
             "required": ps.required,
             "annotation": ann_name,
+            "annotation_spec": ann_spec,
         })
     try:
         input_type = _describe(contract.input_type)
@@ -197,6 +299,12 @@ for attr_name in dir(mod):
     except Exception:
         input_type = None
         output_type = None
+    try:
+        input_spec = _encode_type_spec(contract.input_type)
+        output_spec = _encode_type_spec(contract.output_type)
+    except Exception as exc:
+        reason = {"kind": "unsupported", "reason": "encoder failed: " + str(exc)}
+        input_spec = output_spec = reason
     tools.append({
         "name": contract.name,
         "target": contract.target,
@@ -205,6 +313,8 @@ for attr_name in dir(mod):
         "description": contract.description,
         "input": input_type,
         "output": output_type,
+        "input_spec": input_spec,
+        "output_spec": output_spec,
         "parameters": params,
     })
 

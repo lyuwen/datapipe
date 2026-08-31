@@ -14,6 +14,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from datapipe.tools.examples import (
+    ExampleValidationError,
+    MetadataLimitError,
+    SpawnSmokeTestError,
+    check_metadata_limits,
+    compare_static_dynamic,
+    run_examples,
+    spawn_load_smoke_test,
+)
 from datapipe.tools.registry import (
     ProviderEntry,
     add_provider,
@@ -104,6 +113,51 @@ def install_provider(
 
     tool_names = [t["name"] for t in metadata.tools]
 
+    # --- Metadata hygiene ---------------------------------------------------
+    # Names and descriptions end up in CLI output and registry JSON, so they
+    # are size- and character-limited (plan §8.2).
+    try:
+        check_metadata_limits(metadata.tools)
+    except MetadataLimitError as exc:
+        raise InstallationError(str(exc)) from exc
+
+    # --- Static/dynamic metadata agreement ----------------------------------
+    # validate_static collects @tool names by AST walk; validate_dynamic
+    # collects the real contracts by importing.  A name the source declares
+    # but the import does not produce means the provider's advertised surface
+    # does not match its real one, so refuse to register it (plan §8.2, final
+    # bullet).
+    comparison = compare_static_dynamic(source_bytes, path, metadata.tools)
+    if comparison.missing_dynamically:
+        raise InstallationError(
+            f"{path}: provider metadata is inconsistent — "
+            f"{comparison.describe()}. A @tool declared at module level must "
+            "exist as a module attribute after import; check for a later "
+            "redefinition or a conditional definition shadowing it."
+        )
+
+    # --- Functional smoke tests: declared examples (plan §8.3) --------------
+    try:
+        example_report = run_examples(path, source_bytes)
+    except ExampleValidationError as exc:
+        raise InstallationError(str(exc)) from exc
+
+    # --- Functional smoke test: load under spawn (plan §8.2/§8.3) ----------
+    # Verify now, in a genuinely fresh interpreter, that a worker can resolve
+    # this provider.  Failing at install is far better than failing per-record
+    # for every record of every later run.
+    try:
+        spawn_load_smoke_test(
+            provider_id=provider_id,
+            alias=alias,
+            mode="editable" if editable else "copied",
+            source_path=str(path),
+            digest=digest,
+            expected_tools=tool_names,
+        )
+    except SpawnSmokeTestError as exc:
+        raise InstallationError(str(exc)) from exc
+
     # --- Confirmation prompt ------------------------------------------------
     if not yes:
         mode_label = "editable" if editable else "copied"
@@ -111,6 +165,11 @@ def install_provider(
         print(f"Source:   {path}")
         print(f"Mode:     {mode_label}")
         print(f"Tools:    {', '.join(tool_names) if tool_names else '(none)'}")
+        if example_report.examples_run:
+            print(
+                f"Examples: {example_report.examples_run} passed "
+                f"across {example_report.tools_with_examples} tool(s)"
+            )
         print()
         print(
             "This provider contains executable Python and will run inside "

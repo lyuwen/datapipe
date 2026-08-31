@@ -227,5 +227,15 @@ datapipe/
 ├── runtime/          # RuntimeContext, env detection (torchrun/Slurm/K8s)
 ├── io/               # Source/Sink, JSONL, Parquet, iterable
 ├── progress/         # ProgressReporter, TqdmProgress
-└── cli/              # CLI skeleton (Phase 4)
+├── dsl/              # jq-like expression lexer, parser, compiler, selectors
+├── stages/           # CompiledToolProgramStage (the tool-program hot path)
+├── tools/            # Tool contracts, @tool decorator, registry, installer
+└── cli/              # datapipe run / inspect / transform / inspect-expression / tools
 ```
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATAPIPE_LOG_LEVEL` | `WARNING` | CLI log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`). At `INFO` the CLI logs a start-up summary naming the source, sink, executor, worker count, rank and error policy. |
+| `DATAPIPE_USER_DATA` | `~/.local/share` | Base directory for the tool provider registry. |

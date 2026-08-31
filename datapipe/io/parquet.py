@@ -119,6 +119,7 @@ class ParquetSource(Source):
         self.filters = filters
         self._filter_expr = None
         self.batch_size = batch_size
+        self._shard: tuple[int, int] | None = None
 
     def _files(self) -> list[str]:
         pa, pq, ds = _require_pyarrow()
@@ -147,6 +148,12 @@ class ParquetSource(Source):
         self._expr()
         if world_size <= 1:
             return self.__iter__()
+        # Record the physical division so ``total`` reports what this rank will
+        # actually read. This assignment must happen here rather than in
+        # ``open()``: ``Source.iter_for_runtime`` reads ``total`` to resolve a
+        # RangeSharding *before* calling ``iter_shard``, and that consumer needs
+        # the full-dataset count.
+        self._shard = (rank, world_size)
         if _is_dataset_path(self.path):
             # Directory datasets (including Hive-partitioned ones): shard by
             # file index via a directory-level dataset so partition metadata
@@ -237,12 +244,39 @@ class ParquetSource(Source):
 
     @property
     def total(self) -> int | None:
+        """Row count this source will yield, or ``None`` if undiscoverable.
+
+        Once ``iter_shard`` has divided the dataset, this reports only the
+        current rank's share so a per-rank progress bar reaches 100%.
+        """
         try:
             pa, pq, ds = _require_pyarrow()
+            if self._shard is not None:
+                return self._shard_total(*self._shard)
             files = self._files()
             return int(sum(pq.ParquetFile(f).metadata.num_rows for f in files))
         except Exception:
             return None
+
+    def _shard_total(self, rank: int, world_size: int) -> int | None:
+        """Row count for *rank*'s physical share, mirroring ``iter_shard``.
+
+        Returns ``None`` when a filter is active: the predicate is applied per
+        row group at scan time, so the metadata row counts overstate the result
+        and a wrong total is worse than no total.
+        """
+        pa, pq, ds = _require_pyarrow()
+        if self._expr() is not None:
+            return None
+        if _is_dataset_path(self.path):
+            dataset = ds.dataset(self.path, format="parquet", partitioning="hive")
+            mine = sorted(dataset.files)[rank::world_size]
+            return int(sum(pq.ParquetFile(f).metadata.num_rows for f in mine))
+        meta = pq.ParquetFile(self.path).metadata
+        groups = range(meta.num_row_groups)
+        return int(
+            sum(meta.row_group(g).num_rows for g in groups[rank::world_size])
+        )
 
 
 class ParquetSink(Sink):

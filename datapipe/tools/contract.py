@@ -39,11 +39,6 @@ class Cardinality(enum.Enum):
 
 _SUPPORTED_CARDINALITIES = frozenset({Cardinality.ONE_TO_ONE})
 
-# Python types that are allowed as keyword-only configuration annotations.
-_ALLOWED_PARAM_TYPES: frozenset[type] = frozenset(
-    {str, int, float, bool, type(None), list, dict}
-)
-
 
 @dataclass(frozen=True)
 class ParameterSpec:

@@ -36,8 +36,65 @@ class WorkerSetupError(Exception):
         self.cause = cause
 
 
+class SubmissionAccounting:
+    """Live submitted / in-flight counters owned by the scheduler.
+
+    The scheduler is the only component that knows the true dispatch state, so
+    it owns these counters rather than letting the coordinator approximate them
+    by wrapping the record iterator (which cannot see source-error markers, and
+    which produced negative in-flight counts).
+
+    Semantics
+    ---------
+    ``submitted``
+        Records pulled from the source and accounted for: either dispatched to
+        a worker, or short-circuited as a ``SourceRecordError`` marker. Counted
+        *before* the corresponding ``on_result`` call so ``submitted`` never
+        lags ``processed``.
+    ``in_flight``
+        Dispatched tasks that have not yet been delivered to ``on_result``. A
+        record is removed from the in-flight set before its result is
+        delivered, so during an ``on_result`` call the record being reported is
+        not counted.
+
+    Both counters are written only by the scheduler and read only from the
+    thread that drives it (``on_result`` runs on the coordinator), so no lock
+    is needed. The invariant ``submitted - processed == in_flight`` holds at
+    every ``on_result`` entry.
+    """
+
+    __slots__ = ("submitted", "in_flight")
+
+    def __init__(self) -> None:
+        self.submitted = 0
+        self.in_flight = 0
+
+    def reset(self) -> None:
+        self.submitted = 0
+        self.in_flight = 0
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"SubmissionAccounting(submitted={self.submitted}, "
+            f"in_flight={self.in_flight})"
+        )
+
+
 class Executor(ABC):
     """Owns local parallelism only."""
+
+    @property
+    def accounting(self) -> SubmissionAccounting:
+        """Live submitted / in-flight counters for the current run.
+
+        Created lazily so subclasses need not call ``super().__init__``, and
+        reset at the start of every ``run()``.
+        """
+        acc = getattr(self, "_accounting", None)
+        if acc is None:
+            acc = SubmissionAccounting()
+            self._accounting = acc
+        return acc
 
     @abstractmethod
     def run(
@@ -140,6 +197,7 @@ class BoundedMapExecutor(Executor):
         stats = stats or ExecutionStats(
             rank=runtime.rank, world_size=runtime.world_size
         )
+        self.accounting.reset()
         self._start_backend(runtime, worker)
         try:
             self._scheduler_loop(
@@ -166,7 +224,7 @@ class BoundedMapExecutor(Executor):
         pending: dict[Future, _Job] = {}
         next_seq = 0
         source_exhausted = False
-        aborting = False
+        acc = self.accounting
 
         def fill() -> None:
             nonlocal next_seq, source_exhausted
@@ -178,7 +236,11 @@ class BoundedMapExecutor(Executor):
                     break
                 except SourceRecordError as exc:
                     # A source may *raise* SourceRecordError; treat it the
-                    # same as a yielded marker below.
+                    # same as a yielded marker below.  It consumes a sequence
+                    # number and counts as submitted (so submitted stays >=
+                    # processed) but it never becomes in-flight: no task is
+                    # dispatched and the result is delivered inline.
+                    acc.submitted += 1
                     on_result(
                         _wrap_error(_Job(seq=next_seq, value=None), exc.exc)
                     )
@@ -192,6 +254,7 @@ class BoundedMapExecutor(Executor):
                 if isinstance(value, SourceRecordError):
                     # Resumable per-record failure: report it without
                     # submitting a job and keep pulling subsequent records.
+                    acc.submitted += 1
                     on_result(
                         _wrap_error(_Job(seq=next_seq, value=None), value.exc)
                     )
@@ -201,6 +264,8 @@ class BoundedMapExecutor(Executor):
                 next_seq += 1
                 future = self._submit(job)
                 pending[future] = job
+                acc.submitted += 1
+                acc.in_flight = len(pending)
                 stats.max_in_flight_observed = max(
                     stats.max_in_flight_observed, len(pending)
                 )
@@ -214,6 +279,11 @@ class BoundedMapExecutor(Executor):
                 )
                 for future in done:
                     job = pending.pop(future)
+                    # Drop out of the in-flight set *before* delivering the
+                    # result: the coordinator builds its progress snapshot
+                    # inside on_result, and the record being reported there is
+                    # no longer in flight.
+                    acc.in_flight = len(pending)
                     try:
                         result = future.result()
                     except WorkerSetupError:
@@ -235,6 +305,10 @@ class BoundedMapExecutor(Executor):
         finally:
             for future in list(pending):
                 future.cancel()
+            # Cancelled work will never be delivered to on_result, so it is no
+            # longer in flight.  Leaving the count non-zero would leak a stale
+            # number into any snapshot published during teardown.
+            acc.in_flight = 0
             # Let subclasses (e.g. ThreadExecutor) submit teardown futures to
             # the still-live pool before it is closed.  Runs on both normal
             # completion and abort so worker resources are always released.
@@ -249,4 +323,5 @@ __all__ = [
     "Executor",
     "BoundedMapExecutor",
     "ExecutionStats",
+    "SubmissionAccounting",
 ]

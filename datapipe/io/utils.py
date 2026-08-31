@@ -28,10 +28,17 @@ def detect_compression(path: str, compression: str = "auto") -> str | None:
 
 
 def open_reader(path: str, compression: str | None) -> BinaryIO:
-    """Open a binary stream for reading, wrapping in a decompressor if needed."""
-    raw = open(path, "rb")
+    """Open a binary stream for reading, wrapping in a decompressor if needed.
+
+    Closing the returned stream always closes the underlying file, so callers
+    that use it as a context manager never leak a descriptor.
+    """
     if compression == "gzip":
-        return gzip.GzipFile(fileobj=raw, mode="rb")
+        # Passing ``filename`` (not ``fileobj``) makes GzipFile own the file it
+        # opened, so GzipFile.close() closes it. With ``fileobj`` the caller
+        # keeps ownership and the descriptor survives until GC.
+        return gzip.GzipFile(filename=path, mode="rb")
+    raw = open(path, "rb")
     if compression == "zstd":
         try:
             import zstandard  # noqa: PLC0415
@@ -40,7 +47,7 @@ def open_reader(path: str, compression: str | None) -> BinaryIO:
             raise ImportError(
                 "zstandard is required for .zst files; install `datapipe[zstd]`"
             ) from exc
-        return zstandard.ZstdDecompressor().stream_reader(raw)
+        return zstandard.ZstdDecompressor().stream_reader(raw, closefd=True)
     return raw
 
 
