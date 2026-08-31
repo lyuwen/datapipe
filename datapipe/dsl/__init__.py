@@ -8,8 +8,6 @@ Phase 2 exports:
     from datapipe.dsl.selector import CompiledSelector
     from datapipe.dsl.compiler import CompiledExpression, ToolInvocation
 
-Phase 3 (datapipe transform CLI) and Phase 4 (provider registry) not yet
-implemented.
 """
 
 from datapipe.dsl.errors import (

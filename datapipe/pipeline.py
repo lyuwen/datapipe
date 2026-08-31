@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -455,11 +456,15 @@ class Pipeline:
             # json.dumps cannot serialize it, which would crash both raw and
             # non-raw JSONL sinks at runtime.  The payload dict is always
             # JSON-serializable and carries the same seq/stage/error fields.
+            #
+            # A *raw* sink is a further case: it accepts only str/bytes, since
+            # raw mode means the pipeline is responsible for serialization
+            # (workers emit JSON lines via JsonDumpStage).  Error payloads are
+            # produced here in the coordinator, downstream of any dump stage,
+            # so we serialize them ourselves before handing them to a raw sink.
             payload = _error_payload(result)
-            if config.error_sink is not None:
-                config.error_sink.write(payload)
-            else:
-                sink.write(payload)
+            target = config.error_sink if config.error_sink is not None else sink
+            target.write(_serialize_for_sink(payload, target))
             stats.output_records += 1
             _report(1)
             return
@@ -480,6 +485,27 @@ class Pipeline:
 
     def __repr__(self) -> str:
         return f"Pipeline(name={self.name!r}, stages={len(self.stages)})"
+
+
+def _serialize_for_sink(payload: dict, sink: Sink) -> "dict | str":
+    """Return *payload* in the form *sink* accepts.
+
+    A raw sink (``raw=True``) expects the pipeline to have already serialized
+    its records — in a transform run the workers do that via ``JsonDumpStage``.
+    Error payloads are built in the coordinator, after that stage, so they
+    arrive unserialized and must be dumped here.  Non-raw sinks serialize on
+    the caller's behalf and want the dict itself.
+
+    Falls back to the dict when the sink does not declare raw mode, and when
+    serialization fails — a sink-specific ``TypeError`` is a better diagnostic
+    than a ``json`` error raised from the coordinator's emit path.
+    """
+    if not getattr(sink, "raw", False):
+        return payload
+    try:
+        return json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return payload
 
 
 def _error_payload(result: TaskResult) -> dict:

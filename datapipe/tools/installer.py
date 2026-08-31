@@ -143,20 +143,37 @@ def install_provider(
         raise InstallationError(str(exc)) from exc
 
     # --- Functional smoke test: load under spawn (plan §8.2/§8.3) ----------
-    # Verify now, in a genuinely fresh interpreter, that a worker can resolve
-    # this provider.  Failing at install is far better than failing per-record
-    # for every record of every later run.
+    # For copied mode the test must exercise the exact layout workers will
+    # see: an isolated directory containing only source.py, with no sibling
+    # modules from the original file's parent.  A provider that self-seeds
+    # sys.path and imports a sibling passes a test against the original
+    # source path but fails in every worker because the sibling is absent
+    # from the installed snapshot.  Writing to a temp dir first catches
+    # that class of breakage at install time rather than per-record at
+    # runtime.
+    import tempfile as _tempfile
+    if editable:
+        _smoke_source_path = str(path)
+        _smoke_tmp_dir = None
+    else:
+        _smoke_tmp_dir = Path(_tempfile.mkdtemp(prefix="datapipe_smoke_"))
+        _smoke_tmp_src = _smoke_tmp_dir / "source.py"
+        _smoke_tmp_src.write_bytes(source_bytes)
+        _smoke_source_path = str(_smoke_tmp_src)
     try:
         spawn_load_smoke_test(
             provider_id=provider_id,
             alias=alias,
             mode="editable" if editable else "copied",
-            source_path=str(path),
+            source_path=_smoke_source_path,
             digest=digest,
             expected_tools=tool_names,
         )
     except SpawnSmokeTestError as exc:
         raise InstallationError(str(exc)) from exc
+    finally:
+        if _smoke_tmp_dir is not None:
+            shutil.rmtree(_smoke_tmp_dir, ignore_errors=True)
 
     # --- Confirmation prompt ------------------------------------------------
     if not yes:
@@ -183,7 +200,6 @@ def install_provider(
             return None
 
     # --- Copy or editable install -------------------------------------------
-    import json as _json
     pdir = provider_dir(provider_id)
     # Record whether the provider directory already existed.  A rollback must
     # remove a directory this install created, otherwise a failed first-time
@@ -270,7 +286,7 @@ def install_provider(
     _backup(provider_json)
     try:
         provider_json.write_text(
-            _json.dumps(
+            json.dumps(
                 {
                     "provider_id": entry.provider_id,
                     "alias": entry.alias,

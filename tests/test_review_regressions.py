@@ -125,17 +125,34 @@ class TestErrorsReturnNonRawSink:
         # Payload must round-trip through json.dumps — this is the actual bug.
         json.dumps(errors[0])
 
-    def test_raw_sink_also_works(self, tmp_path):
-        """A raw sink accepts the payload dict too (guard is unnecessary now)."""
+    def test_raw_sink_errors_return(self, tmp_path):
+        """errors='return' with a raw=True sink must write a JSON line, not crash.
+
+        Transform pipelines use JsonlSink(raw=True) because workers emit JSON
+        strings via JsonDumpStage.  Error payloads are built in the coordinator
+        after that stage, so the coordinator must serialise them before handing
+        them to the raw sink — otherwise JsonlSink raises TypeError on the dict.
+        """
+        # Wrap with JsonDumpStage as the transform CLI does, so records are
+        # strings by the time they reach the sink; error payloads bypass that
+        # stage and must therefore be serialised by _serialize_for_sink.
+        import json as _json
+        from datapipe.stage import JsonDumpStage
+
         out = tmp_path / "out.jsonl"
-        stats = Pipeline([_FailOnThree()]).run(
+        stats = Pipeline([_FailOnThree(), JsonDumpStage()]).run(
             source=IterableSource(range(5)),
-            sink=JsonlSink(str(out), raw=False),
+            sink=JsonlSink(str(out), raw=True),
             executor=SequentialExecutor(),
             errors="return",
             progress=False,
         )
         assert stats.failed_records == 1
+        lines = [_json.loads(x) for x in out.read_text().splitlines() if x.strip()]
+        assert len(lines) == 5
+        errors = [x for x in lines if isinstance(x, dict) and "stage_name" in x]
+        assert len(errors) == 1
+        assert errors[0]["error_type"] == "ValueError"
 
 
 # ---------------------------------------------------------------------------

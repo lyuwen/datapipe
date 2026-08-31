@@ -550,6 +550,16 @@ def _probe(fields, result_queue):
     """Load the provider exactly as a ProcessExecutor worker does."""
     import os as _os
     import sys as _sys
+    import tempfile as _tempfile
+
+    # The spawn helper is written to a tempfile, so the system temp root
+    # (e.g. /tmp) ends up on sys.path[0].  A provider whose source also lives
+    # in /tmp could then resolve sibling imports from there during the smoke
+    # test even though those siblings are absent from the installed snapshot.
+    # Remove every sys.path entry that resolves to the temp root so the child
+    # sees the same clean import environment that real workers see.
+    _tmp_root = _os.path.realpath(_tempfile.gettempdir())
+    _sys.path = [p for p in _sys.path if _os.path.realpath(p) != _tmp_root]
 
     # A top-level print() in the provider must not reach our stdout protocol.
     _real_stdout = _sys.stdout
