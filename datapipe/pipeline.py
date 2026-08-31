@@ -377,7 +377,7 @@ class Pipeline:
                 if next_to_emit > 0:  # at least one record was emitted
                     reporter.update(0, snapshot=_snapshot())
             else:
-                self._emit(result, sink, stats, config, reporter)
+                self._emit(result, sink, stats, config, reporter, snapshot=_snapshot())
 
         try:
             stats = config.executor.run(
@@ -408,6 +408,7 @@ class Pipeline:
         stats: ExecutionStats,
         config: RunConfig,
         reporter: ProgressReporter | None,
+        snapshot: ProgressSnapshot | None = None,
     ) -> None:
         """Write one result per policy.
 
@@ -416,9 +417,15 @@ class Pipeline:
         at their sequence position (ordered mode) or immediately (unordered).
         Pass ``reporter=None`` when the caller has already updated progress
         (ordered mode: progress is updated on completion, not on emission).
+        Pass ``snapshot`` to forward a structured ``ProgressSnapshot`` to the
+        reporter; falls back to a legacy ``errors`` kwarg when None.
         """
         def _report(n: int) -> None:
-            if reporter is not None:
+            if reporter is None:
+                return
+            if snapshot is not None:
+                reporter.update(n, snapshot=snapshot)
+            else:
                 reporter.update(n, errors=stats.failed_records)
 
         if result.error is not None:

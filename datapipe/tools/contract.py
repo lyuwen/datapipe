@@ -121,6 +121,16 @@ class ToolContract:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("ToolContract.name must not be empty")
+        if not self.name.isidentifier():
+            raise ValueError(
+                f"ToolContract.name {self.name!r} is not a valid Python identifier; "
+                "tool names must match [a-zA-Z_][a-zA-Z0-9_]*"
+            )
+        if self.name.startswith("_"):
+            raise ValueError(
+                f"ToolContract.name {self.name!r} starts with an underscore; "
+                "tool names must be publicly accessible identifiers"
+            )
         if self.api_version != 1:
             raise ValueError(
                 f"unsupported api_version {self.api_version!r}; only 1 is supported"

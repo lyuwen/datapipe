@@ -7,6 +7,7 @@ as an installable tool provider.  ``remove_provider`` reverses that.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -167,9 +168,21 @@ def install_provider(
     else:
         dest = pdir / "source.py"
         _backup(dest)
+        # Write to a temp sibling then atomically replace so a mid-write failure
+        # never leaves a truncated snapshot on disk.  The backup was taken above
+        # so a later rollback can restore the original even if we already called
+        # os.replace().
+        import tempfile as _tempfile
+        fd, tmp_path_str = _tempfile.mkstemp(dir=pdir, prefix=".source-", suffix=".tmp")
+        tmp_dest = Path(tmp_path_str)
         try:
-            dest.write_bytes(source_bytes)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(source_bytes)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_dest, dest)
         except Exception:
+            tmp_dest.unlink(missing_ok=True)
             _rollback()
             raise
         files_written.append(dest)
