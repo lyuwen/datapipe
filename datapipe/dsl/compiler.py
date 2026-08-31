@@ -362,10 +362,26 @@ def _bind_arguments(
         _validate_argument_type(value, param, contract.name, expression, arg.span)
         bound[arg.name] = value
 
-    # Fill in defaults for unspecified parameters.
+    # Fill in defaults for unspecified parameters and validate them.
     for param in contract.parameters:
         if param.name not in bound:
-            bound[param.name] = param.default
+            default = param.default
+            bound[param.name] = default
+            # Check default against its annotation so that a badly declared
+            # default (e.g. annotation=bool but default="yes") is caught at
+            # compile time rather than silently passing through to the worker.
+            if default is not None and param.annotation is not None:
+                try:
+                    _validate_argument_type(default, param, contract.name, expression, _invocation_span)
+                except ToolConfigurationError:
+                    # Re-raise with a clearer message about it being a default.
+                    ann_name = getattr(param.annotation, "__name__", repr(param.annotation))
+                    raise ToolConfigurationError(
+                        f"default value {default!r} for argument {param.name!r} of "
+                        f"{contract.name!r} does not match its annotation {ann_name!r}",
+                        expression=expression,
+                        span=_invocation_span,
+                    )
 
     return bound
 

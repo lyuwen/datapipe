@@ -303,7 +303,7 @@ class _Recorder(ProgressReporter):
     def start(self, total=None):
         self.started = True
 
-    def update(self, n=1, **stats):
+    def update(self, n=1, snapshot=None, **stats):
         self.updates += n
 
     def close(self):
@@ -413,8 +413,19 @@ class _CapturingProgress(ProgressReporter):
     def start(self, total=None):
         pass
 
-    def update(self, n=1, **stats):
-        self.calls.append({"n": n, **stats})
+    def update(self, n=1, snapshot=None, **stats):
+        # Accept both structured snapshot and legacy keyword-argument style.
+        entry = {"n": n}
+        if snapshot is not None:
+            entry["processed"] = snapshot.processed
+            entry["written"] = snapshot.written
+            entry["buffered"] = snapshot.buffered
+            entry["in_flight"] = snapshot.in_flight
+            entry["failed"] = snapshot.failed
+            entry["dropped"] = snapshot.dropped
+        else:
+            entry.update(stats)
+        self.calls.append(entry)
 
     def close(self):
         pass

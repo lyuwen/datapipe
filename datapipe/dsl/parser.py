@@ -18,7 +18,7 @@ Grammar::
     boolean      := IDENT("true"|"false"|"True"|"False")
     null         := IDENT("null"|"None")
     array        := LBRACKET (literal (COMMA literal)*)? RBRACKET
-    object       := (not implemented in Phase 2; reserved for Phase 3)
+    object       := LBRACE (STRING COLON literal (COMMA STRING COLON literal)*)? RBRACE
     qualified_name := IDENT (DOT IDENT)?
 """
 
@@ -263,6 +263,9 @@ class _Parser:
         if tok.type is TT.LBRACKET:
             return self._parse_array_literal()
 
+        if tok.type is TT.LBRACE:
+            return self._parse_object_literal()
+
         if tok.type is TT.IDENT:
             raw = str(tok.value)
             if raw in ("true", "True"):
@@ -297,6 +300,29 @@ class _Parser:
                 items.append(self._parse_literal().value)
 
         close = self._expect(TT.RBRACKET, "']'")
+        return _ast.Literal(
+            value=items,
+            span=Span(open_tok.span.start, close.span.end),
+        )
+
+    def _parse_object_literal(self) -> "_ast.Literal":
+        """Parse an object literal ``{"key": value, ...}`` as a plain dict."""
+        open_tok = self._advance()  # consume {
+        items: dict[str, Any] = {}
+
+        if self._peek().type is not TT.RBRACE:
+            key_tok = self._expect(TT.STRING, "string key")
+            self._expect(TT.COLON, "':'")
+            val = self._parse_literal()
+            items[str(key_tok.value)] = val.value
+            while self._peek().type is TT.COMMA:
+                self._advance()
+                key_tok = self._expect(TT.STRING, "string key")
+                self._expect(TT.COLON, "':'")
+                val = self._parse_literal()
+                items[str(key_tok.value)] = val.value
+
+        close = self._expect(TT.RBRACE, "'}'")
         return _ast.Literal(
             value=items,
             span=Span(open_tok.span.start, close.span.end),

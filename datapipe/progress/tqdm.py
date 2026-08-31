@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from datapipe.progress.base import ProgressReporter
+from datapipe.progress.base import ProgressReporter, ProgressSnapshot
 
 try:  # pragma: no cover - env dependent
     from tqdm.auto import tqdm as _tqdm
@@ -35,15 +35,29 @@ class TqdmProgress(ProgressReporter):
             self._bar.total = None
             self._bar.initial = 0
 
-    def update(self, n: int = 1, **stats: Any) -> None:
-        errors = stats.get("errors")
+    def update(
+        self,
+        n: int = 1,
+        snapshot: ProgressSnapshot | None = None,
+        **stats: Any,
+    ) -> None:
+        # Accept structured snapshot or legacy keyword-argument style.
+        errors = snapshot.failed if snapshot is not None else stats.get("errors")
         if errors is not None:
             self._error_count = int(errors)
         if self._bar is None:
             return
         self._bar.update(n)
+        postfix: dict[str, Any] = {}
         if self._error_count:
-            self._bar.set_postfix(errors=self._error_count)
+            postfix["errors"] = self._error_count
+        if snapshot is not None:
+            if snapshot.buffered:
+                postfix["buffered"] = snapshot.buffered
+            if snapshot.in_flight:
+                postfix["in_flight"] = snapshot.in_flight
+        if postfix:
+            self._bar.set_postfix(postfix)
 
     def close(self) -> None:
         if self._bar is not None:

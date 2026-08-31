@@ -167,7 +167,11 @@ def install_provider(
     else:
         dest = pdir / "source.py"
         _backup(dest)
-        dest.write_bytes(source_bytes)
+        try:
+            dest.write_bytes(source_bytes)
+        except Exception:
+            _rollback()
+            raise
         files_written.append(dest)
         source_path = str(dest)
 

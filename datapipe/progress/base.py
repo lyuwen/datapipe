@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProgressSnapshot:
     """Structured progress state for one reporting event.
+
+    Frozen so reporters can safely store snapshots without risk of aliasing.
 
     Attributes
     ----------
@@ -17,6 +19,8 @@ class ProgressSnapshot:
         before ordered buffering drains).
     written:
         Records emitted to the primary or error sink.
+    dropped:
+        Records that produced a DROP sentinel (intentionally omitted).
     buffered:
         Completed results waiting in the reorder buffer for an ordering gap
         to close (always 0 in unordered mode).
@@ -28,6 +32,7 @@ class ProgressSnapshot:
 
     processed: int = 0
     written: int = 0
+    dropped: int = 0
     buffered: int = 0
     in_flight: int = 0
     failed: int = 0
@@ -39,7 +44,7 @@ class ProgressReporter:
     def start(self, total: int | None = None) -> None:
         ...
 
-    def update(self, n: int = 1, **stats: Any) -> None:
+    def update(self, n: int = 1, snapshot: ProgressSnapshot | None = None, **stats: Any) -> None:
         ...
 
     def close(self) -> None:
@@ -52,7 +57,7 @@ class NullProgress(ProgressReporter):
     def start(self, total: int | None = None) -> None:
         pass
 
-    def update(self, n: int = 1, **stats: Any) -> None:
+    def update(self, n: int = 1, snapshot: ProgressSnapshot | None = None, **stats: Any) -> None:
         pass
 
     def close(self) -> None:

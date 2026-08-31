@@ -107,6 +107,16 @@ def validate_static(path: Path) -> bytes:
 
     seen: set[str] = set()
     for name in tool_names:
+        if not name.isidentifier():
+            raise StaticValidationError(
+                f"{path}: @tool name {name!r} is not a valid Python identifier; "
+                "tool names must match [a-zA-Z_][a-zA-Z0-9_]*"
+            )
+        if name.startswith("_"):
+            raise StaticValidationError(
+                f"{path}: @tool name {name!r} starts with an underscore; "
+                "tool names must be publicly accessible identifiers"
+            )
         if name in seen:
             raise StaticValidationError(
                 f"{path}: duplicate @tool name {name!r} found in the same file"

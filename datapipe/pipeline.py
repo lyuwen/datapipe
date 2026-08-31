@@ -18,7 +18,7 @@ from datapipe.execution import (
 )
 from datapipe.io.base import Source, Sink
 from datapipe.io.iterable import CallableSink, IterableSource
-from datapipe.progress import NullProgress, ProgressReporter, TqdmProgress
+from datapipe.progress import NullProgress, ProgressReporter, ProgressSnapshot, TqdmProgress
 from datapipe.result import ExecutionStats, TaskResult
 from datapipe.runtime import RuntimeContext, default_sharding_for
 from datapipe.sentinels import DROP
@@ -312,10 +312,31 @@ class Pipeline:
         stats = ExecutionStats(rank=runtime.rank, world_size=runtime.world_size)
         ordered_buffer: dict[int, TaskResult] = {}
         next_to_emit = 0
+        in_flight = 0  # tracks submitted-but-not-yet-completed records
+
+        # Wrap the records iterator to count submissions into in_flight.
+        def _counting_records():
+            nonlocal in_flight
+            for record in records:
+                in_flight += 1
+                yield record
+
+        counting_records = _counting_records()
+
+        def _snapshot(extra_buffered: int = 0) -> ProgressSnapshot:
+            return ProgressSnapshot(
+                processed=stats.completed_records,
+                written=stats.output_records,
+                dropped=stats.dropped_records,
+                buffered=len(ordered_buffer) + extra_buffered,
+                in_flight=in_flight,
+                failed=stats.failed_records,
+            )
 
         def on_result(result: TaskResult) -> None:
             """Single entry point for every completed record."""
-            nonlocal next_to_emit
+            nonlocal next_to_emit, in_flight
+            in_flight -= 1
             stats.completed_records += 1
 
             if result.error is not None:
@@ -344,14 +365,7 @@ class Pipeline:
                 # finished.  The structured counts distinguish processed
                 # (completed) from written (emitted) so a straggler shows
                 # processed climbing while written lags.
-                reporter.update(
-                    1,
-                    errors=stats.failed_records,
-                    processed=stats.completed_records,
-                    written=stats.output_records,
-                    buffered=len(ordered_buffer),
-                    failed=stats.failed_records,
-                )
+                reporter.update(1, snapshot=_snapshot())
                 while next_to_emit in ordered_buffer:
                     emit = ordered_buffer.pop(next_to_emit)
                     next_to_emit += 1
@@ -361,20 +375,13 @@ class Pipeline:
                 # n=0 increment leaves the overall counter unchanged while
                 # letting the reporter refresh its display.
                 if next_to_emit > 0:  # at least one record was emitted
-                    reporter.update(
-                        0,
-                        errors=stats.failed_records,
-                        processed=stats.completed_records,
-                        written=stats.output_records,
-                        buffered=len(ordered_buffer),
-                        failed=stats.failed_records,
-                    )
+                    reporter.update(0, snapshot=_snapshot())
             else:
                 self._emit(result, sink, stats, config, reporter)
 
         try:
             stats = config.executor.run(
-                records=records,
+                records=counting_records,
                 worker=compiled,
                 runtime=runtime,
                 on_result=on_result,

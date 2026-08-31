@@ -39,6 +39,9 @@ class TT(Enum):
     RBRACKET = auto()
     EQUALS = auto()
     COMMA = auto()
+    COLON = auto()
+    LBRACE = auto()
+    RBRACE = auto()
     STRING = auto()
     INTEGER = auto()
     FLOAT = auto()
@@ -107,6 +110,18 @@ def tokenize(expr: str) -> list[Token]:
             continue
         if ch == ",":
             tokens.append(Token(TT.COMMA, None, Span(i, i + 1)))
+            i += 1
+            continue
+        if ch == ":":
+            tokens.append(Token(TT.COLON, None, Span(i, i + 1)))
+            i += 1
+            continue
+        if ch == "{":
+            tokens.append(Token(TT.LBRACE, None, Span(i, i + 1)))
+            i += 1
+            continue
+        if ch == "}":
+            tokens.append(Token(TT.RBRACE, None, Span(i, i + 1)))
             i += 1
             continue
 
