@@ -247,7 +247,7 @@ def test_error_policy_raise(exec_cls):
 
 @pytest.mark.parametrize("exec_cls", ALL_EXECUTORS)
 def test_error_policy_return_without_error_sink(exec_cls):
-    """errors='return' without an error_sink exposes structured TaskResults."""
+    """errors='return' without an error_sink writes structured error payload dicts."""
     exec_ = _make_executor(exec_cls)
     sink = ListSink()
     stats = Pipeline([TransformStage(_boom, name="boom")]).run(
@@ -257,14 +257,17 @@ def test_error_policy_return_without_error_sink(exec_cls):
         errors="return",
         progress=False,
     )
-    # 5 successes + 1 errored TaskResult, in input order (ordered default).
+    # 5 successes + 1 error payload dict, in input order (ordered default).
     assert len(sink.items) == 6
     ok = [i for i in sink.items if isinstance(i, int)]
     errs = [i for i in sink.items if not isinstance(i, int)]
     assert ok == [0, 1, 2, 3, 4]
     assert len(errs) == 1
-    assert errs[0].seq == 5
-    assert errs[0].error is not None
+    # Error payload is a JSON-serializable dict, not a raw TaskResult object.
+    assert isinstance(errs[0], dict), f"expected dict, got {type(errs[0])}"
+    assert errs[0]["seq"] == 5
+    assert errs[0]["stage_name"] == "boom"
+    assert errs[0].get("error_type") is not None
     assert stats.failed_records == 1
 
 

@@ -186,13 +186,22 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
             )
             from datapipe.tools.types import JsonType as _JsonType, as_type_spec as _as_type_spec
 
-            # Build parameters from registry metadata.
+            # Build parameters from registry metadata, restoring annotation
+            # from the stored type-name string so compile-time type checking
+            # works for installed providers the same way it does for built-ins.
+            _ANN_MAP = {
+                "str": str, "int": int, "float": float, "bool": bool,
+                "list": list, "dict": dict, "None": type(None),
+            }
             params = []
             for p in tool_meta_.get("parameters", []):
+                ann_name = p.get("annotation")
+                annotation = _ANN_MAP.get(ann_name) if ann_name else None
                 params.append(_ParameterSpec(
                     name=p["name"],
                     default=p.get("default"),
                     required=p.get("required", False),
+                    annotation=annotation,
                 ))
 
             # Build input/output TypeSpecs; fall back to ANY when the stored
@@ -240,23 +249,27 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
             # Always register the qualified form: alias.tool_name.
             qualified = f"{entry.alias}.{tool_name}"
             registry[qualified] = (stub_fn, tool_desc)
-            # Register unqualified only when the name is not a reserved built-in.
+            # Register unqualified only when the name is not a reserved built-in
+            # and is unambiguous.  When two providers export the same tool name,
+            # the plan requires neither to win — both must be accessed by their
+            # qualified alias.tool_name form.  This prevents silent wrong-tool
+            # dispatch under first-wins behavior.
             if tool_name not in _BUILTIN_NAMES:
                 if tool_name in registry:
-                    # Warn when an unqualified name is already taken by another
-                    # provider.  The first-registered provider wins; users must
-                    # use the qualified form to access the later one.
+                    # A collision: both providers define the same unqualified name.
+                    # Remove the existing entry so neither wins unqualified.
                     existing_desc = registry[tool_name][1]
                     existing_pid = (
                         existing_desc.provider.provider_id
                         if existing_desc is not None
                         else "builtin"
                     )
+                    del registry[tool_name]
                     print(
                         f"warning: tool name {tool_name!r} is provided by both "
                         f"{existing_pid!r} and {entry.provider_id!r}; "
-                        f"unqualified {tool_name!r} refers to the first; "
-                        f"use {entry.alias}.{tool_name!r} to reference the latter",
+                        f"unqualified {tool_name!r} is not available — use the "
+                        f"qualified form e.g. {entry.alias}.{tool_name!r}",
                         file=sys.stderr,
                     )
                 else:

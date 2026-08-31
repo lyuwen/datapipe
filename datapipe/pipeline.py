@@ -212,17 +212,9 @@ class Pipeline:
                     "sink must be a Sink or a callable, "
                     f"got {type(sink).__name__}"
                 )
-        # errors="return" without an error_sink exposes TaskResult objects in
-        # the primary sink.  A raw JSONL sink expects serialized strings, so
-        # this combination would crash at runtime.  Reject it now before any
-        # source records are opened so the user gets a clear message and no
-        # partial output is written.
-        if errors == "return" and error_sink is None and getattr(sink, "raw", False):
-            raise PipelineValidationError(
-                "errors='return' requires an error_sink when the primary sink "
-                "is a raw sink (raw=True): TaskResult objects cannot be "
-                "serialized as raw JSON strings"
-            )
+        # Note: errors="return" without an error_sink writes _error_payload()
+        # dicts to the primary sink regardless of raw mode, so there is no
+        # type mismatch at runtime.  Both raw and non-raw sinks accept dicts.
         runtime = runtime or RuntimeContext.auto()
         executor = executor or ProcessExecutor()
         sharding = sharding or default_sharding_for(runtime)
@@ -392,7 +384,10 @@ class Pipeline:
                 if next_to_emit > 0:  # at least one record was emitted
                     reporter.update(0, snapshot=_snapshot())
             else:
-                self._emit(result, sink, stats, config, reporter, snapshot=_snapshot())
+                self._emit(result, sink, stats, config, reporter)
+                # Build snapshot AFTER _emit() has updated output_records and
+                # dropped_records so the written/dropped counts are accurate.
+                reporter.update(0, snapshot=_snapshot())
 
         try:
             stats = config.executor.run(
@@ -447,12 +442,16 @@ class Pipeline:
             if config.errors == "skip":
                 _report(1)
                 return
-            # errors == "return": deliver to error_sink if given, else expose
-            # the structured TaskResult to the main sink.
+            # errors == "return": deliver a structured error payload dict.
+            # Writing a raw TaskResult object to the sink is not correct —
+            # json.dumps cannot serialize it, which would crash both raw and
+            # non-raw JSONL sinks at runtime.  The payload dict is always
+            # JSON-serializable and carries the same seq/stage/error fields.
+            payload = _error_payload(result)
             if config.error_sink is not None:
-                config.error_sink.write(_error_payload(result))
+                config.error_sink.write(payload)
             else:
-                sink.write(result)
+                sink.write(payload)
             stats.output_records += 1
             _report(1)
             return

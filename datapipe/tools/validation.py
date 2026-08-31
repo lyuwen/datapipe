@@ -179,10 +179,17 @@ for attr_name in dir(mod):
         continue
     params = []
     for ps in contract.parameters:
+        # Serialize annotation as a type-name string so the coordinator can
+        # reconstruct ParameterSpec.annotation from registry JSON.
+        ann = ps.annotation
+        ann_name = None
+        if ann is not None:
+            ann_name = getattr(ann, "__name__", None) if ann is not type(None) else "None"
         params.append({
             "name": ps.name,
             "default": ps.default,
             "required": ps.required,
+            "annotation": ann_name,
         })
     try:
         input_type = _describe(contract.input_type)
