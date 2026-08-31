@@ -6,7 +6,7 @@ import json
 import os
 from typing import Any, Callable, Iterator
 
-from datapipe.errors import SourceError
+from datapipe.errors import SourceError, SinkError
 from datapipe.io.base import Source, Sink, SourceRecordError
 from datapipe.io.utils import (
     detect_compression,
@@ -165,7 +165,7 @@ class JsonlSink(Sink):
 
     def write(self, record: Any) -> None:
         if self._handle is None:
-            raise SourceError("JsonlSink.write() before open()")
+            raise SinkError("JsonlSink.write() before open()")
         if self.raw:
             if isinstance(record, bytes):
                 line = record.decode(self.encoding)

@@ -134,10 +134,15 @@ class TestMainVersion:
             main(["transform", "expr"])
         assert exc_info.value.code != 0
 
-    def test_tools_stub(self, capsys):
+    def test_tools_requires_subcommand(self, capsys):
+        """``datapipe tools`` with no sub-command lists the available ones."""
         rc = main(["tools"])
         assert rc == 2
-        assert "not yet implemented" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "sub-command required" in err
+        # The message must name the real, implemented sub-commands.
+        for sub in ("install", "validate", "list", "inspect", "remove"):
+            assert sub in err
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,11 @@
 """datapipe.tools: public authoring API for tool contracts and built-ins.
 
-Phase 1 — tool contracts and built-ins:
+Usage::
 
     from datapipe.tools import JsonType, OneOf, tool, ToolContract, ParameterSpec
     from datapipe.tools import fromjson, tojson
-
-Phase 2-4 (registry, installer, loader) — not yet implemented.
+    from datapipe.tools.installer import install_provider, remove_provider
+    from datapipe.tools.registry import load_registry, get_provider
 """
 
 from datapipe.tools.types import (

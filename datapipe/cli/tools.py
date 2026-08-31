@@ -25,7 +25,7 @@ def add_tools_parser(subparsers: argparse._SubParsersAction) -> None:
     """Attach the ``tools`` sub-parser tree to *subparsers*."""
     tools_p = subparsers.add_parser(
         "tools",
-        help="manage installable tool providers (Phase 4)",
+        help="manage installable tool providers",
     )
     tools_sub = tools_p.add_subparsers(dest="tools_command")
 
@@ -69,7 +69,7 @@ def tools_command(args: argparse.Namespace) -> int:
     cmd = getattr(args, "tools_command", None)
     if cmd is None:
         print(
-            "datapipe tools: sub-command required (not yet implemented shorthand); "
+            "datapipe tools: sub-command required; "
             "use: datapipe tools {install,validate,list,inspect,remove}",
             file=sys.stderr,
         )

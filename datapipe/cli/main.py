@@ -4,8 +4,8 @@ Commands
 --------
 datapipe run       Execute a Python-defined Pipeline
 datapipe inspect   Inspect a Pipeline's stage structure
-datapipe transform [stub] jq-like transform expression  (Phase 3)
-datapipe tools     [stub] tool management sub-commands   (Phase 4)
+datapipe transform jq-like transform expression
+datapipe tools     tool provider management sub-commands
 datapipe --version Print the installed version
 
 The shorthand positional form (§3.1 of the CLI plan) dispatches to
@@ -52,11 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_parser(sub)
     add_inspect_parser(sub)
 
-    # -- transform (Phase 3) -------------------------------------------------
     from datapipe.cli.transform import add_transform_parser
     add_transform_parser(sub)
 
-    # -- tools (Phase 4) ------------------------------------------------
     from datapipe.cli.tools import add_tools_parser
     add_tools_parser(sub)
 
@@ -152,7 +150,6 @@ def install_main(argv: list[str] | None = None) -> int:
 
         datapipe tools install --editable ./my_tools.py
 
-    The actual implementation lives in Phase 4.
     """
     if argv is None:
         argv = sys.argv[1:]
