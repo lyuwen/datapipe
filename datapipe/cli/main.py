@@ -91,6 +91,14 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
+    import logging as _logging
+    import os as _os
+    _log_level = _os.environ.get("DATAPIPE_LOG_LEVEL", "WARNING").upper()
+    _logging.basicConfig(
+        level=getattr(_logging, _log_level, _logging.WARNING),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
     # Shorthand: datapipe EXPRESSION ... → datapipe transform EXPRESSION ...
     if argv and _is_expression_shorthand(argv):
         argv = ["transform"] + argv

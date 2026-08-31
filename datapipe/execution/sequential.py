@@ -57,6 +57,8 @@ class SequentialExecutor(Executor):
                     continue
                 try:
                     result = worker.process(value, ctx)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
                 except BaseException as exc:  # noqa: BLE001
                     on_result(_wrap_error(_seq_job(seq), exc))
                 else:

@@ -188,6 +188,10 @@ class Pipeline:
             raise PipelineValidationError(
                 f"errors must be one of {_ERROR_POLICIES}, got {errors!r}"
             )
+        if max_in_flight is not None and max_in_flight < 1:
+            raise PipelineValidationError(
+                f"max_in_flight must be >= 1 when specified, got {max_in_flight!r}"
+            )
         # Convenience coercion: string paths become JSONL adapters, plain
         # iterables become IterableSource, callables become CallableSink.
         if isinstance(source, str):
@@ -208,6 +212,17 @@ class Pipeline:
                     "sink must be a Sink or a callable, "
                     f"got {type(sink).__name__}"
                 )
+        # errors="return" without an error_sink exposes TaskResult objects in
+        # the primary sink.  A raw JSONL sink expects serialized strings, so
+        # this combination would crash at runtime.  Reject it now before any
+        # source records are opened so the user gets a clear message and no
+        # partial output is written.
+        if errors == "return" and error_sink is None and getattr(sink, "raw", False):
+            raise PipelineValidationError(
+                "errors='return' requires an error_sink when the primary sink "
+                "is a raw sink (raw=True): TaskResult objects cannot be "
+                "serialized as raw JSON strings"
+            )
         runtime = runtime or RuntimeContext.auto()
         executor = executor or ProcessExecutor()
         sharding = sharding or default_sharding_for(runtime)

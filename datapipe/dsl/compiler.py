@@ -87,7 +87,6 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
 
     try:
         from datapipe.tools.registry import load_registry as _load_reg, add_provider as _add_provider
-        from datapipe.tools.loader import load_provider
         from datapipe.tools.validation import validate_dynamic
     except ImportError:
         return registry
@@ -121,6 +120,27 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
                     entry.tools = {t["name"]: t for t in metadata.tools}
                     _add_provider(entry)
                 sha256 = current_digest
+            else:
+                # For copied providers, verify the snapshot on disk still
+                # matches the registry digest.  A mismatch means the snapshot
+                # was tampered with after installation; warn now so the user
+                # gets a clear message rather than a cryptic worker failure.
+                try:
+                    current_bytes = Path(entry.source_path).read_bytes()
+                    current_digest = "sha256:" + hashlib.sha256(current_bytes).hexdigest()
+                    if current_digest != entry.digest:
+                        print(
+                            f"warning: provider {entry.provider_id!r} snapshot "
+                            f"digest mismatch (expected {entry.digest!r}, "
+                            f"got {current_digest!r}); workers will reject it",
+                            file=sys.stderr,
+                        )
+                except OSError as exc:
+                    print(
+                        f"warning: provider {entry.provider_id!r} snapshot "
+                        f"could not be read: {exc}; workers will reject it",
+                        file=sys.stderr,
+                    )
 
             desc = ProviderDescriptor(
                 provider_id=entry.provider_id,
@@ -130,8 +150,14 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
                 sha256=sha256,
                 api_version=entry.datapipe_api,
             )
-            provider_entry = load_provider(desc)
-            tools: dict[str, Callable] = provider_entry["tools"]
+            # Build the tool list from registry JSON metadata rather than
+            # executing the provider source in the coordinator.  The compiler
+            # only needs tool names and descriptors to produce ToolInvocation
+            # objects; the actual callable is resolved per-worker in setup().
+            # Calling load_provider() here would exec() provider source in the
+            # control-plane process, introducing side effects, hangs, and
+            # import failures that should only be surfaced at worker startup.
+            tool_names_in_registry = list(entry.tools.keys())
         except Exception as exc:  # noqa: BLE001
             # Never let one broken provider block tools from every other
             # provider, but do not fail silently either: without this warning
@@ -144,14 +170,97 @@ def _build_full_registry() -> dict[str, tuple[Callable, ToolDescriptor | None]]:
             )
             continue
 
-        for tool_name, fn in tools.items():
+        # Register a sentinel callable with the ToolContract attached.
+        # The callable is never invoked in the coordinator; the real
+        # implementation is resolved per-worker from the descriptor.
+        # Attaching the contract lets the compiler's _resolve_tool() call
+        # get_contract(stub) just as it does for real @tool callables.
+        def _make_stub_with_contract(
+            tool_name_: str,
+            tool_meta_: dict,
+        ) -> Callable:
+            from datapipe.tools.contract import (
+                Cardinality as _Cardinality,
+                ParameterSpec as _ParameterSpec,
+                ToolContract as _ToolContract,
+            )
+            from datapipe.tools.types import JsonType as _JsonType, as_type_spec as _as_type_spec
+
+            # Build parameters from registry metadata.
+            params = []
+            for p in tool_meta_.get("parameters", []):
+                params.append(_ParameterSpec(
+                    name=p["name"],
+                    default=p.get("default"),
+                    required=p.get("required", False),
+                ))
+
+            # Build input/output TypeSpecs; fall back to ANY when the stored
+            # description cannot be matched to a known JsonType.
+            def _jt_from_desc(desc: str | None) -> _JsonType:
+                if desc is None:
+                    return _JsonType.ANY
+                for jt in _JsonType:
+                    if jt.value == desc or jt.name.lower() == (desc or "").lower():
+                        return jt
+                return _JsonType.ANY
+
+            try:
+                cardinality = _Cardinality(
+                    tool_meta_.get("cardinality", "one_to_one")
+                )
+            except ValueError:
+                cardinality = _Cardinality.ONE_TO_ONE
+
+            contract = _ToolContract(
+                name=tool_name_,
+                api_version=1,
+                target=tool_meta_.get("target", "value"),
+                input_type=_as_type_spec(_jt_from_desc(tool_meta_.get("input"))),
+                output_type=_as_type_spec(_jt_from_desc(tool_meta_.get("output"))),
+                cardinality=cardinality,
+                deterministic=bool(tool_meta_.get("deterministic", True)),
+                description=tool_meta_.get("description", ""),
+                parameters=tuple(params),
+            )
+
+            def _stub(*args, **kwargs):  # pragma: no cover
+                raise RuntimeError(
+                    f"provider tool stub for {tool_name_!r} called in coordinator; "
+                    "this is a bug — provider tools must only be called in workers"
+                )
+            _stub.__name__ = tool_name_
+            _stub.__tool_contract__ = contract  # type: ignore[attr-defined]
+            return _stub
+
+        for tool_name in tool_names_in_registry:
+            tool_meta = entry.tools.get(tool_name, {})
             tool_desc = ToolDescriptor(provider=desc, tool_name=tool_name)
+            stub_fn = _make_stub_with_contract(tool_name, tool_meta)
             # Always register the qualified form: alias.tool_name.
             qualified = f"{entry.alias}.{tool_name}"
-            registry[qualified] = (fn, tool_desc)
+            registry[qualified] = (stub_fn, tool_desc)
             # Register unqualified only when the name is not a reserved built-in.
             if tool_name not in _BUILTIN_NAMES:
-                registry.setdefault(tool_name, (fn, tool_desc))
+                if tool_name in registry:
+                    # Warn when an unqualified name is already taken by another
+                    # provider.  The first-registered provider wins; users must
+                    # use the qualified form to access the later one.
+                    existing_desc = registry[tool_name][1]
+                    existing_pid = (
+                        existing_desc.provider.provider_id
+                        if existing_desc is not None
+                        else "builtin"
+                    )
+                    print(
+                        f"warning: tool name {tool_name!r} is provided by both "
+                        f"{existing_pid!r} and {entry.provider_id!r}; "
+                        f"unqualified {tool_name!r} refers to the first; "
+                        f"use {entry.alias}.{tool_name!r} to reference the latter",
+                        file=sys.stderr,
+                    )
+                else:
+                    registry[tool_name] = (stub_fn, tool_desc)
 
     return registry
 

@@ -7,10 +7,7 @@ process boundaries. This module keeps a single source of truth so that
 
 from __future__ import annotations
 
-from datapipe.record import _Sentinel, _get_sentinel
-
-#: Drop a record from the output stream.
-DROP = _Sentinel("DROP")
+from datapipe.record import _Sentinel, _get_sentinel, DROP  # noqa: F401
 
 #: Private: record not owned by this rank.
 _NOT_OWNED = _Sentinel("_NOT_OWNED")

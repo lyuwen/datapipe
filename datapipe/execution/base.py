@@ -221,6 +221,8 @@ class BoundedMapExecutor(Executor):
                         # error; abort regardless of the configured error
                         # policy by re-raising out of the scheduler loop.
                         raise
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
                     except BaseException as exc:  # noqa: BLE001
                         # A worker raised while processing this record.
                         on_result(_wrap_error(job, exc))

@@ -145,9 +145,14 @@ def install_provider(
             backups[p] = p.read_bytes() if p.exists() else None
 
     def _rollback() -> None:
-        """Restore every touched path to its pre-install state."""
-        for p in files_written:
-            original = backups.get(p)
+        """Restore every touched path to its pre-install state.
+
+        Iterates ``backups`` rather than ``files_written`` so that a partial
+        write that failed before the path was appended to ``files_written`` is
+        still restored.  Any path in ``backups`` was touched (or was about to
+        be touched) by this install and must be rolled back.
+        """
+        for p, original in backups.items():
             try:
                 if original is None:
                     p.unlink(missing_ok=True)
