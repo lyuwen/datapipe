@@ -112,30 +112,24 @@ def test_7_9_multistatement_with_struct_merge():
 # §7.10  Multi-statement with `<-` field assignment
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="structural syntax `<-` field assignment not yet implemented",
-)
 def test_7_10_field_assignment_arrow():
     result = parse_program(
         "fromjson(.metadata); .temperature <- fromjson(.metadata.temperature); tojson(.metadata)"
     )
     assert isinstance(result, Program)
+    assert len(result.statements) == 3
 
 
 # ---------------------------------------------------------------------------
 # §7.11  Multi-statement with `=` as structural assignment
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="structural syntax `;` and `=` as structural assignment not yet implemented",
-)
 def test_7_11_structural_equals_assignment():
-    result = parse(
+    result = parse_program(
         "fromjson(.metadata); .temperature = .metadata.temperature; tojson(.metadata)"
     )
-    assert result is not None
+    assert isinstance(result, Program)
+    assert len(result.statements) == 3
 
 
 # ---------------------------------------------------------------------------

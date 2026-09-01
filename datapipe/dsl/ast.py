@@ -141,6 +141,32 @@ class BareToolCall:
 
 
 # ---------------------------------------------------------------------------
+# Assignment nodes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AssignmentRHS:
+    """Right-hand side of an assignment.
+
+    ``source`` is the primary source selector (required for moves).
+    ``transform`` is an optional tool applied to the source value.
+    """
+    source: Selector
+    transform: "Invocation | BareToolCall | None"
+    span: Span
+
+
+@dataclass(frozen=True)
+class Assignment:
+    """``.dest = rhs`` (copy) or ``.dest <- rhs`` (move)."""
+    destination: Selector
+    rhs: AssignmentRHS
+    is_move: bool
+    span: Span
+
+
+# ---------------------------------------------------------------------------
 # Top-level expression
 # ---------------------------------------------------------------------------
 
@@ -162,8 +188,12 @@ class Statement:
     For selector-first focused statements, ``focus_selector`` is the leading
     selector, ``operation`` is the first bare tool call, and ``pipes`` has
     further bare tool calls.
+
+    For assignments, ``operation`` is an ``Assignment`` and ``focus_selector``
+    is the assignment's destination — trailing pipes apply to the value that
+    was just written there.
     """
-    operation: "Invocation | BareToolCall"
+    operation: "Invocation | BareToolCall | Assignment"
     pipes: "tuple[BareToolCall, ...]"
     focus_selector: "Selector | None"   # None for invocation-first statements
     span: Span

@@ -592,9 +592,28 @@ class CompiledBareCall:
 
 
 @dataclass(frozen=True)
+class CompiledAssignment:
+    """A compiled ``=`` / ``<-`` statement operation.
+
+    ``dest_parent`` and ``dest_key`` are precomputed for the common case where
+    the destination ends in a field: the parent must already exist, but the
+    final key may be absent (that is what assignment creates).  They are
+    ``None`` when the final part is an index or wildcard, in which case the
+    whole destination selector is resolved instead.
+    """
+    destination: CompiledSelector
+    source: CompiledSelector
+    transform: "ToolInvocation | CompiledBareCall | None"
+    is_move: bool
+    span: tuple[int, int]
+    dest_parent: CompiledSelector | None = None
+    dest_key: str | None = None
+
+
+@dataclass(frozen=True)
 class CompiledStatement:
     """One compiled statement: a base operation plus optional focused pipes."""
-    operation: ToolInvocation          # base operation
+    operation: "ToolInvocation | CompiledBareCall | CompiledAssignment"
     pipes: tuple[CompiledBareCall, ...]
     focus_selector: CompiledSelector | None  # None for invocation-first
     span: tuple[int, int]
@@ -696,55 +715,33 @@ def compile_program(expression: str) -> CompiledProgram:
     ``CompiledStatement``.  Invocation-first statements have
     ``focus_selector=None``; selector-first focused statements carry the
     compiled focus selector and use it as the base operation's selector.
+    Assignment statements compile to a ``CompiledAssignment`` whose focus is
+    the destination.
 
-    ``expression_index`` values are unique across every operation and bare
-    call in the whole program so the executing stage can key resolved
-    callables by index.
+    ``expression_index`` values are unique across every operation, assignment
+    transform, and bare call in the whole program so the executing stage can
+    key resolved callables by index.
     """
     program = parse_program(expression)
     registry = _build_full_registry()
     statements: list[CompiledStatement] = []
 
-    # Monotonic counter shared by base operations and bare pipe calls so every
-    # resolved callable has a distinct key in the stage's _resolved_fns dict.
+    # Monotonic counter shared by base operations, assignment transforms, and
+    # bare pipe calls so every resolved callable has a distinct key in the
+    # stage's _resolved_fns dict.
     index = 0
 
     for stmt in program.statements:
         op_node = stmt.operation
 
-        tool_fn, tool_desc = _resolve_tool(op_node.qualified_name, registry, expression)
-        contract = get_contract(tool_fn)
-        if contract is None:
-            raise ToolResolutionError(
-                f"tool {op_node.qualified_name.display!r} has no contract; "
-                "only @tool-decorated functions are supported",
-                expression=expression,
-                span=op_node.qualified_name.span,
+        if isinstance(op_node, _ast.Assignment):
+            operation, focus, index = _compile_assignment(
+                op_node, registry, expression, index
             )
-
-        # Invocation-first statements carry their own selector; focused
-        # statements take the leading focus selector as the operation target.
-        if stmt.focus_selector is None:
-            selector_node = op_node.selector
         else:
-            selector_node = stmt.focus_selector
-
-        selector = _compile_selector(selector_node, contract, expression)
-        arguments = _bind_arguments(
-            op_node.arguments, contract, expression, op_node.span
-        )
-
-        operation = ToolInvocation(
-            tool_descriptor=tool_desc,
-            builtin_fn=tool_fn if tool_desc is None else None,
-            tool_name=contract.name,
-            contract=contract,
-            selector=selector,
-            arguments=arguments,
-            expression_index=index,
-            expression_span=(op_node.span.start, op_node.span.end),
-        )
-        index += 1
+            operation, focus, index = _compile_tool_operation(
+                stmt, op_node, registry, expression, index
+            )
 
         # Compile each bare pipe call against the same focus.
         pipes: list[CompiledBareCall] = []
@@ -775,7 +772,7 @@ def compile_program(expression: str) -> CompiledProgram:
         statements.append(CompiledStatement(
             operation=operation,
             pipes=tuple(pipes),
-            focus_selector=selector if stmt.focus_selector is not None else None,
+            focus_selector=focus,
             span=(stmt.span.start, stmt.span.end),
         ))
 
@@ -785,6 +782,240 @@ def compile_program(expression: str) -> CompiledProgram:
         statements=tuple(statements),
         source=expression,
     )
+
+
+def _compile_tool_operation(
+    stmt: "_ast.Statement",
+    op_node: "_ast.Invocation | _ast.BareToolCall",
+    registry: dict[str, tuple[Callable, ToolDescriptor | None]],
+    expression: str,
+    index: int,
+) -> tuple[ToolInvocation, CompiledSelector | None, int]:
+    """Compile an invocation-first or focused statement's base operation."""
+    tool_fn, tool_desc = _resolve_tool(op_node.qualified_name, registry, expression)
+    contract = get_contract(tool_fn)
+    if contract is None:
+        raise ToolResolutionError(
+            f"tool {op_node.qualified_name.display!r} has no contract; "
+            "only @tool-decorated functions are supported",
+            expression=expression,
+            span=op_node.qualified_name.span,
+        )
+
+    # Invocation-first statements carry their own selector; focused
+    # statements take the leading focus selector as the operation target.
+    if stmt.focus_selector is None:
+        selector_node = op_node.selector
+    else:
+        selector_node = stmt.focus_selector
+
+    selector = _compile_selector(selector_node, contract, expression)
+    arguments = _bind_arguments(
+        op_node.arguments, contract, expression, op_node.span
+    )
+
+    operation = ToolInvocation(
+        tool_descriptor=tool_desc,
+        builtin_fn=tool_fn if tool_desc is None else None,
+        tool_name=contract.name,
+        contract=contract,
+        selector=selector,
+        arguments=arguments,
+        expression_index=index,
+        expression_span=(op_node.span.start, op_node.span.end),
+    )
+    focus = selector if stmt.focus_selector is not None else None
+    return operation, focus, index + 1
+
+
+def _compile_assignment(
+    node: "_ast.Assignment",
+    registry: dict[str, tuple[Callable, ToolDescriptor | None]],
+    expression: str,
+    index: int,
+) -> tuple[CompiledAssignment, CompiledSelector, int]:
+    """Compile a ``=`` / ``<-`` statement, applying the §12 static rejections."""
+    op_label = "move" if node.is_move else "copy"
+
+    # A move must have a statically identifiable primary source to delete.
+    # The root selector names no removable field, so it is only ever a
+    # computation — that is a copy, not a move.
+    if node.is_move and node.rhs.source.is_root:
+        raise ToolConfigurationError(
+            f"move (`<-`) requires a statically identifiable source path, but "
+            f"the right-hand side has no source to remove; use `=` to assign "
+            f"the computed value without deleting anything",
+            expression=expression,
+            span=node.rhs.span,
+        )
+
+    _reject_static_overlap(node, expression, op_label)
+
+    transform: ToolInvocation | None = None
+    if node.rhs.transform is not None:
+        inv_node = node.rhs.transform
+        tool_fn, tool_desc = _resolve_tool(
+            inv_node.qualified_name, registry, expression
+        )
+        contract = get_contract(tool_fn)
+        if contract is None:
+            raise ToolResolutionError(
+                f"tool {inv_node.qualified_name.display!r} has no contract; "
+                "only @tool-decorated functions are supported",
+                expression=expression,
+                span=inv_node.qualified_name.span,
+            )
+        transform = ToolInvocation(
+            tool_descriptor=tool_desc,
+            builtin_fn=tool_fn if tool_desc is None else None,
+            tool_name=contract.name,
+            contract=contract,
+            selector=_compile_selector(node.rhs.source, contract, expression),
+            arguments=_bind_arguments(
+                inv_node.arguments, contract, expression, inv_node.span
+            ),
+            expression_index=index,
+            expression_span=(inv_node.span.start, inv_node.span.end),
+        )
+        index += 1
+
+    dest_parent, dest_key = _split_destination(node.destination)
+
+    operation = CompiledAssignment(
+        destination=CompiledSelector(node.destination),
+        source=CompiledSelector(node.rhs.source),
+        transform=transform,
+        is_move=node.is_move,
+        span=(node.span.start, node.span.end),
+        dest_parent=dest_parent,
+        dest_key=dest_key,
+    )
+    return operation, operation.destination, index
+
+
+def _split_destination(
+    destination: "_ast.Selector",
+) -> tuple[CompiledSelector | None, str | None]:
+    """Split ``.a.b`` into the parent selector ``.a`` and the final key ``"b"``.
+
+    Assignment creates the final key when it is absent, so only the parent has
+    to already exist.  Returns ``(None, None)`` when the final part is not an
+    object key (root, index, or wildcard) — those destinations must resolve as
+    a whole because there is no key to create.
+    """
+    parts = destination.parts
+    if not parts:
+        return None, None
+    last = parts[-1]
+    if isinstance(last, _ast.Field):
+        key = last.name
+    elif isinstance(last, _ast.QuotedKey):
+        key = last.key
+    else:
+        return None, None
+    parent = _ast.Selector(parts=parts[:-1], span=destination.span)
+    return CompiledSelector(parent), key
+
+
+def _static_path(selector: "_ast.Selector") -> tuple[str | int, ...] | None:
+    """Return a comparable canonical path for *selector*, or None if dynamic.
+
+    ``.a`` and ``.["a"]`` name the same key and canonicalize identically.  A
+    wildcard makes the path unknowable at compile time, so those are deferred
+    to the runtime overlap check.  Keys canonicalize to ``str`` and indices to
+    ``int``, matching ``Reference.path_parts`` so the two checks compare the
+    same shape.
+    """
+    canonical: list[str | int] = []
+    for part in selector.parts:
+        if isinstance(part, _ast.Field):
+            canonical.append(part.name)
+        elif isinstance(part, _ast.QuotedKey):
+            canonical.append(part.key)
+        elif isinstance(part, _ast.Index):
+            canonical.append(part.index)
+        else:
+            return None  # Each / unknown — not statically comparable
+    return tuple(canonical)
+
+
+def overlap_reason(
+    dest: tuple[str | int, ...],
+    source: tuple[str | int, ...],
+    *,
+    is_move: bool,
+    has_transform: bool = False,
+) -> str | None:
+    """Return why *dest* and *source* overlap illegally, or None if they are fine.
+
+    A move is rejected for any overlap (§8.8): whichever direction it runs, the
+    write lands in the subtree the source is about to be removed from.
+
+    A copy is rejected where the overlap is *provably* self-destructive:
+
+    - the same path, or the destination above the source — the write drops the
+      source subtree, and ``=`` must never delete;
+    - the source above the destination with no transform — the assigned value
+      is an alias of the container it is written into, so ``.a.b = .a`` builds
+      a self-referential record that no serializer can emit.
+
+    A transform makes the last case unprovable (its result is normally a fresh
+    value), so it compiles; the runtime identity guard in the stage catches a
+    transform that happens to return its input unchanged.
+    """
+    if dest == source:
+        return "the source and destination are the same path"
+
+    if source[: len(dest)] == dest:
+        return "the destination is an ancestor of the source"
+
+    if dest[: len(source)] == source:
+        if is_move:
+            return "the source is an ancestor of the destination"
+        if not has_transform:
+            return (
+                "the source is an ancestor of the destination, so the assigned "
+                "value would contain itself"
+            )
+
+    return None
+
+
+def _reject_static_overlap(
+    node: "_ast.Assignment", expression: str, op_label: str
+) -> None:
+    """Reject a provably self-destructive source/destination pair (§8.8).
+
+    Only paths that are fully static are compared; a wildcard defers the same
+    check to runtime, where the concrete paths are known.
+    """
+    dest = _static_path(node.destination)
+    src = _static_path(node.rhs.source)
+    if dest is None or src is None:
+        return
+
+    detail = overlap_reason(
+        dest,
+        src,
+        is_move=node.is_move,
+        has_transform=node.rhs.transform is not None,
+    )
+    if detail is None:
+        return
+
+    raise ToolConfigurationError(
+        f"overlapping source and destination in {op_label} "
+        f"{_render_selector(node.destination)} "
+        f"{'<-' if node.is_move else '='} {_render_selector(node.rhs.source)}: "
+        f"{detail}",
+        expression=expression,
+        span=node.span,
+    )
+
+
+def _render_selector(selector: "_ast.Selector") -> str:
+    """Render an AST selector for a diagnostic (mirrors CompiledSelector.render)."""
+    return CompiledSelector(selector).render()
 
 
 # ---------------------------------------------------------------------------

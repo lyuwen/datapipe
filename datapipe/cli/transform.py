@@ -201,8 +201,8 @@ def _needs_program_path(program) -> bool:
     has identical semantics under either compiler, so it keeps the legacy
     ``CompiledExpression`` shape.  That holds the single-invocation
     ``--dry-run`` / ``inspect-expression`` output stable.  Multi-statement
-    programs, selector-first focused statements, and bare pipes all require
-    the program compiler.
+    programs, selector-first focused statements, assignments (whose focus is
+    their destination), and bare pipes all require the program compiler.
 
     The positive cases would also reach ``compile_program`` via the legacy
     fallback in ``_compile_or_report`` (they fail the legacy parse), so this
@@ -431,6 +431,7 @@ def _describe_contract(contract) -> dict | None:
 def _describe_invocation(inv) -> dict:
     """Render one ``ToolInvocation`` (base operation or legacy pipe element)."""
     return {
+        "kind": "invocation",
         "index": inv.expression_index,
         "tool": inv.tool_name,
         "selector": inv.selector.render(),
@@ -438,6 +439,29 @@ def _describe_invocation(inv) -> dict:
         "contract": _describe_contract(inv.contract),
         "arguments": dict(inv.arguments),
     }
+
+
+def _describe_assignment(op) -> dict:
+    """Render one ``CompiledAssignment`` (a ``=`` or ``<-`` statement operation)."""
+    return {
+        "kind": "assignment",
+        "operator": "<-" if op.is_move else "=",
+        "move": op.is_move,
+        "destination": op.destination.render(),
+        "source": op.source.render(),
+        "transform": (
+            None if op.transform is None else _describe_invocation(op.transform)
+        ),
+    }
+
+
+def _describe_operation(op) -> dict:
+    """Render a statement's base operation, whichever IR shape it has."""
+    from datapipe.dsl.compiler import CompiledAssignment
+
+    if isinstance(op, CompiledAssignment):
+        return _describe_assignment(op)
+    return _describe_invocation(op)
 
 
 def _describe_bare_call(bare) -> dict:
@@ -468,6 +492,7 @@ def _describe_bare_call(bare) -> dict:
         tool_name = getattr(fn, "__name__", None) or "<unknown>"
 
     return {
+        "kind": "bare_call",
         "index": bare.expression_index,
         "tool": tool_name,
         "provider": _describe_provider(bare.descriptor),
@@ -502,7 +527,7 @@ def describe_compiled(compiled, expression: str, *, validate: str = "always") ->
                     None if stmt.focus_selector is None
                     else stmt.focus_selector.render()
                 ),
-                "operation": _describe_invocation(stmt.operation),
+                "operation": _describe_operation(stmt.operation),
                 "pipes": [_describe_bare_call(b) for b in stmt.pipes],
             }
             for i, stmt in enumerate(compiled.statements)
@@ -563,9 +588,22 @@ def _print_compiled(compiled, expression: str, *, validate: str = "always") -> N
                 header += f"  focus: {focus}"
             print(header)
             op = stmt["operation"]
-            _print_call(
-                op, indent="    ", label=f"{op['tool']}({op['selector']})"
-            )
+            if op["kind"] == "assignment":
+                print(
+                    f"    {op['destination']} {op['operator']} "
+                    f"{op['source']}"
+                )
+                if op["transform"] is not None:
+                    t = op["transform"]
+                    _print_call(
+                        t,
+                        indent="    ",
+                        label=f"transform {t['tool']}({t['selector']})",
+                    )
+            else:
+                _print_call(
+                    op, indent="    ", label=f"{op['tool']}({op['selector']})"
+                )
             for pipe in stmt["pipes"]:
                 _print_call(pipe, indent="    ", label=f"| {pipe['tool']}")
     else:

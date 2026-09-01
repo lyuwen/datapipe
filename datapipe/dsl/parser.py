@@ -6,6 +6,11 @@ carries source spans so diagnostics can render caret annotations.
 Grammar::
 
     expression   := invocation (PIPE invocation)*
+    program      := statement (SEMICOLON statement)* SEMICOLON?
+    statement    := assignment | focused | invocation (PIPE bare_call)*
+    assignment   := selector (EQUALS | ARROW_LEFT) rhs (PIPE bare_call)*
+    rhs          := selector | invocation
+    focused      := selector PIPE bare_call (PIPE bare_call)*
     invocation   := qualified_name LPAREN selector (COMMA argument)* RPAREN
     argument     := IDENT EQUALS literal
     selector     := DOT selector_part*
@@ -184,6 +189,7 @@ class _Parser:
     def _parse_statement(self) -> "_ast.Statement":
         """Parse one statement.
 
+        Assignment form:     ``.dest = rhs`` / ``.dest <- rhs`` (+ optional pipes)
         Selector-first form: ``.field | bare_tool | bare_tool ...``
         Invocation-first form: ``name(selector, ...) | bare_tool | ...``
         """
@@ -197,10 +203,15 @@ class _Parser:
             # something else: after the DOT we expect IDENT, LBRACKET, or EOF/PIPE/SEMI
             # — basically anything that _parse_selector handles.
             selector = self._parse_selector()
+
+            nxt = self._peek().type
+            if nxt is TT.EQUALS or nxt is TT.ARROW_LEFT:
+                return self._parse_assignment(selector, is_move=nxt is TT.ARROW_LEFT)
+
             # Now we must see PIPE to make it a focused statement.
-            if self._peek().type is not TT.PIPE:
+            if nxt is not TT.PIPE:
                 raise self._error(
-                    "selector-first statement requires '|' after selector",
+                    "selector-first statement requires '|', '=', or '<-' after selector",
                     self._peek().span,
                 )
             self._advance()  # consume |
@@ -230,6 +241,66 @@ class _Parser:
             pipes=tuple(pipes_inv),
             focus_selector=None,
             span=span,
+        )
+
+    def _parse_assignment(
+        self, destination: "_ast.Selector", *, is_move: bool
+    ) -> "_ast.Statement":
+        """Parse ``= rhs`` / ``<- rhs`` after *destination*, plus any focused pipes.
+
+        The published focus is the destination, so trailing pipes operate on
+        the value that was just written there.
+        """
+        self._advance()  # consume '=' or '<-'
+        rhs = self._parse_assignment_rhs()
+
+        assignment = _ast.Assignment(
+            destination=destination,
+            rhs=rhs,
+            is_move=is_move,
+            span=Span(destination.span.start, rhs.span.end),
+        )
+
+        pipes: list["_ast.BareToolCall"] = []
+        while self._peek().type is TT.PIPE:
+            self._advance()  # consume |
+            pipes.append(self._parse_bare_tool_call())
+
+        end = (pipes[-1].span.end if pipes else assignment.span.end)
+        return _ast.Statement(
+            operation=assignment,
+            pipes=tuple(pipes),
+            focus_selector=destination,
+            span=Span(destination.span.start, end),
+        )
+
+    def _parse_assignment_rhs(self) -> "_ast.AssignmentRHS":
+        """Parse an assignment right-hand side: a selector or a transform of one.
+
+        ``.b``               → source ``.b``, no transform
+        ``fromjson(.b)``     → source ``.b``, transform the invocation
+        """
+        tok = self._peek()
+
+        if tok.type is TT.DOT:
+            selector = self._parse_selector()
+            return _ast.AssignmentRHS(
+                source=selector, transform=None, span=selector.span
+            )
+
+        if tok.type is TT.IDENT:
+            inv = self._parse_invocation()
+            # The primary source is the invocation's own selector argument;
+            # sharing the node keeps the two views of it from drifting.
+            return _ast.AssignmentRHS(
+                source=inv.selector, transform=inv, span=inv.span
+            )
+
+        raise self._error(
+            f"expected a selector or a tool invocation on the right-hand side "
+            f"of an assignment, got {tok.type.name}"
+            + (f" {tok.value!r}" if tok.value is not None else ""),
+            tok.span,
         )
 
     def _parse_bare_tool_call(self) -> "_ast.BareToolCall":

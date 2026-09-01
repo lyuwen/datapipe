@@ -538,7 +538,7 @@ def _error_payload(result: TaskResult) -> dict:
     # Preserve the structured tool fields when the failure came from a tool
     # invocation (§11 of the CLI plan).  Everything here is JSON-serializable:
     # the span becomes a 2-element list.
-    from datapipe.tools.errors import ToolExecutionError
+    from datapipe.tools.errors import StructuralExecutionError, ToolExecutionError
 
     if isinstance(detail, ToolExecutionError):
         payload["tool"] = {
@@ -556,6 +556,21 @@ def _error_payload(result: TaskResult) -> dict:
             "expected_type": detail.expected_type,
             "actual_type": detail.actual_type,
             "stage": detail.stage,
+        }
+    elif isinstance(detail, StructuralExecutionError):
+        payload["structural"] = {
+            "statement_index": detail.statement_index,
+            "operation": detail.operation,
+            "expression_span": (
+                list(detail.expression_span)
+                if detail.expression_span is not None
+                else None
+            ),
+            "selector": detail.selector,
+            "source_path": detail.source_path,
+            "destination_path": detail.destination_path,
+            "policy": detail.policy,
+            "reason": detail.reason,
         }
 
     return payload

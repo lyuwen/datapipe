@@ -96,9 +96,9 @@ class TestExpressionRouting:
         assert "error" in capsys.readouterr().err.lower()
 
     @pytest.mark.parametrize("expression, expected", [
-        # parse_program: "requires '|' after selector"
+        # parse_program: "requires '|', '=', or '<-' after selector"
         # legacy:        "expected tool name, got DOT"
-        (".a", "'|' after selector"),
+        (".a", "after selector"),
         # parse_program: "expected '(', got EOF"
         # legacy:        "unexpected token IDENT 'tojson'"
         ("fromjson(.a) tojson", "expected '('"),

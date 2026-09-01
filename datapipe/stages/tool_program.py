@@ -29,10 +29,10 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from datapipe.context import WorkerContext
-from datapipe.dsl.compiler import CompiledExpression, ToolInvocation
+from datapipe.dsl.compiler import CompiledExpression, ToolInvocation, overlap_reason
 from datapipe.dsl.errors import SelectorResolutionError
 from datapipe.stage import Stage
-from datapipe.tools.errors import ToolExecutionError
+from datapipe.tools.errors import StructuralExecutionError, ToolExecutionError
 from datapipe.tools.types import describe, infer_json_type, matches
 
 # Forward reference for CompiledProgram; imported locally in CompiledProgramStage
@@ -316,6 +316,18 @@ def _short_name(expression: str, max_len: int = 40) -> str:
     return clean
 
 
+def _join_path(parts: "tuple[str | int, ...]") -> str:
+    """Render concrete path parts as selector text, e.g. ``.tools[0].name``."""
+    if not parts:
+        return "."
+    return "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in parts)
+
+
+def _ref_path(refs: list) -> str | None:
+    """Return the single reference's concrete path, or None when it is ambiguous."""
+    return refs[0].path if len(refs) == 1 else None
+
+
 # ---------------------------------------------------------------------------
 # CompiledProgramStage: multi-statement sibling of CompiledToolProgramStage
 # ---------------------------------------------------------------------------
@@ -377,32 +389,57 @@ class CompiledProgramStage(Stage):
         self._resolve_all()
 
     def _expected_fn_count(self) -> int:
-        """Total callables to resolve: one per base operation plus one per bare pipe."""
-        return sum(1 + len(stmt.pipes) for stmt in self._compiled.statements)
+        """Total callables to resolve across the program.
+
+        One per tool base operation, one per assignment transform (an
+        assignment with no transform contributes none), plus one per bare pipe.
+        """
+        from datapipe.dsl.compiler import CompiledAssignment
+
+        total = 0
+        for stmt in self._compiled.statements:
+            op = stmt.operation
+            if isinstance(op, CompiledAssignment):
+                total += 1 if op.transform is not None else 0
+            else:
+                total += 1
+            total += len(stmt.pipes)
+        return total
 
     def _resolve_all(self) -> None:
         """Resolve all tool callables into ``_resolved_fns`` if not already done.
 
-        Both base operations and focused bare pipe calls are resolved, keyed by
-        their ``expression_index`` (unique across the whole program).
+        Base operations, assignment transforms, and focused bare pipe calls are
+        all resolved, keyed by their ``expression_index`` (unique across the
+        whole program).
         """
         if len(self._resolved_fns) == self._expected_fn_count():
             return
+        from datapipe.dsl.compiler import CompiledAssignment
         from datapipe.tools.loader import resolve_tool
+
+        def _resolve_invocation(inv) -> None:
+            if inv.expression_index in self._resolved_fns:
+                return
+            if inv.tool_descriptor is not None:
+                fn = resolve_tool(
+                    inv.tool_descriptor.provider, inv.tool_descriptor.tool_name
+                )
+            else:
+                assert inv.builtin_fn is not None, (
+                    f"ToolInvocation {inv.tool_name!r}: both tool_descriptor and "
+                    "builtin_fn are None — exactly one must be set"
+                )
+                fn = inv.builtin_fn
+            self._resolved_fns[inv.expression_index] = fn
+
         for stmt in self._compiled.statements:
-            inv = stmt.operation
-            if inv.expression_index not in self._resolved_fns:
-                if inv.tool_descriptor is not None:
-                    fn = resolve_tool(
-                        inv.tool_descriptor.provider, inv.tool_descriptor.tool_name
-                    )
-                else:
-                    assert inv.builtin_fn is not None, (
-                        f"ToolInvocation {inv.tool_name!r}: both tool_descriptor and "
-                        "builtin_fn are None — exactly one must be set"
-                    )
-                    fn = inv.builtin_fn
-                self._resolved_fns[inv.expression_index] = fn
+            op = stmt.operation
+            if isinstance(op, CompiledAssignment):
+                if op.transform is not None:
+                    _resolve_invocation(op.transform)
+            else:
+                _resolve_invocation(op)
 
             for bare in stmt.pipes:
                 if bare.expression_index in self._resolved_fns:
@@ -427,7 +464,13 @@ class CompiledProgramStage(Stage):
         focused bare pipe calls before writing back to the same location.
         A wildcard selector applies the whole chain elementwise to each match.
         The value returned is always the root record, never the focused value.
+
+        An assignment statement instead resolves its source and destination,
+        writes the (optionally transformed) value, and — for a move — removes
+        the source only once the write has succeeded.
         """
+        from datapipe.dsl.compiler import CompiledAssignment
+
         if len(self._resolved_fns) < self._expected_fn_count():
             self._resolve_all()
 
@@ -438,7 +481,17 @@ class CompiledProgramStage(Stage):
         if checking:
             self._validated_records += 1
 
-        for stmt in self._compiled.statements:
+        for stmt_index, stmt in enumerate(self._compiled.statements):
+            if isinstance(stmt.operation, CompiledAssignment):
+                record = self._apply_assignment(
+                    stmt,
+                    stmt_index,
+                    record,
+                    record_seq=record_seq,
+                    checking=checking,
+                )
+                continue
+
             inv = stmt.operation
             tool_fn = self._resolved_fns[inv.expression_index]
 
@@ -525,6 +578,262 @@ class CompiledProgramStage(Stage):
 
             record = inv.selector.apply(record, refs, new_values)
         return record
+
+    def _apply_assignment(
+        self,
+        stmt: Any,
+        stmt_index: int,
+        record: Any,
+        *,
+        record_seq: int | None,
+        checking: bool,
+    ) -> Any:
+        """Execute one ``=`` / ``<-`` statement, in the §8.1 binding order.
+
+        1. resolve the source
+        2. resolve/prepare the destination parent
+        3. validate source cardinality
+        4. detect runtime overlap
+        5. compute the transformed value (and run any focused pipes)
+        6. write the destination
+        7. remove the move source
+        8. publish focus = destination
+
+        Nothing is written until steps 1-5 have all succeeded, so a failure at
+        any precondition leaves the record byte-for-byte unmodified.
+        """
+        op = stmt.operation
+        fail = self._structural_failure(op, stmt_index, record_seq)
+
+        # -- 1. resolve the source ----------------------------------------
+        try:
+            src_refs = op.source.resolve(record)
+        except SelectorResolutionError as exc:
+            raise fail(
+                source_path=exc.path or op.source.render(),
+                reason=f"source path cannot be resolved: {exc}",
+                cause=exc,
+            ) from exc
+
+        # -- 2. resolve / prepare the destination --------------------------
+        # Only the final field is created by assignment; a missing intermediate
+        # parent is an error (§8.2 auto-creation is scoped to `<<` in S4).
+        dest_parent_container: Any = None
+        dest_key: Any = None
+        dest_ref = None
+        if op.dest_parent is not None:
+            try:
+                parent_refs = op.dest_parent.resolve(record)
+            except SelectorResolutionError as exc:
+                raise fail(
+                    source_path=_ref_path(src_refs),
+                    reason=f"destination parent cannot be resolved: {exc}",
+                    cause=exc,
+                ) from exc
+            if len(parent_refs) != 1:
+                raise fail(
+                    source_path=_ref_path(src_refs),
+                    reason=(
+                        f"destination parent must resolve to exactly one "
+                        f"location, got {len(parent_refs)}"
+                    ),
+                )
+            parent_value = parent_refs[0].value
+            if not isinstance(parent_value, dict):
+                raise fail(
+                    source_path=_ref_path(src_refs),
+                    reason=(
+                        f"destination parent {parent_refs[0].path} is a "
+                        f"{type(parent_value).__name__}, not an object"
+                    ),
+                )
+            dest_parent_container = parent_value
+            dest_key = op.dest_key
+            dest_parts = parent_refs[0].path_parts + (op.dest_key,)
+        else:
+            # Root, index, or wildcard destination: it must already exist.
+            try:
+                dest_refs = op.destination.resolve(record)
+            except SelectorResolutionError as exc:
+                raise fail(
+                    source_path=_ref_path(src_refs),
+                    reason=f"destination cannot be resolved: {exc}",
+                    cause=exc,
+                ) from exc
+            if len(dest_refs) != 1:
+                raise fail(
+                    source_path=_ref_path(src_refs),
+                    reason=(
+                        f"destination must resolve to exactly one location, "
+                        f"got {len(dest_refs)}"
+                    ),
+                )
+            dest_ref = dest_refs[0]
+            dest_parts = dest_ref.path_parts
+
+        # -- 3. validate source cardinality --------------------------------
+        if len(src_refs) != 1:
+            raise fail(
+                destination_path=_join_path(dest_parts),
+                reason=(
+                    f"source must resolve to exactly one reference, got "
+                    f"{len(src_refs)}"
+                ),
+            )
+        src_ref = src_refs[0]
+
+        # -- 4. detect runtime overlap -------------------------------------
+        detail = overlap_reason(
+            dest_parts,
+            src_ref.path_parts,
+            is_move=op.is_move,
+            has_transform=op.transform is not None,
+        )
+        if detail is not None:
+            raise fail(
+                source_path=src_ref.path,
+                destination_path=_join_path(dest_parts),
+                reason=f"overlapping source and destination: {detail}",
+            )
+
+        # -- 5. compute the transformed value ------------------------------
+        new_value = src_ref.value
+        if op.transform is not None:
+            new_value = self._run_transform(
+                op.transform,
+                new_value,
+                record_seq=record_seq,
+                matched_path=src_ref.path,
+                checking=checking,
+            )
+        for bare in stmt.pipes:
+            new_value = self._run_bare_call(
+                bare,
+                new_value,
+                record_seq=record_seq,
+                selector_text=op.destination.render(),
+                matched_path=_join_path(dest_parts),
+                match_ordinal=None,
+                checking=checking,
+            )
+
+        # -- 6. apply the destination write --------------------------------
+        # Step 4 waives the source-above-destination overlap when a transform
+        # is present, because a transform normally yields a fresh value.  One
+        # that returned its own argument puts us back in exactly the rejected
+        # case, so re-run the check now that the value is known.
+        if op.transform is not None and new_value is src_ref.value:
+            detail = overlap_reason(
+                dest_parts,
+                src_ref.path_parts,
+                is_move=op.is_move,
+                has_transform=False,
+            )
+            if detail is not None:
+                raise fail(
+                    source_path=src_ref.path,
+                    destination_path=_join_path(dest_parts),
+                    reason=(
+                        f"transform returned its own argument unchanged, so "
+                        f"the source and destination overlap: {detail}"
+                    ),
+                )
+
+        # A root destination is unreachable here: step 4 rejects it, because
+        # the root path is a prefix of every source path.
+        if dest_parent_container is not None:
+            dest_parent_container[dest_key] = new_value
+        else:
+            dest_ref.replace(new_value)
+
+        # -- 7. remove the move source (only now) --------------------------
+        if op.is_move:
+            del src_ref.parent[src_ref.key]
+
+        # -- 8. focus is the destination; the record is what we return -----
+        return record
+
+    def _structural_failure(
+        self, op: Any, stmt_index: int, record_seq: int | None
+    ) -> Callable[..., StructuralExecutionError]:
+        """Return a builder for this statement's ``StructuralExecutionError``."""
+        operation = "move" if op.is_move else "copy"
+
+        def build(
+            *,
+            source_path: str | None = None,
+            destination_path: str | None = None,
+            reason: str,
+            cause: BaseException | None = None,
+        ) -> StructuralExecutionError:
+            return StructuralExecutionError(
+                record_seq=record_seq,
+                statement_index=stmt_index,
+                operation=operation,
+                selector=op.source.render(),
+                source_path=source_path or op.source.render(),
+                destination_path=destination_path or op.destination.render(),
+                expression_span=op.span,
+                policy="error",
+                reason=reason,
+                cause=cause,
+            )
+
+        return build
+
+    def _run_transform(
+        self,
+        inv: ToolInvocation,
+        value: Any,
+        *,
+        record_seq: int | None,
+        matched_path: str | None,
+        checking: bool,
+    ) -> Any:
+        """Apply an assignment's RHS transform to the already-resolved source value."""
+        tool_fn = self._resolved_fns[inv.expression_index]
+
+        if checking and not matches(value, inv.contract.input_type):
+            raise self._mismatch(
+                inv,
+                record_seq=record_seq,
+                stage="input",
+                expected=inv.contract.input_type,
+                value=value,
+                matched_path=matched_path,
+                match_ordinal=None,
+            )
+
+        try:
+            result = tool_fn(value, **inv.arguments)
+        except ToolExecutionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ToolExecutionError(
+                record_seq=record_seq,
+                invocation_index=inv.expression_index,
+                tool_name=inv.tool_name,
+                provider_id=_provider_id(inv),
+                expression_span=inv.expression_span,
+                selector=inv.selector.render(),
+                matched_path=matched_path,
+                match_ordinal=None,
+                stage="call",
+                cause=exc,
+            ) from exc
+
+        if checking and not matches(result, inv.contract.output_type):
+            raise self._mismatch(
+                inv,
+                record_seq=record_seq,
+                stage="output",
+                expected=inv.contract.output_type,
+                value=result,
+                matched_path=matched_path,
+                match_ordinal=None,
+            )
+
+        return result
 
     def _run_bare_call(
         self,
