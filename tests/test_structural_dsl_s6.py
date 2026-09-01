@@ -386,6 +386,13 @@ def _doc_io_cases() -> "list[tuple[str, str, dict, dict]]":
     are (input, expected output); one line is the expected output for the most
     recently declared input.  A ```json block that does not follow a transform
     command declares an input for the examples that follow it.
+
+    A declared input stays current across intervening command fences: the docs
+    routinely show one input record and then several commands that each
+    transform it.  Clearing it at the fence silently dropped three of the
+    migration guide's examples -- including both headline nesting examples --
+    from verification, so a documented output could be corrupted without
+    failing any test.
     """
     cases = []
     for name in DOC_FILES:
@@ -412,6 +419,16 @@ def _doc_io_cases() -> "list[tuple[str, str, dict, dict]]":
                 current_input = record
             elif len(lines) == 1 and current_input is not None:
                 record, expected = current_input, json.loads(lines[0])
+            elif len(lines) == 1:
+                # No input declared yet, so this single-line block is the
+                # section's input rather than a result -- a prose section can
+                # open with a command and only then show the record it applies
+                # to.  Adopting it here is what keeps the examples that follow
+                # verifiable; discarding it silently dropped three of the
+                # migration guide's examples, both headline ones among them.
+                current_input = json.loads(lines[0])
+                pending = None
+                continue
             else:
                 pending = None
                 continue
@@ -422,6 +439,11 @@ def _doc_io_cases() -> "list[tuple[str, str, dict, dict]]":
 
 
 DOC_IO_CASES = _doc_io_cases()
+
+#: Minimum verified input/output pairs per file.  A global floor alone let
+#: migration-guide.md lose three examples while cli.md's contribution kept the
+#: total above the bar.
+DOC_IO_FLOOR_PER_FILE = {"cli.md": 13, "migration-guide.md": 7}
 
 
 def test_the_docs_contain_verifiable_input_output_pairs():
