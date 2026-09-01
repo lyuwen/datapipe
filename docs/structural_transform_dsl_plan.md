@@ -655,6 +655,10 @@ Reject moves where:
 
 - destination is inside the source subtree;
 - source is an ancestor of the destination;
+- source and destination are both indices into the same array — deleting the
+  source element renumbers the destination, so the write cannot be made stable
+  in either order (moving *out* of an array into a different container stays
+  valid, see §8.9);
 - the same source is selected more than once;
 - two sources derive the same destination key;
 - wildcard expansion produces duplicate references.

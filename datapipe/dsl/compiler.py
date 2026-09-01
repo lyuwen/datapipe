@@ -962,6 +962,13 @@ def overlap_reason(
     A transform makes the last case unprovable (its result is normally a fresh
     value), so it compiles; the runtime identity guard in the stage catches a
     transform that happens to return its input unchanged.
+
+    A move whose source is an array element additionally conflicts with any
+    destination inside that same array: removing the element renumbers every
+    later one, so the destination resolved before the delete no longer names
+    the slot it was resolved against.  A move out of an array into a *different*
+    container (§8.9, ``.metadata.first <- .values[0]``) is unaffected and stays
+    legal.
     """
     if dest == source:
         return "the source and destination are the same path"
@@ -978,7 +985,30 @@ def overlap_reason(
                 "value would contain itself"
             )
 
+    if is_move and _same_array_indices(dest, source):
+        return (
+            "the source and destination are elements of the same array, and "
+            "removing the source would renumber the destination"
+        )
+
     return None
+
+
+def _same_array_indices(
+    dest: tuple[str | int, ...], source: tuple[str | int, ...]
+) -> bool:
+    """True when *source* is an array element and *dest* lives in that array.
+
+    ``source`` ending in an index means the move deletes by position, which
+    shifts every later element of the enclosing array.  Any destination that
+    reaches into the same array through its own index is therefore unstable.
+    """
+    if not source or not isinstance(source[-1], int):
+        return False
+    container = source[:-1]
+    if len(dest) <= len(container) or dest[: len(container)] != container:
+        return False
+    return isinstance(dest[len(container)], int)
 
 
 def _reject_static_overlap(

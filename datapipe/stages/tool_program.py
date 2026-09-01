@@ -26,6 +26,7 @@ Architecture (§10 of the CLI plan)
 
 from __future__ import annotations
 
+from copy import deepcopy as _deepcopy
 from typing import Any, Callable
 
 from datapipe.context import WorkerContext
@@ -326,6 +327,17 @@ def _join_path(parts: "tuple[str | int, ...]") -> str:
 def _ref_path(refs: list) -> str | None:
     """Return the single reference's concrete path, or None when it is ambiguous."""
     return refs[0].path if len(refs) == 1 else None
+
+
+def _detached(value: Any) -> Any:
+    """Return *value* with no shared structure, so writing it creates no alias.
+
+    Only containers are copied: JSON scalars are immutable, so copying them
+    would be pure per-record cost on the hot path for no correctness gain.
+    """
+    if isinstance(value, (dict, list)):
+        return _deepcopy(value)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -741,10 +753,14 @@ class CompiledProgramStage(Stage):
 
         # A root destination is unreachable here: step 4 rejects it, because
         # the root path is a prefix of every source path.
+        # Containers are deep-copied so the destination cannot be mutated
+        # through the source (or vice versa) by a later statement; §6.1 says
+        # `=` copies.  Scalars are immutable and skip the per-record cost.
+        written = _detached(new_value)
         if dest_parent_container is not None:
-            dest_parent_container[dest_key] = new_value
+            dest_parent_container[dest_key] = written
         else:
-            dest_ref.replace(new_value)
+            dest_ref.replace(written)
 
         # -- 7. remove the move source (only now) --------------------------
         if op.is_move:

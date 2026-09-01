@@ -358,6 +358,47 @@ def test_copy_from_a_list_index():
     assert out == {"values": [10, 20], "first": 10}
 
 
+# §6.1: `=` copies, so a later write through the destination must not reach
+# back into the source.
+def test_copy_of_a_container_does_not_alias_the_source():
+    stage = _stage(".a = .b; .a.x = .c")
+    out = stage.process({"b": {"y": 1}, "c": 5}, None)
+    assert out["b"] == {"y": 1}
+    assert out["a"] == {"y": 1, "x": 5}
+    assert out["a"] is not out["b"]
+
+
+def test_copied_list_is_independent_of_its_source():
+    stage = _stage(".a = .b; .a[0] = .c")
+    out = stage.process({"b": [1, 2], "c": 9}, None)
+    assert out["b"] == [1, 2]
+    assert out["a"] == [9, 2]
+    assert out["a"] is not out["b"]
+
+
+def test_nested_containers_are_copied_deeply():
+    stage = _stage(".a = .b; .a.inner.x = .c")
+    out = stage.process({"b": {"inner": {"x": 1}}, "c": 2}, None)
+    assert out["b"] == {"inner": {"x": 1}}
+    assert out["a"] is not out["b"]
+    assert out["a"]["inner"] is not out["b"]["inner"]
+
+
+def test_scalar_copy_is_not_copied():
+    """Scalars are immutable: the copy must be the identical object."""
+    stage = _stage(".a = .b")
+    src = {"b": "a string value"}
+    out = stage.process(src, None)
+    assert out["a"] == "a string value"
+    assert out["a"] is out["b"]
+
+
+def test_move_of_a_container_does_not_alias_a_live_value():
+    stage = _stage(".a <- .b; .a.x = .c")
+    out = stage.process({"b": {"y": 1}, "c": 5}, None)
+    assert out == {"c": 5, "a": {"y": 1, "x": 5}}
+
+
 # ===========================================================================
 # Runtime — move
 # ===========================================================================
@@ -444,6 +485,46 @@ def test_move_from_a_list_index_removes_the_element():
     stage = _stage(".first <- .values[0]")
     out = stage.process({"values": [10, 20]}, None)
     assert out == {"values": [20], "first": 10}
+
+
+# §8.9 "Array sources": a move out of an array into a different container is
+# valid, and the remaining elements must survive intact and reindexed.
+def test_move_from_array_index_into_another_container_reindexes():
+    stage = _stage(".metadata.first <- .values[0]")
+    out = stage.process({"values": [1, 2, 3], "metadata": {}}, None)
+    assert out == {"values": [2, 3], "metadata": {"first": 1}}
+
+
+def test_move_between_indices_of_the_same_array_is_rejected():
+    """Deleting by index renumbers the destination, so this destroys data."""
+    from datapipe.dsl.compiler import compile_program
+
+    with pytest.raises(ToolConfigurationError) as exc:
+        compile_program(".items[1] <- .items[0]")
+    assert "same array" in str(exc.value)
+
+
+def test_move_into_a_subtree_of_the_same_array_is_rejected():
+    from datapipe.dsl.compiler import compile_program
+
+    with pytest.raises(ToolConfigurationError):
+        compile_program(".items[1].k <- .items[0]")
+
+
+def test_move_between_indices_of_different_arrays_is_allowed():
+    stage = _stage(".a[0] <- .b[0]")
+    out = stage.process({"a": [0], "b": [7, 8]}, None)
+    assert out == {"a": [7], "b": [8]}
+
+
+def test_same_array_move_hidden_by_a_wildcard_is_rejected_at_runtime():
+    """A wildcard defers the check; the runtime must still refuse to mutate."""
+    stage = _stage(".a[].items[1] <- .a[0].items[0]")
+    record = {"a": [{"items": [10, 20, 30]}]}
+    with pytest.raises(StructuralExecutionError) as exc:
+        stage.process(record, None)
+    assert "same array" in str(exc.value)
+    assert record == {"a": [{"items": [10, 20, 30]}]}
 
 
 def test_index_destination_writes_in_place():
@@ -720,7 +801,10 @@ def test_print_compiled_handles_assignments(capsys):
     expr = ".a = .b | tojson"
     _print_compiled(_compile_or_report(expr), expr)
     out = capsys.readouterr().out
-    assert ".a = .b" in out or ".a" in out
+    # Anchored to the indented statement line: the bare text also appears in
+    # the `Expression:` echo and the stage summary, so a substring test alone
+    # would pass with the assignment-rendering branch removed entirely.
+    assert "\n    .a = .b\n" in out
 
 
 # ===========================================================================
