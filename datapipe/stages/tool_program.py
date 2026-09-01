@@ -35,6 +35,11 @@ from datapipe.stage import Stage
 from datapipe.tools.errors import ToolExecutionError
 from datapipe.tools.types import describe, infer_json_type, matches
 
+# Forward reference for CompiledProgram; imported locally in CompiledProgramStage
+# to avoid circular imports at module load time.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from datapipe.dsl.compiler import CompiledProgram
 #: Number of records each worker validates in ``sample`` mode before it starts
 #: trusting the provider.
 SAMPLE_LIMIT = 100
@@ -288,3 +293,204 @@ def _short_name(expression: str, max_len: int = 40) -> str:
     if len(clean) > max_len:
         return clean[:max_len - 1] + "…"
     return clean
+
+
+# ---------------------------------------------------------------------------
+# CompiledProgramStage: multi-statement sibling of CompiledToolProgramStage
+# ---------------------------------------------------------------------------
+
+
+class CompiledProgramStage(Stage):
+    """Pipeline stage that executes a compiled multi-statement program per record.
+
+    Semantics: each statement executes in sequence on the evolving root record.
+    The record after all statements is the output.
+
+    Parameters
+    ----------
+    compiled:
+        The output of ``datapipe.dsl.compiler.compile_program()``.
+    name:
+        Stage name used in error attribution and pipeline inspection.
+        Defaults to a short excerpt of the expression.
+    validate:
+        Runtime contract validation mode — ``"always"`` (default),
+        ``"sample"``, or ``"off"``.
+    """
+
+    def __init__(
+        self,
+        compiled: "CompiledProgram",
+        name: str | None = None,
+        validate: str = "always",
+    ) -> None:
+        if validate not in VALIDATE_MODES:
+            raise ValueError(
+                f"invalid validate mode {validate!r}; "
+                f"expected one of {', '.join(repr(m) for m in VALIDATE_MODES)}"
+            )
+        self._compiled = compiled
+        self._validate = validate
+        self._validated_records = 0
+        self._resolved_fns: dict[int, Callable] = {}
+        self.name = name or _short_name(compiled.source)
+        self._name_explicit = name is not None
+
+    @property
+    def validate(self) -> str:
+        return self._validate
+
+    def __getstate__(self) -> dict:
+        """Exclude resolved callables from pickling."""
+        state = self.__dict__.copy()
+        state["_resolved_fns"] = {}
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        if "_resolved_fns" not in self.__dict__:
+            self._resolved_fns = {}
+
+    def setup(self, ctx: WorkerContext) -> None:
+        """Resolve provider callables once per worker before any records arrive."""
+        self._resolve_all()
+
+    def _resolve_all(self) -> None:
+        """Resolve all tool callables into ``_resolved_fns`` if not already done."""
+        if len(self._resolved_fns) == len(self._compiled.statements):
+            return
+        from datapipe.tools.loader import resolve_tool
+        for inv in self._compiled.statements:
+            if inv.expression_index in self._resolved_fns:
+                continue
+            if inv.tool_descriptor is not None:
+                fn = resolve_tool(inv.tool_descriptor.provider, inv.tool_descriptor.tool_name)
+            else:
+                assert inv.builtin_fn is not None, (
+                    f"ToolInvocation {inv.tool_name!r}: both tool_descriptor and "
+                    "builtin_fn are None — exactly one must be set"
+                )
+                fn = inv.builtin_fn
+            self._resolved_fns[inv.expression_index] = fn
+
+    def process(self, value: Any, ctx: WorkerContext) -> Any:
+        """Execute all statements in sequence against *value*."""
+        if len(self._resolved_fns) < len(self._compiled.statements):
+            self._resolve_all()
+
+        record = value
+        record_seq = ctx.record_index if ctx is not None else None
+
+        checking = self._should_validate_record()
+        if checking:
+            self._validated_records += 1
+
+        for inv in self._compiled.statements:
+            tool_fn = self._resolved_fns[inv.expression_index]
+
+            try:
+                refs = inv.selector.resolve(record)
+            except SelectorResolutionError as exc:
+                raise ToolExecutionError(
+                    record_seq=record_seq,
+                    invocation_index=inv.expression_index,
+                    tool_name=inv.tool_name,
+                    provider_id=_provider_id(inv),
+                    expression_span=inv.expression_span,
+                    selector=inv.selector.render(),
+                    matched_path=exc.path if exc.path else None,
+                    match_ordinal=None,
+                    stage="selector",
+                    cause=exc,
+                ) from exc
+
+            if not refs:
+                continue
+
+            wildcard = inv.selector.has_wildcard
+
+            new_values = []
+            for ordinal, ref in enumerate(refs):
+                match_ordinal = ordinal if wildcard else None
+
+                if checking and not matches(ref.value, inv.contract.input_type):
+                    raise self._mismatch(
+                        inv,
+                        record_seq=record_seq,
+                        stage="input",
+                        expected=inv.contract.input_type,
+                        value=ref.value,
+                        matched_path=ref.path,
+                        match_ordinal=match_ordinal,
+                    )
+
+                try:
+                    result = tool_fn(ref.value, **inv.arguments)
+                except ToolExecutionError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    raise ToolExecutionError(
+                        record_seq=record_seq,
+                        invocation_index=inv.expression_index,
+                        tool_name=inv.tool_name,
+                        provider_id=_provider_id(inv),
+                        expression_span=inv.expression_span,
+                        selector=inv.selector.render(),
+                        matched_path=ref.path,
+                        match_ordinal=match_ordinal,
+                        stage="call",
+                        cause=exc,
+                    ) from exc
+
+                if checking and not matches(result, inv.contract.output_type):
+                    raise self._mismatch(
+                        inv,
+                        record_seq=record_seq,
+                        stage="output",
+                        expected=inv.contract.output_type,
+                        value=result,
+                        matched_path=ref.path,
+                        match_ordinal=match_ordinal,
+                    )
+
+                new_values.append(result)
+
+            record = inv.selector.apply(record, refs, new_values)
+        return record
+
+    def _should_validate_record(self) -> bool:
+        if self._validate == "always":
+            return True
+        if self._validate == "off":
+            return False
+        return self._validated_records < SAMPLE_LIMIT
+
+    def _mismatch(
+        self,
+        inv: ToolInvocation,
+        *,
+        record_seq: int | None,
+        stage: str,
+        expected: Any,
+        value: Any,
+        matched_path: str | None,
+        match_ordinal: int | None,
+    ) -> ToolExecutionError:
+        actual = infer_json_type(value)
+        actual_name = actual.value if actual is not None else type(value).__name__
+        return ToolExecutionError(
+            record_seq=record_seq,
+            invocation_index=inv.expression_index,
+            tool_name=inv.tool_name,
+            provider_id=_provider_id(inv),
+            expression_span=inv.expression_span,
+            selector=inv.selector.render(),
+            matched_path=matched_path,
+            match_ordinal=match_ordinal,
+            expected_type=describe(expected),
+            actual_type=actual_name,
+            stage=stage,
+        )
+
+    def __repr__(self) -> str:
+        return f"CompiledProgramStage({self.name!r})"

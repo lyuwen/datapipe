@@ -27,13 +27,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import warnings
+
 from datapipe.dsl import ast as _ast
 from datapipe.dsl.errors import (
     Span,
     ToolConfigurationError,
     ToolResolutionError,
 )
-from datapipe.dsl.parser import parse
+from datapipe.dsl.parser import parse, parse_program
 from datapipe.dsl.selector import CompiledSelector
 from datapipe.tools.contract import ParameterSpec, ToolContract
 from datapipe.tools.decorator import get_contract
@@ -624,10 +626,88 @@ def compile_expression(expression: str) -> CompiledExpression:
             expression_span=(inv_node.span.start, inv_node.span.end),
         ))
 
+    # Legacy | migration diagnostic: warn when multiple invocations all use
+    # explicit (non-root, non-wildcard) selectors.  Single-invocation
+    # expressions and any expression with a root or wildcard selector are
+    # silent so we do not warn on legitimate uses.
+    if len(invocations) > 1 and all(
+        not inv.selector.has_wildcard and not inv.selector.is_root
+        for inv in invocations
+    ):
+        suggested = "; ".join(
+            f"{inv.tool_name}({inv.selector.render()})"
+            for inv in invocations
+        )
+        warnings.warn(
+            f"`|` between explicit record mutations is deprecated; use semicolons:\n"
+            f"  {suggested}",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     _check_static_compatibility(invocations, expression)
 
     return CompiledExpression(
         invocations=tuple(invocations),
+        source=expression,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-statement program compiler
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CompiledProgram:
+    """Compiled representation of a multi-statement program.
+
+    Each statement is one ``ToolInvocation`` (Phase S1).
+    """
+    statements: tuple[ToolInvocation, ...]
+    source: str
+
+
+def compile_program(expression: str) -> CompiledProgram:
+    """Compile a multi-statement program expression.
+
+    Calls ``parse_program`` then compiles each statement's invocation using
+    the same resolution logic as ``compile_expression``.
+    """
+    program = parse_program(expression)
+    registry = _build_full_registry()
+    invocations: list[ToolInvocation] = []
+
+    for i, stmt in enumerate(program.statements):
+        inv_node = stmt.operation
+        tool_fn, tool_desc = _resolve_tool(inv_node.qualified_name, registry, expression)
+        contract = get_contract(tool_fn)
+        if contract is None:
+            raise ToolResolutionError(
+                f"tool {inv_node.qualified_name.display!r} has no contract; "
+                "only @tool-decorated functions are supported",
+                expression=expression,
+                span=inv_node.qualified_name.span,
+            )
+
+        selector = _compile_selector(inv_node.selector, contract, expression)
+        arguments = _bind_arguments(
+            inv_node.arguments, contract, expression, inv_node.span
+        )
+
+        invocations.append(ToolInvocation(
+            tool_descriptor=tool_desc,
+            builtin_fn=tool_fn if tool_desc is None else None,
+            tool_name=contract.name,
+            contract=contract,
+            selector=selector,
+            arguments=arguments,
+            expression_index=i,
+            expression_span=(inv_node.span.start, inv_node.span.end),
+        ))
+
+    return CompiledProgram(
+        statements=tuple(invocations),
         source=expression,
     )
 

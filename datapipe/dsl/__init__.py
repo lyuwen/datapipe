@@ -8,6 +8,12 @@ Phase 2 exports:
     from datapipe.dsl.selector import CompiledSelector
     from datapipe.dsl.compiler import CompiledExpression, ToolInvocation
 
+Phase S1 additions:
+
+    from datapipe.dsl import parse_program, compile_program
+    from datapipe.dsl import Program, Statement
+    from datapipe.dsl.compiler import CompiledProgram
+
 """
 
 from datapipe.dsl.errors import (
@@ -25,13 +31,21 @@ from datapipe.dsl.ast import (
     Index,
     Invocation,
     Literal,
+    Program,
     QualifiedName,
     QuotedKey,
     Selector,
+    Statement,
 )
-from datapipe.dsl.parser import parse
+from datapipe.dsl.parser import parse, parse_program
 from datapipe.dsl.selector import CompiledSelector, Reference
-from datapipe.dsl.compiler import CompiledExpression, ToolInvocation, compile_expression
+from datapipe.dsl.compiler import (
+    CompiledExpression,
+    CompiledProgram,
+    ToolInvocation,
+    compile_expression,
+    compile_program,
+)
 
 __all__ = [
     # Errors
@@ -48,16 +62,21 @@ __all__ = [
     "Index",
     "Invocation",
     "Literal",
+    "Program",
     "QualifiedName",
     "QuotedKey",
     "Selector",
+    "Statement",
     # Parser
     "parse",
+    "parse_program",
     # Selector runtime
     "CompiledSelector",
     "Reference",
     # Compiler
     "CompiledExpression",
+    "CompiledProgram",
     "ToolInvocation",
     "compile_expression",
+    "compile_program",
 ]

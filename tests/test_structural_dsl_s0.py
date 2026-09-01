@@ -1,28 +1,18 @@
-"""Phase S0 fixture tests: parser baseline for every Section 7 example.
-
-Currently-valid expressions assert that parse() succeeds.
-Expressions that require new structural syntax (`;`, `<<`, `<-`, `^`,
-field-set selectors) are marked xfail(strict=False) so the suite stays
-green today and they automatically promote to passing when those tokens
-land in later phases.
-"""
-
 from __future__ import annotations
 
 import pytest
 
-from datapipe.dsl.parser import parse
-from datapipe.dsl.ast import Expression
+from datapipe.dsl.parser import parse, parse_program
+from datapipe.dsl.ast import Expression, Program
 
 
 # ---------------------------------------------------------------------------
 # §7.1  Sequence via `;` — two fromjson invocations
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=False, reason="structural syntax `;` not yet implemented")
 def test_7_1_fromjson_sequence_semicolon():
-    result = parse("fromjson(.tools); fromjson(.metadata.annotation, recursive=true)")
-    assert result is not None
+    result = parse_program("fromjson(.tools); fromjson(.metadata.annotation, recursive=true)")
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
@@ -38,20 +28,18 @@ def test_7_2_tojson_single_currently_valid():
 # §7.3  Sequence via `;` — two tojson invocations
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=False, reason="structural syntax `;` not yet implemented")
 def test_7_3_tojson_sequence_semicolon():
-    result = parse("tojson(.keya); tojson(.keyb)")
-    assert result is not None
+    result = parse_program("tojson(.keya); tojson(.keyb)")
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
 # §7.4  Three-statement sequence via `;`
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=False, reason="structural syntax `;` not yet implemented")
 def test_7_4_three_statement_sequence():
-    result = parse("tojson(.tools); tojson(.metadata); finalize_record(.)")
-    assert result is not None
+    result = parse_program("tojson(.tools); tojson(.metadata); finalize_record(.)")
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
@@ -111,13 +99,13 @@ def test_7_8_nest_builtin_unregistered():
 
 @pytest.mark.xfail(
     strict=False,
-    reason="structural syntax `;` and `<<` not yet implemented",
+    reason="structural syntax `<<` not yet implemented",
 )
 def test_7_9_multistatement_with_struct_merge():
-    result = parse(
+    result = parse_program(
         "fromjson(.metadata); . << .metadata.(temperature|score); tojson(.metadata)"
     )
-    assert result is not None
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +114,13 @@ def test_7_9_multistatement_with_struct_merge():
 
 @pytest.mark.xfail(
     strict=False,
-    reason="structural syntax `;` and `<-` field assignment not yet implemented",
+    reason="structural syntax `<-` field assignment not yet implemented",
 )
 def test_7_10_field_assignment_arrow():
-    result = parse(
+    result = parse_program(
         "fromjson(.metadata); .temperature <- fromjson(.metadata.temperature); tojson(.metadata)"
     )
-    assert result is not None
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +165,11 @@ def test_7_13a_legacy_pipe_currently_valid():
 
 
 # ---------------------------------------------------------------------------
-# §7.13b  Same as 7.13a but using `;` — not yet valid
+# §7.13b  Same as 7.13a but using `;` — now valid via parse_program()
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=False, reason="structural syntax `;` not yet implemented")
 def test_7_13b_semicolon_sequencing():
-    result = parse(
+    result = parse_program(
         "fromjson(.tools); fromjson(.metadata.annotation, recursive=true)"
     )
-    assert result is not None
+    assert isinstance(result, Program)

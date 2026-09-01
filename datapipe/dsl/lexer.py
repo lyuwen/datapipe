@@ -42,6 +42,7 @@ class TT(Enum):
     COLON = auto()
     LBRACE = auto()
     RBRACE = auto()
+    SEMICOLON = auto()
     STRING = auto()
     INTEGER = auto()
     FLOAT = auto()
@@ -122,6 +123,10 @@ def tokenize(expr: str) -> list[Token]:
             continue
         if ch == "}":
             tokens.append(Token(TT.RBRACE, None, Span(i, i + 1)))
+            i += 1
+            continue
+        if ch == ";":
+            tokens.append(Token(TT.SEMICOLON, None, Span(i, i + 1)))
             i += 1
             continue
 

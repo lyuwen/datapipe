@@ -196,14 +196,18 @@ def inspect_expression_command(args: "argparse.Namespace") -> int:
 
 def _compile_or_report(expression: str):
     """Compile *expression*, printing a diagnostic and returning None on error."""
-    from datapipe.dsl.compiler import compile_expression
     from datapipe.dsl.errors import (
         ExpressionSyntaxError,
         ToolConfigurationError,
         ToolResolutionError,
     )
     try:
-        return compile_expression(expression)
+        if ";" in expression:
+            from datapipe.dsl.compiler import compile_program
+            return compile_program(expression)
+        else:
+            from datapipe.dsl.compiler import compile_expression
+            return compile_expression(expression)
     except (ExpressionSyntaxError, ToolResolutionError, ToolConfigurationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return None
@@ -325,11 +329,18 @@ def _build_pipeline(compiled, validate: str = "always"):
     """Wrap a compiled expression in a Pipeline with outer JSON stages."""
     from datapipe.pipeline import Pipeline
     from datapipe.stage import JsonDumpStage, JsonLoadStage
-    from datapipe.stages.tool_program import CompiledToolProgramStage
+    from datapipe.dsl.compiler import CompiledProgram
+
+    if isinstance(compiled, CompiledProgram):
+        from datapipe.stages.tool_program import CompiledProgramStage
+        stage = CompiledProgramStage(compiled, validate=validate)
+    else:
+        from datapipe.stages.tool_program import CompiledToolProgramStage
+        stage = CompiledToolProgramStage(compiled, validate=validate)
 
     return Pipeline([
         JsonLoadStage(),
-        CompiledToolProgramStage(compiled, validate=validate),
+        stage,
         JsonDumpStage(),
     ])
 

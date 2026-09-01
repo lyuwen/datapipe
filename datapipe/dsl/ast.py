@@ -138,3 +138,22 @@ class Expression:
     """A complete pipeline expression: one or more ``|``-separated invocations."""
     invocations: tuple[Invocation, ...]
     span: Span
+
+
+@dataclass(frozen=True)
+class Statement:
+    """One record-mutation statement: a base operation with optional focused pipes.
+
+    For Phase S1 the base operation is always an ``Invocation``;
+    ``pipes`` is always empty until Phase S2.
+    """
+    operation: Invocation          # use existing Invocation for now
+    pipes: tuple[()]               # empty until S2
+    span: Span
+
+
+@dataclass(frozen=True)
+class Program:
+    """A complete multi-statement program: one or more ``;``-separated statements."""
+    statements: tuple[Statement, ...]
+    span: Span

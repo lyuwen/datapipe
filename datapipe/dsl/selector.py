@@ -98,6 +98,11 @@ class CompiledSelector:
         """True when the selector contains a ``[]`` wildcard part."""
         return any(isinstance(p, _ast.Each) for p in self._parts)
 
+    @property
+    def is_root(self) -> bool:
+        """True when the selector is the bare root selector ``.``."""
+        return self._is_root
+
     def render(self) -> str:
         """Return the original selector text, e.g. ``.tools[].function``.
 

@@ -42,6 +42,20 @@ def parse(expression: str) -> "_ast.Expression":
     return p.parse_expression()
 
 
+def parse_program(expression: str) -> "_ast.Program":
+    """Parse a multi-statement program (``;``-separated invocations).
+
+    A single statement with no ``;`` is still valid and returns a
+    ``Program`` with one ``Statement``.
+
+    Raises :class:`~datapipe.dsl.errors.ExpressionSyntaxError` on any syntax
+    problem, including an empty statement (two consecutive ``;``).
+    """
+    tokens = tokenize(expression)
+    p = _Parser(tokens, expression)
+    return p.parse_program()
+
+
 class _Parser:
     """Stateful recursive-descent parser over a flat token list."""
 
@@ -107,6 +121,67 @@ class _Parser:
         end = invocations[-1].span.end
         return _ast.Expression(
             invocations=tuple(invocations),
+            span=Span(start, end),
+        )
+
+    def parse_program(self) -> "_ast.Program":
+        """Parse a ``;``-separated sequence of invocations into a ``Program``."""
+        start = self._peek().span.start
+        statements: list["_ast.Statement"] = []
+
+        # Parse the first statement (may be empty input → error at EOF below)
+        while True:
+            tok = self._peek()
+
+            # Skip leading/trailing/between semicolons but detect empty statements
+            if tok.type is TT.SEMICOLON:
+                if not statements:
+                    raise self._error("empty statement", tok.span)
+                self._advance()  # consume ;
+                # After consuming ';', check for another ';' (empty statement)
+                if self._peek().type is TT.SEMICOLON:
+                    raise self._error("empty statement", self._peek().span)
+                # Trailing semicolon at EOF is allowed
+                if self._peek().type is TT.EOF:
+                    break
+                # Parse next statement
+                inv = self._parse_invocation()
+                stmt_span = inv.span
+                statements.append(_ast.Statement(
+                    operation=inv,
+                    pipes=(),
+                    span=stmt_span,
+                ))
+                continue
+
+            if tok.type is TT.EOF:
+                break
+
+            # Parse first invocation (or if we ended up here from a PIPE chain)
+            inv = self._parse_invocation()
+            stmt_span = inv.span
+            statements.append(_ast.Statement(
+                operation=inv,
+                pipes=(),
+                span=stmt_span,
+            ))
+
+        if not statements:
+            tok = self._peek()
+            raise self._error("expected an invocation", tok.span)
+
+        # Must be at end of input
+        if self._peek().type is not TT.EOF:
+            tok = self._peek()
+            raise self._error(
+                f"unexpected token {tok.type.name}"
+                + (f" {tok.value!r}" if tok.value is not None else ""),
+                tok.span,
+            )
+
+        end = statements[-1].span.end
+        return _ast.Program(
+            statements=tuple(statements),
             span=Span(start, end),
         )
 
