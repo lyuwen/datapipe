@@ -46,36 +46,27 @@ def test_7_4_three_statement_sequence():
 # §7.5  Struct-merge `<<` with comma-separated field list
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=False, reason="structural syntax `<<` not yet implemented")
 def test_7_5_struct_merge_comma_fields():
-    result = parse(".metadata << .annotation_key, .temperature, .score | tojson")
-    assert result is not None
+    result = parse_program(".metadata << .annotation_key, .temperature, .score | tojson")
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
 # §7.6  Struct-merge `<<` with grouped field-set selector `.(a|b|c)`
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="structural syntax `<<` and field-set selector not yet implemented",
-)
 def test_7_6_struct_merge_field_set():
-    result = parse(".metadata << .(annotation_key|temperature|score) | tojson")
-    assert result is not None
+    result = parse_program(".metadata << .(annotation_key|temperature|score) | tojson")
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
 # §7.7  Struct-merge `<<` with complement selector `^`
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="structural syntax `<<` and complement selector `^` not yet implemented",
-)
 def test_7_7_struct_merge_complement():
-    result = parse(".metadata << .(^instance_id|messages|tools) | tojson")
-    assert result is not None
+    result = parse_program(".metadata << .(^instance_id|messages|tools) | tojson")
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------
@@ -97,10 +88,6 @@ def test_7_8_nest_builtin_unregistered():
 # §7.9  Multi-statement with `<<` nesting
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="structural syntax `<<` not yet implemented",
-)
 def test_7_9_multistatement_with_struct_merge():
     result = parse_program(
         "fromjson(.metadata); . << .metadata.(temperature|score); tojson(.metadata)"
@@ -136,15 +123,11 @@ def test_7_11_structural_equals_assignment():
 # §7.12  Complement merge piped into unregistered tool
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="structural syntax `<<` and complement `^` not yet implemented; normalize_metadata not registered",
-)
 def test_7_12_complement_merge_pipe_tool():
-    result = parse(
+    result = parse_program(
         ".metadata << .(^instance_id|messages|tools) | normalize_metadata | tojson"
     )
-    assert result is not None
+    assert isinstance(result, Program)
 
 
 # ---------------------------------------------------------------------------

@@ -167,6 +167,36 @@ class Assignment:
 
 
 # ---------------------------------------------------------------------------
+# Move-into nodes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FieldSet:
+    """``.base.(a|b|c)`` / ``.base.(^a|b|c)`` — a named set of sibling fields.
+
+    ``complement`` inverts the whole parenthesized set: every field of the
+    object at ``base`` *except* ``names``.
+    """
+    base: Selector
+    names: tuple[str, ...]
+    complement: bool
+    span: Span
+
+
+@dataclass(frozen=True)
+class MoveInto:
+    """``.dest << src, src, ...`` — move each source under the destination object.
+
+    Each source contributes one destination key, derived from its final object
+    field name.  A ``FieldSet`` source contributes one key per expanded field.
+    """
+    destination: Selector
+    sources: tuple["Selector | FieldSet", ...]
+    span: Span
+
+
+# ---------------------------------------------------------------------------
 # Top-level expression
 # ---------------------------------------------------------------------------
 
@@ -192,8 +222,11 @@ class Statement:
     For assignments, ``operation`` is an ``Assignment`` and ``focus_selector``
     is the assignment's destination — trailing pipes apply to the value that
     was just written there.
+
+    For move-intos, ``operation`` is a ``MoveInto`` and ``focus_selector`` is
+    its destination, so a trailing pipe applies to the assembled object.
     """
-    operation: "Invocation | BareToolCall | Assignment"
+    operation: "Invocation | BareToolCall | Assignment | MoveInto"
     pipes: "tuple[BareToolCall, ...]"
     focus_selector: "Selector | None"   # None for invocation-first statements
     span: Span

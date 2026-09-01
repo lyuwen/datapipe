@@ -24,6 +24,11 @@ Phase S3 additions:
     from datapipe.dsl import Assignment, AssignmentRHS
     from datapipe.dsl.compiler import CompiledAssignment
 
+Phase S4 additions:
+
+    from datapipe.dsl import FieldSet, MoveInto
+    from datapipe.dsl.compiler import CompiledFieldSet, CompiledMoveInto
+
 """
 
 from datapipe.dsl.errors import (
@@ -41,9 +46,11 @@ from datapipe.dsl.ast import (
     Each,
     Expression,
     Field,
+    FieldSet,
     Index,
     Invocation,
     Literal,
+    MoveInto,
     Program,
     QualifiedName,
     QuotedKey,
@@ -56,6 +63,8 @@ from datapipe.dsl.compiler import (
     CompiledAssignment,
     CompiledBareCall,
     CompiledExpression,
+    CompiledFieldSet,
+    CompiledMoveInto,
     CompiledProgram,
     CompiledStatement,
     ToolInvocation,
@@ -78,9 +87,11 @@ __all__ = [
     "Each",
     "Expression",
     "Field",
+    "FieldSet",
     "Index",
     "Invocation",
     "Literal",
+    "MoveInto",
     "Program",
     "QualifiedName",
     "QuotedKey",
@@ -96,6 +107,8 @@ __all__ = [
     "CompiledAssignment",
     "CompiledBareCall",
     "CompiledExpression",
+    "CompiledFieldSet",
+    "CompiledMoveInto",
     "CompiledProgram",
     "CompiledStatement",
     "ToolInvocation",

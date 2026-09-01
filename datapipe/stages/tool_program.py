@@ -340,6 +340,35 @@ def _detached(value: Any) -> Any:
     return value
 
 
+def _without(
+    target: dict,
+    entries: "list[tuple[str, Any]]",
+    dest_parts: "tuple[str | int, ...]",
+) -> dict:
+    """Return a detached copy of *target* with any nested move sources removed.
+
+    A trailing pipe must see the destination as it will be once the move is
+    complete.  When the destination is an ancestor of a source — §6.6's
+    ``. << .metadata.x`` — the source is still physically inside *target*, so a
+    plain copy would hand the tool a value that still contains what is about to
+    move out of it.
+    """
+    result = _deepcopy(target)
+    depth = len(dest_parts)
+    nested = sorted(
+        (ref.path_parts[depth:] for _k, ref in entries if len(ref.path_parts) > depth
+         and ref.path_parts[:depth] == dest_parts),
+        key=len,
+        reverse=True,
+    )
+    for rel in nested:
+        container = result
+        for part in rel[:-1]:
+            container = container[part]
+        del container[rel[-1]]
+    return result
+
+
 # ---------------------------------------------------------------------------
 # CompiledProgramStage: multi-statement sibling of CompiledToolProgramStage
 # ---------------------------------------------------------------------------
@@ -406,13 +435,15 @@ class CompiledProgramStage(Stage):
         One per tool base operation, one per assignment transform (an
         assignment with no transform contributes none), plus one per bare pipe.
         """
-        from datapipe.dsl.compiler import CompiledAssignment
+        from datapipe.dsl.compiler import CompiledAssignment, CompiledMoveInto
 
         total = 0
         for stmt in self._compiled.statements:
             op = stmt.operation
             if isinstance(op, CompiledAssignment):
                 total += 1 if op.transform is not None else 0
+            elif isinstance(op, CompiledMoveInto):
+                pass  # a move-into calls no tool of its own
             else:
                 total += 1
             total += len(stmt.pipes)
@@ -427,7 +458,7 @@ class CompiledProgramStage(Stage):
         """
         if len(self._resolved_fns) == self._expected_fn_count():
             return
-        from datapipe.dsl.compiler import CompiledAssignment
+        from datapipe.dsl.compiler import CompiledAssignment, CompiledMoveInto
         from datapipe.tools.loader import resolve_tool
 
         def _resolve_invocation(inv) -> None:
@@ -450,7 +481,7 @@ class CompiledProgramStage(Stage):
             if isinstance(op, CompiledAssignment):
                 if op.transform is not None:
                     _resolve_invocation(op.transform)
-            else:
+            elif not isinstance(op, CompiledMoveInto):
                 _resolve_invocation(op)
 
             for bare in stmt.pipes:
@@ -481,7 +512,7 @@ class CompiledProgramStage(Stage):
         writes the (optionally transformed) value, and — for a move — removes
         the source only once the write has succeeded.
         """
-        from datapipe.dsl.compiler import CompiledAssignment
+        from datapipe.dsl.compiler import CompiledAssignment, CompiledMoveInto
 
         if len(self._resolved_fns) < self._expected_fn_count():
             self._resolve_all()
@@ -496,6 +527,16 @@ class CompiledProgramStage(Stage):
         for stmt_index, stmt in enumerate(self._compiled.statements):
             if isinstance(stmt.operation, CompiledAssignment):
                 record = self._apply_assignment(
+                    stmt,
+                    stmt_index,
+                    record,
+                    record_seq=record_seq,
+                    checking=checking,
+                )
+                continue
+
+            if isinstance(stmt.operation, CompiledMoveInto):
+                record = self._apply_move_into(
                     stmt,
                     stmt_index,
                     record,
@@ -769,11 +810,342 @@ class CompiledProgramStage(Stage):
         # -- 8. focus is the destination; the record is what we return -----
         return record
 
+    def _apply_move_into(
+        self,
+        stmt: Any,
+        stmt_index: int,
+        record: Any,
+        *,
+        record_seq: int | None,
+        checking: bool,
+    ) -> Any:
+        """Execute one ``<<`` statement, in the §8.1 binding order.
+
+        1. locate the destination object (created only in step 6, never here)
+        2. resolve and expand every source
+        3. validate destination type and source cardinality
+        4. detect self-references, duplicate keys, and key collisions
+        5. assemble the destination value and run any focused pipes
+        6. write the destination
+        7. remove every source
+        8. publish focus = the destination
+
+        Nothing in the record is written until steps 1-5 have all succeeded, so
+        a collision on the third of three sources leaves the record
+        byte-for-byte unmodified.
+        """
+        op = stmt.operation
+        fail = self._structural_failure(op, stmt_index, record_seq)
+
+        # -- 1. locate the destination -------------------------------------
+        target, dest_parts, place = self._locate_move_destination(record, op, fail)
+
+        # -- 2/3. resolve and expand every source --------------------------
+        entries = self._expand_move_sources(record, op, dest_parts, fail)
+
+        # -- 4. reject self-references, duplicates, and collisions ---------
+        self._check_move_entries(entries, target, dest_parts, fail)
+
+        # -- 5. assemble the destination value ------------------------------
+        # Values are detached so the destination shares no structure with
+        # anything still live in the record (the S3 aliasing rule); this also
+        # makes the deletions in step 7 harmless to what was just written.
+        additions = {key: _detached(ref.value) for key, ref in entries}
+
+        if not stmt.pipes:
+            record = place(record, additions, None)
+        else:
+            # A pipe sees the destination as it will be *after* the move, so a
+            # source that lives inside the destination subtree (§6.6's root
+            # move) must already be gone from the value handed to the tool.
+            final = _without(target, entries, dest_parts)
+            final.update(additions)
+            for bare in stmt.pipes:
+                final = self._run_bare_call(
+                    bare,
+                    final,
+                    record_seq=record_seq,
+                    selector_text=op.destination.render(),
+                    matched_path=_join_path(dest_parts),
+                    match_ordinal=None,
+                    checking=checking,
+                )
+            # -- 6. apply the destination write ------------------------------
+            record = place(record, additions, final)
+
+        # -- 7. remove the sources (only now) -------------------------------
+        # Every source's immediate parent is an object: `<<` derives its keys
+        # from final object fields, so no deletion can renumber a sibling the
+        # way removing a list element would.  Step 4 has already rejected a
+        # source nested inside another, so no deletion can remove the container
+        # another pending reference points into either.
+        for _key, ref in entries:
+            del ref.parent[ref.key]
+
+        # -- 8. focus is the destination; the record is what we return ------
+        return record
+
+    def _locate_move_destination(
+        self, record: Any, op: Any, fail: Callable[..., StructuralExecutionError]
+    ) -> "tuple[dict, tuple[str | int, ...], Callable]":
+        """Locate a ``<<`` destination and return (target, path_parts, placer).
+
+        ``target`` is the object the moved fields join — the existing
+        destination, or an empty dict standing in for one that §8.2 will create.
+        Nothing is written here: ``placer`` performs the whole write later, once
+        every precondition has passed.
+        """
+        if op.dest_parent is not None:
+            try:
+                parent_refs = op.dest_parent.resolve(record)
+            except SelectorResolutionError as exc:
+                raise fail(
+                    reason=f"destination parent cannot be resolved: {exc}",
+                    cause=exc,
+                ) from exc
+            if len(parent_refs) != 1:
+                raise fail(reason=(
+                    f"destination parent must resolve to exactly one location, "
+                    f"got {len(parent_refs)}"
+                ))
+            parent = parent_refs[0].value
+            if not isinstance(parent, dict):
+                raise fail(reason=(
+                    f"destination parent {parent_refs[0].path} is a "
+                    f"{type(parent).__name__}, not an object"
+                ))
+
+            key = op.dest_key
+            dest_parts = parent_refs[0].path_parts + (key,)
+            existing = parent.get(key)
+            if key in parent and not isinstance(existing, dict):
+                # §8.3: a serialized destination must be decoded first.
+                raise fail(
+                    destination_path=_join_path(dest_parts),
+                    reason=(
+                        f"destination {_join_path(dest_parts)} is a "
+                        f"{type(existing).__name__}, not an object; decode it "
+                        f"first (`fromjson({_join_path(dest_parts)})`)"
+                    ),
+                )
+            target = existing if key in parent else {}
+
+            def place(rec, additions, final, _p=parent, _k=key, _t=target):
+                if final is not None:
+                    _p[_k] = final
+                    return rec
+                _t.update(additions)
+                _p[_k] = _t      # a no-op when the destination already existed
+                return rec
+
+            return target, dest_parts, place
+
+        # Root, index, or wildcard destination: it must already exist (§8.2
+        # creates only a missing *final field*, which has a parent selector).
+        try:
+            dest_refs = op.destination.resolve(record)
+        except SelectorResolutionError as exc:
+            raise fail(
+                reason=f"destination cannot be resolved: {exc}", cause=exc
+            ) from exc
+        if len(dest_refs) != 1:
+            raise fail(reason=(
+                f"destination must resolve to exactly one location, "
+                f"got {len(dest_refs)}"
+            ))
+        dest_ref = dest_refs[0]
+        if not isinstance(dest_ref.value, dict):
+            raise fail(
+                destination_path=dest_ref.path,
+                reason=(
+                    f"destination {dest_ref.path} is a "
+                    f"{type(dest_ref.value).__name__}, not an object"
+                ),
+            )
+
+        def place(rec, additions, final, _ref=dest_ref):
+            if final is None:
+                # In-place update keeps the caller's record identity, which
+                # matters when the destination is the root itself.
+                _ref.value.update(additions)
+                return rec
+            if _ref.parent is None:
+                return final   # a pipe replaced the whole record
+            _ref.replace(final)
+            return rec
+
+        return dest_ref.value, dest_ref.path_parts, place
+
+    def _expand_move_sources(
+        self,
+        record: Any,
+        op: Any,
+        dest_parts: "tuple[str | int, ...]",
+        fail: Callable[..., StructuralExecutionError],
+    ) -> "list[tuple[str, Any]]":
+        """Resolve every ``<<`` source into ``(derived_key, Reference)`` pairs.
+
+        Field sets expand in the **source object's** key order (§6.4), not the
+        order the names were written.  A positive set is strict (§8.5); a
+        complement ignores names the record does not have (§8.6) and drops the
+        destination itself (§8.7).
+        """
+        from datapipe.dsl.compiler import CompiledFieldSet
+        from datapipe.dsl.selector import Reference
+
+        entries: list[tuple[str, Any]] = []
+
+        for source in op.sources:
+            if not isinstance(source, CompiledFieldSet):
+                try:
+                    refs = source.resolve(record)
+                except SelectorResolutionError as exc:
+                    raise fail(
+                        source_path=exc.path or source.render(),
+                        reason=f"source path cannot be resolved: {exc}",
+                        cause=exc,
+                    ) from exc
+                if len(refs) != 1:
+                    raise fail(
+                        source_path=source.render(),
+                        reason=(
+                            f"source {source.render()} must resolve to exactly "
+                            f"one reference, got {len(refs)}"
+                        ),
+                    )
+                entries.append((str(refs[0].path_parts[-1]), refs[0]))
+                continue
+
+            try:
+                base_refs = source.base.resolve(record)
+            except SelectorResolutionError as exc:
+                raise fail(
+                    source_path=exc.path or source.base.render(),
+                    reason=f"field-set base cannot be resolved: {exc}",
+                    cause=exc,
+                ) from exc
+            if len(base_refs) != 1:
+                raise fail(
+                    source_path=source.base.render(),
+                    reason=(
+                        f"field-set base {source.base.render()} must resolve to "
+                        f"exactly one object, got {len(base_refs)}"
+                    ),
+                )
+            base = base_refs[0]
+            if not isinstance(base.value, dict):
+                raise fail(
+                    source_path=base.path,
+                    reason=(
+                        f"field set selects from {base.path}, which is a "
+                        f"{type(base.value).__name__}, not an object"
+                    ),
+                )
+
+            named = set(source.names)
+            if source.complement:
+                # §8.6: names the record does not have are simply not excluded.
+                selected = [k for k in base.value if k not in named]
+            else:
+                missing = [n for n in source.names if n not in base.value]
+                if missing:
+                    # §8.5: positive sets are strict.
+                    raise fail(
+                        source_path=base.path,
+                        reason=(
+                            f"field set requires "
+                            f"{', '.join(repr(m) for m in missing)} at "
+                            f"{base.path}, which is missing"
+                        ),
+                    )
+                # Source object order, not the order the names were written.
+                selected = [k for k in base.value if k in named]
+
+            for name in selected:
+                parts = base.path_parts + (name,)
+                if source.complement and parts == dest_parts:
+                    continue  # §8.7: never move the destination into itself
+                entries.append((name, Reference(
+                    parent=base.value,
+                    key=name,
+                    value=base.value[name],
+                    path=f"{'' if base.path == '.' else base.path}.{name}",
+                    path_parts=parts,
+                )))
+
+        return entries
+
+    def _check_move_entries(
+        self,
+        entries: "list[tuple[str, Any]]",
+        target: dict,
+        dest_parts: "tuple[str | int, ...]",
+        fail: Callable[..., StructuralExecutionError],
+    ) -> None:
+        """Reject every §8.4/§8.8 problem before a single byte is written."""
+        by_key: dict[str, str] = {}
+
+        for key, ref in entries:
+            # `<<` desugars to `dest.<key> <- source`, so overlap is judged
+            # against that effective destination — the destination object itself
+            # is legitimately an ancestor of the source in §6.6's root move.
+            detail = overlap_reason(
+                dest_parts + (key,), ref.path_parts, is_move=True
+            )
+            if detail is not None:
+                raise fail(
+                    source_path=ref.path,
+                    destination_path=_join_path(dest_parts + (key,)),
+                    reason=f"overlapping source and destination: {detail}",
+                )
+
+            previous = by_key.get(key)
+            if previous is not None:
+                raise fail(
+                    source_path=ref.path,
+                    destination_path=_join_path(dest_parts),
+                    reason=(
+                        f"two sources derive the destination key {key!r}: "
+                        f"{previous} and {ref.path}"
+                    ),
+                )
+            by_key[key] = ref.path
+
+            if key in target:
+                # §8.4: `<<` is collision="error".
+                raise fail(
+                    source_path=ref.path,
+                    destination_path=_join_path(dest_parts + (key,)),
+                    reason=(
+                        f"destination key {key!r} already exists at "
+                        f"{_join_path(dest_parts)}"
+                    ),
+                )
+
+        # A source nested inside another would have its container deleted out
+        # from under it in step 7, so the pair can never both be moved.
+        paths = sorted((ref.path_parts, ref.path) for _k, ref in entries)
+        for (outer, outer_path), (inner, inner_path) in zip(paths, paths[1:]):
+            if inner[: len(outer)] == outer:
+                raise fail(
+                    source_path=inner_path,
+                    destination_path=_join_path(dest_parts),
+                    reason=(
+                        f"source {outer_path} is an ancestor of source "
+                        f"{inner_path}; moving both is not well defined"
+                    ),
+                )
+
     def _structural_failure(
         self, op: Any, stmt_index: int, record_seq: int | None
     ) -> Callable[..., StructuralExecutionError]:
         """Return a builder for this statement's ``StructuralExecutionError``."""
-        operation = "move" if op.is_move else "copy"
+        from datapipe.dsl.compiler import CompiledMoveInto
+
+        if isinstance(op, CompiledMoveInto):
+            operation = "move-into"
+        else:
+            operation = "move" if op.is_move else "copy"
 
         def build(
             *,

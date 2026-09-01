@@ -611,9 +611,45 @@ class CompiledAssignment:
 
 
 @dataclass(frozen=True)
+class CompiledFieldSet:
+    """A compiled ``.base.(a|b|c)`` / ``.base.(^a|b|c)`` move-into source.
+
+    Expansion happens per record: the named fields (or, for a complement, every
+    other field) are read from the object at ``base`` **in that object's own key
+    order**, which is what fixes the destination key order (§6.4).
+    """
+    base: CompiledSelector
+    names: tuple[str, ...]
+    complement: bool
+    span: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class CompiledMoveInto:
+    """A compiled ``.dest << src, ...`` statement operation.
+
+    ``dest_parent`` / ``dest_key`` are precomputed exactly as for
+    ``CompiledAssignment``: ``<<`` creates a missing final field as ``{}`` when
+    the parent exists (§8.2), so only the parent must already resolve.  They are
+    ``None`` for a root, index, or wildcard destination, which must exist.
+    """
+    destination: CompiledSelector
+    sources: tuple["CompiledSelector | CompiledFieldSet", ...]
+    span: tuple[int, int]
+    dest_parent: CompiledSelector | None = None
+    dest_key: str | None = None
+
+    @property
+    def source(self) -> CompiledSelector:
+        """The first source, for diagnostics that report a single selector."""
+        first = self.sources[0]
+        return first.base if isinstance(first, CompiledFieldSet) else first
+
+
+@dataclass(frozen=True)
 class CompiledStatement:
     """One compiled statement: a base operation plus optional focused pipes."""
-    operation: "ToolInvocation | CompiledBareCall | CompiledAssignment"
+    operation: "ToolInvocation | CompiledBareCall | CompiledAssignment | CompiledMoveInto"
     pipes: tuple[CompiledBareCall, ...]
     focus_selector: CompiledSelector | None  # None for invocation-first
     span: tuple[int, int]
@@ -738,6 +774,8 @@ def compile_program(expression: str) -> CompiledProgram:
             operation, focus, index = _compile_assignment(
                 op_node, registry, expression, index
             )
+        elif isinstance(op_node, _ast.MoveInto):
+            operation, focus = _compile_move_into(op_node, expression)
         else:
             operation, focus, index = _compile_tool_operation(
                 stmt, op_node, registry, expression, index
@@ -891,6 +929,227 @@ def _compile_assignment(
         dest_key=dest_key,
     )
     return operation, operation.destination, index
+
+
+def _compile_move_into(
+    node: "_ast.MoveInto", expression: str
+) -> tuple[CompiledMoveInto, CompiledSelector]:
+    """Compile a ``<<`` statement, applying the §12 static rejections.
+
+    Rejected here, before any record is read:
+
+    - a source whose key cannot be inferred — an index, a wildcard, or the root
+      (§8.9): ``<<`` derives destination keys from object fields only;
+    - duplicate exact names inside one field set;
+    - two sources that provably derive the same destination key (§8.8);
+    - a statically provable source/destination overlap (§8.8).
+
+    A ``FieldSet`` source contributes keys that are only known per record when
+    it is a complement, so its duplicate and overlap checks are completed at
+    runtime; the positive form is fully static and checked here.
+    """
+    dest_path = _static_path(node.destination)
+
+    # Derived keys that are knowable at compile time, mapped to the source text
+    # that produced them, so a collision names both sides.
+    derived: dict[str, str] = {}
+
+    for source in node.sources:
+        if isinstance(source, _ast.FieldSet):
+            _check_field_set(source, node, expression)
+            base_path = _static_path(source.base)
+            if source.complement:
+                _check_complement_base(dest_path, base_path, source, node, expression)
+                continue
+            # A positive set is fully static: each name is an ordinary source
+            # rooted at the base, so it gets the ordinary key and overlap checks.
+            for name in source.names:
+                rendered = f"{_render_field_set(source)} → {name}"
+                _record_derived_key(derived, name, rendered, node, expression)
+                _check_move_overlap(
+                    dest_path,
+                    None if base_path is None else base_path + (name,),
+                    rendered, node, expression,
+                )
+            continue
+
+        key = _inferred_key(source)
+        if key is None:
+            raise ToolConfigurationError(
+                f"cannot infer a destination key for source "
+                f"{_render_selector(source)!r} in move-into "
+                f"{_render_selector(node.destination)} << ...: `<<` derives the "
+                f"key from a final object field, so an array index, a wildcard, "
+                f"or the root needs an explicit destination "
+                f"(`{_render_selector(node.destination)}.<key> <- "
+                f"{_render_selector(source)}`)",
+                expression=expression,
+                span=source.span,
+            )
+        _record_derived_key(
+            derived, key, _render_selector(source), node, expression
+        )
+        _check_move_overlap(
+            dest_path, _static_path(source), _render_selector(source),
+            node, expression,
+        )
+
+    dest_parent, dest_key = _split_destination(node.destination)
+    operation = CompiledMoveInto(
+        destination=CompiledSelector(node.destination),
+        sources=tuple(_compile_move_source(s) for s in node.sources),
+        span=(node.span.start, node.span.end),
+        dest_parent=dest_parent,
+        dest_key=dest_key,
+    )
+    return operation, operation.destination
+
+
+def _compile_move_source(
+    source: "_ast.Selector | _ast.FieldSet",
+) -> "CompiledSelector | CompiledFieldSet":
+    """Compile one ``<<`` source into its runtime form."""
+    if isinstance(source, _ast.FieldSet):
+        return CompiledFieldSet(
+            base=CompiledSelector(source.base),
+            names=source.names,
+            complement=source.complement,
+            span=(source.span.start, source.span.end),
+        )
+    return CompiledSelector(source)
+
+
+def _inferred_key(source: "_ast.Selector") -> str | None:
+    """Return the destination key ``<<`` derives from *source*, or None (§8.9).
+
+    Only a final object field yields a key.  An index, a wildcard, or the root
+    yields ``None``, which the caller turns into a compile error.  A wildcard
+    anywhere in the path also yields ``None``: it matches many values that would
+    all claim the one derived key.  An index *before* the final field is fine —
+    ``.bag << .items[0].a`` names exactly one value and derives ``a``.
+    """
+    if not source.parts:
+        return None
+    if source.has_wildcard:
+        return None
+    last = source.parts[-1]
+    if isinstance(last, _ast.Field):
+        return last.name
+    if isinstance(last, _ast.QuotedKey):
+        return last.key
+    return None
+
+
+def _record_derived_key(
+    derived: dict[str, str],
+    key: str,
+    rendered: str,
+    node: "_ast.MoveInto",
+    expression: str,
+) -> None:
+    """Register *key* as derived by *rendered*, rejecting a second claim (§8.8)."""
+    previous = derived.get(key)
+    if previous is not None:
+        raise ToolConfigurationError(
+            f"two sources derive the same destination key {key!r} in move-into "
+            f"{_render_selector(node.destination)} << ...: {previous} and "
+            f"{rendered}; `<<` uses collision=\"error\", so give one an explicit "
+            f"destination with `<-`",
+            expression=expression,
+            span=node.span,
+        )
+    derived[key] = rendered
+
+
+def _check_field_set(
+    source: "_ast.FieldSet", node: "_ast.MoveInto", expression: str
+) -> None:
+    """Reject duplicate names inside one field set, and a wildcard base (§12)."""
+    seen: set[str] = set()
+    for name in source.names:
+        if name in seen:
+            raise ToolConfigurationError(
+                f"duplicate field name {name!r} in field set "
+                f"{_render_field_set(source)}",
+                expression=expression,
+                span=source.span,
+            )
+        seen.add(name)
+
+    if source.base.has_wildcard or _static_path(source.base) is None:
+        raise ToolConfigurationError(
+            f"field set {_render_field_set(source)} selects from a wildcard "
+            f"base; a field set must name one object",
+            expression=expression,
+            span=source.span,
+        )
+
+
+def _check_move_overlap(
+    dest_path: "tuple[str | int, ...] | None",
+    src_path: "tuple[str | int, ...] | None",
+    rendered: str,
+    node: "_ast.MoveInto",
+    expression: str,
+) -> None:
+    """Reject a statically provable source/destination overlap for ``<<`` (§8.8).
+
+    ``<<`` desugars to ``dest.<key> <- source``, so the overlap that matters is
+    between the source and that *effective* destination — not between the source
+    and the destination object.  Checking the object itself would reject §6.6's
+    ``. << .metadata.x``, where the destination is legitimately an ancestor of
+    the source.
+    """
+    if dest_path is None or src_path is None:
+        return
+
+    effective = dest_path + (src_path[-1],)
+    detail = overlap_reason(effective, src_path, is_move=True)
+    if detail is None:
+        return
+
+    raise ToolConfigurationError(
+        f"overlapping source and destination in move-into "
+        f"{_render_selector(node.destination)} << {rendered}: {detail}",
+        expression=expression,
+        span=node.span,
+    )
+
+
+def _check_complement_base(
+    dest_path: "tuple[str | int, ...] | None",
+    base_path: "tuple[str | int, ...] | None",
+    source: "_ast.FieldSet",
+    node: "_ast.MoveInto",
+    expression: str,
+) -> None:
+    """Reject a complement whose base sits at or inside the destination (§8.8).
+
+    A complement's members are only known per record, so only the base can be
+    checked statically.  The base being at or under the destination would move
+    the destination's own subtree into itself.  The reverse — the destination
+    inside the base, as in ``.metadata << .(^instance_id)`` — is the intended
+    blanket move, kept safe by the §8.7 self-exclusion at runtime.
+    """
+    if dest_path is None or base_path is None:
+        return
+    if base_path[: len(dest_path)] != dest_path:
+        return
+    raise ToolConfigurationError(
+        f"overlapping source and destination in move-into "
+        f"{_render_selector(node.destination)} << {_render_field_set(source)}: "
+        f"the destination is an ancestor of the source",
+        expression=expression,
+        span=node.span,
+    )
+
+
+def _render_field_set(source: "_ast.FieldSet") -> str:
+    """Render a field set back to its source syntax for diagnostics."""
+    base = _render_selector(source.base)
+    prefix = "" if base == "." else base
+    caret = "^" if source.complement else ""
+    return f"{prefix}.({caret}{'|'.join(source.names)})"
 
 
 def _split_destination(

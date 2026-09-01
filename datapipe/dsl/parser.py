@@ -7,8 +7,12 @@ Grammar::
 
     expression   := invocation (PIPE invocation)*
     program      := statement (SEMICOLON statement)* SEMICOLON?
-    statement    := assignment | focused | invocation (PIPE bare_call)*
+    statement    := assignment | move_into | focused | invocation (PIPE bare_call)*
     assignment   := selector (EQUALS | ARROW_LEFT) rhs (PIPE bare_call)*
+    move_into    := selector MOVE_IN move_source (COMMA move_source)*
+                        (PIPE bare_call)*
+    move_source  := selector | field_set
+    field_set    := selector DOT LPAREN COMPLEMENT? IDENT (PIPE IDENT)* RPAREN
     rhs          := selector | invocation
     focused      := selector PIPE bare_call (PIPE bare_call)*
     invocation   := qualified_name LPAREN selector (COMMA argument)* RPAREN
@@ -208,10 +212,14 @@ class _Parser:
             if nxt is TT.EQUALS or nxt is TT.ARROW_LEFT:
                 return self._parse_assignment(selector, is_move=nxt is TT.ARROW_LEFT)
 
+            if nxt is TT.MOVE_IN:
+                return self._parse_move_into(selector)
+
             # Now we must see PIPE to make it a focused statement.
             if nxt is not TT.PIPE:
                 raise self._error(
-                    "selector-first statement requires '|', '=', or '<-' after selector",
+                    "selector-first statement requires '|', '=', '<-', or '<<' "
+                    "after selector",
                     self._peek().span,
                 )
             self._advance()  # consume |
@@ -360,6 +368,76 @@ class _Parser:
             span=ident_tok.span,
         )
 
+    def _parse_move_into(self, destination: "_ast.Selector") -> "_ast.Statement":
+        """Parse ``<< source_list`` after *destination*, plus any focused pipes.
+
+        Per §9.1 the comma binds tighter than the pipe, so the source list is
+        consumed first and any trailing ``|`` attaches to the whole statement.
+        The published focus is the destination, so a trailing pipe operates on
+        the assembled object rather than on the last source.
+        """
+        self._advance()  # consume '<<'
+
+        sources: list["_ast.Selector | _ast.FieldSet"] = [self._parse_move_source()]
+        while self._peek().type is TT.COMMA:
+            self._advance()  # consume ,
+            sources.append(self._parse_move_source())
+
+        move = _ast.MoveInto(
+            destination=destination,
+            sources=tuple(sources),
+            span=Span(destination.span.start, sources[-1].span.end),
+        )
+
+        pipes: list["_ast.BareToolCall"] = []
+        while self._peek().type is TT.PIPE:
+            self._advance()  # consume |
+            pipes.append(self._parse_bare_tool_call())
+
+        end = pipes[-1].span.end if pipes else move.span.end
+        return _ast.Statement(
+            operation=move,
+            pipes=tuple(pipes),
+            focus_selector=destination,
+            span=Span(destination.span.start, end),
+        )
+
+    def _parse_move_source(self) -> "_ast.Selector | _ast.FieldSet":
+        """Parse one ``<<`` source: a plain selector or a field set."""
+        return self._parse_selector(allow_field_set=True)
+
+    def _parse_field_set(
+        self, base: "_ast.Selector", dot_start: int
+    ) -> "_ast.FieldSet":
+        """Parse ``(^? name (| name)*)`` after the dot that introduced it.
+
+        The opening ``(`` is the current token.  Inside these parentheses ``|``
+        joins exact field names (§9.2); the closing ``)`` ends that context, so
+        a ``|`` after it belongs to the statement's pipe chain.
+        """
+        self._advance()  # consume (
+
+        complement = False
+        if self._peek().type is TT.COMPLEMENT:
+            self._advance()  # consume ^
+            complement = True
+
+        names: list[str] = []
+        name_tok = self._expect(TT.IDENT, "field name inside '.('")
+        names.append(str(name_tok.value))
+        while self._peek().type is TT.PIPE:
+            self._advance()  # consume | — a field-name union, not a pipe
+            name_tok = self._expect(TT.IDENT, "field name after '|' inside '.('")
+            names.append(str(name_tok.value))
+
+        close = self._expect(TT.RPAREN, "')' to close a field set")
+        return _ast.FieldSet(
+            base=base,
+            names=tuple(names),
+            complement=complement,
+            span=Span(dot_start, close.span.end),
+        )
+
     def _parse_invocation(self) -> "_ast.Invocation":
         name = self._parse_qualified_name()
         self._expect(TT.LPAREN, "'('")
@@ -409,7 +487,9 @@ class _Parser:
             span=ident_tok.span,
         )
 
-    def _parse_selector(self) -> "_ast.Selector":
+    def _parse_selector(
+        self, *, allow_field_set: bool = False
+    ) -> "_ast.Selector | _ast.FieldSet":
         dot_tok = self._expect(TT.DOT, "'.'")
         start = dot_tok.span.start
         parts: list["_ast.SelectorPart"] = []
@@ -430,6 +510,10 @@ class _Parser:
             # .[...] — bracket immediately after leading dot
             part, i = self._parse_bracket_part()
             parts.append(part)
+        elif allow_field_set and tok.type is TT.LPAREN:
+            # .(a|b|c) — a field set rooted at the current object
+            base = _ast.Selector(parts=(), span=Span(start, dot_tok.span.end))
+            return self._parse_field_set(base, start)
         # else: root selector "." — parts stays empty
 
         # Consume additional selector parts.
@@ -437,6 +521,19 @@ class _Parser:
             tok = self._peek()
 
             if tok.type is TT.DOT:
+                if (
+                    allow_field_set
+                    and self._pos + 1 < len(self._tokens)
+                    and self._tokens[self._pos + 1].type is TT.LPAREN
+                ):
+                    # .base.(a|b|c) — the dot introduces a field set, not a field
+                    self._advance()  # consume the dot
+                    end = parts[-1].span.end if parts else dot_tok.span.end
+                    base = _ast.Selector(
+                        parts=tuple(parts), span=Span(start, end)
+                    )
+                    return self._parse_field_set(base, start)
+
                 self._advance()  # consume the dot
                 field_tok = self._expect(TT.IDENT, "field name after '.'")
                 parts.append(_ast.Field(

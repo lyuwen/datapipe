@@ -14,6 +14,8 @@ LBRACKET    [
 RBRACKET    ]
 EQUALS      =
 ARROW_LEFT  <-
+MOVE_IN     <<
+COMPLEMENT  ^
 COMMA       ,
 STRING      quoted string literal (single or double quotes)
 INTEGER     integer literal (no leading zeros except 0 itself)
@@ -40,6 +42,8 @@ class TT(Enum):
     RBRACKET = auto()
     EQUALS = auto()
     ARROW_LEFT = auto()
+    MOVE_IN = auto()
+    COMPLEMENT = auto()
     COMMA = auto()
     COLON = auto()
     LBRACE = auto()
@@ -87,6 +91,15 @@ def tokenize(expr: str) -> list[Token]:
         if ch == "<" and i + 1 < n and expr[i + 1] == "-":
             tokens.append(Token(TT.ARROW_LEFT, None, Span(i, i + 2)))
             i += 2
+            continue
+        if ch == "<" and i + 1 < n and expr[i + 1] == "<":
+            tokens.append(Token(TT.MOVE_IN, None, Span(i, i + 2)))
+            i += 2
+            continue
+
+        if ch == "^":
+            tokens.append(Token(TT.COMPLEMENT, None, Span(i, i + 1)))
+            i += 1
             continue
 
         # Single-character punctuation

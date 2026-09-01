@@ -455,12 +455,38 @@ def _describe_assignment(op) -> dict:
     }
 
 
+def _describe_move_source(source) -> dict:
+    """Render one ``<<`` source: a plain selector or an expanded field set."""
+    from datapipe.dsl.compiler import CompiledFieldSet
+
+    if isinstance(source, CompiledFieldSet):
+        return {
+            "kind": "field_set",
+            "base": source.base.render(),
+            "names": list(source.names),
+            "complement": source.complement,
+        }
+    return {"kind": "path", "selector": source.render()}
+
+
+def _describe_move_into(op) -> dict:
+    """Render one ``CompiledMoveInto`` (a ``<<`` statement operation)."""
+    return {
+        "kind": "move_into",
+        "operator": "<<",
+        "destination": op.destination.render(),
+        "sources": [_describe_move_source(s) for s in op.sources],
+    }
+
+
 def _describe_operation(op) -> dict:
     """Render a statement's base operation, whichever IR shape it has."""
-    from datapipe.dsl.compiler import CompiledAssignment
+    from datapipe.dsl.compiler import CompiledAssignment, CompiledMoveInto
 
     if isinstance(op, CompiledAssignment):
         return _describe_assignment(op)
+    if isinstance(op, CompiledMoveInto):
+        return _describe_move_into(op)
     return _describe_invocation(op)
 
 
@@ -573,6 +599,15 @@ def _print_call(call: dict, *, indent: str, label: str) -> None:
     print(f"{detail}arguments:   {args_str}")
 
 
+def _render_move_source(src: dict) -> str:
+    """Render one `<<` source from a ``describe_compiled`` document (§13.4)."""
+    if src["kind"] == "path":
+        return src["selector"]
+    kind = "complement" if src["complement"] else "fields"
+    base = "" if src["base"] == "." else f" at {src['base']}"
+    return f"{kind}({', '.join(src['names'])}){base}"
+
+
 def _print_compiled(compiled, expression: str, *, validate: str = "always") -> None:
     """Print a human-readable description of the compiled expression or program."""
     doc = describe_compiled(compiled, expression, validate=validate)
@@ -600,6 +635,10 @@ def _print_compiled(compiled, expression: str, *, validate: str = "always") -> N
                         indent="    ",
                         label=f"transform {t['tool']}({t['selector']})",
                     )
+            elif op["kind"] == "move_into":
+                print(f"    move-into {op['destination']}")
+                for src in op["sources"]:
+                    print(f"      source: {_render_move_source(src)}")
             else:
                 _print_call(
                     op, indent="    ", label=f"{op['tool']}({op['selector']})"
