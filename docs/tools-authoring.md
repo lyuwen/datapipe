@@ -86,6 +86,74 @@ def add_metadata(record: dict, *, source: str = "") -> dict:
     return record
 ```
 
+### Record-level structural tools
+
+A `target="record"` tool that *restructures* the record — moving fields between
+paths rather than transforming one value in place — has some extra
+considerations, because the structural language can already express most of
+what such a tool would do.
+
+**Reach for the symbolic form first.** These are equivalent:
+
+```bash
+datapipe transform '.metadata << .(^instance_id|messages) | tojson' in.jsonl out.jsonl
+datapipe transform \
+  'nest(., key="metadata", exclude=["instance_id","messages"], jsonify=true)' \
+  in.jsonl out.jsonl
+```
+
+The symbolic form needs no installation, is checked at compile time, and
+reports its structure to `inspect-expression`. Write a record-level tool when:
+
+- the field names are **not known when the expression is written** — they come
+  from a config file, a manifest, or a caller's arguments;
+- the restructuring is **conditional on the record's contents**, which the
+  language has no branching for;
+- you are packaging a multi-step shape your team repeats, and want one name and
+  one contract for it.
+
+If you can type the field names literally, the expression is the better answer.
+
+**Contract requirements.** A record-level tool must declare:
+
+```python
+@tool(
+    name="nest_config",
+    api_version=1,
+    target="record",          # called once per record, not per matched value
+    input=JsonType.OBJECT,    # a record is an object
+    output=JsonType.OBJECT,
+    cardinality="one_to_one", # the only executable cardinality
+    deterministic=True,
+)
+def nest_config(record: dict, *, key: str = "metadata") -> dict: ...
+```
+
+- `target="record"` means the selector in the expression **must** be `.`; the
+  compiler rejects `nest_config(.metadata)`.
+- `cardinality` must be `one_to_one`. A returned list is one record whose value
+  is a list, never an implicit flat-map.
+- The record and any argument defaults cross the process boundary, so
+  everything must be pickleable and every default JSON-serializable.
+
+**Be all-or-nothing.** A record-level tool that mutates its argument and then
+raises leaves a half-restructured record behind — and under `--errors skip`
+that record is dropped with no indication of how far it got. Either validate
+every precondition before the first write, or work on a copy and return it only
+once everything has succeeded.
+
+**Worked examples.** The built-in `nest` and `unnest`
+(`datapipe/tools/builtins/structural.py`) are the reference implementations.
+They are worth reading because of how they avoid re-implementing anything: each
+one desugars its arguments into the *same* compiled operations the symbolic
+`<<` form produces, and executes those. Collision rules, source ordering,
+destination auto-creation, and atomicity are inherited rather than restated, so
+the named and symbolic forms cannot drift apart.
+
+If you write a structural tool of your own, that is the pattern to copy —
+build the operation the language already implements rather than hand-rolling
+dictionary surgery that has to keep its own semantics in sync.
+
 ### JSON type vocabulary
 
 ```python

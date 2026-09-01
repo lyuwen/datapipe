@@ -323,6 +323,13 @@ class _Parser:
 
         if self._peek().type is TT.LPAREN:
             self._advance()  # consume (
+            if self._peek().type is TT.DOT:
+                # `a(.x) | b | c(.y)` — §13.3.  A bare call takes its target
+                # from the focus, so an explicit selector here means the
+                # expression mixes focus semantics with explicit record
+                # mutations and there is no single reading of what `|` means.
+                # The plan forbids guessing: fail with the rewrite instead.
+                raise self._ambiguous_pipe_error(name)
             # Keyword arguments only — no selector.  Comma-driven like
             # _parse_invocation so a missing comma is a syntax error.
             if self._peek().type is not TT.RPAREN:
@@ -340,6 +347,31 @@ class _Parser:
             arguments=tuple(arguments),
             span=span,
         )
+
+    def _ambiguous_pipe_error(
+        self, name: "_ast.QualifiedName"
+    ) -> ExpressionSyntaxError:
+        """Build the §13.3 diagnostic for a focus/explicit-target pipe mix.
+
+        The rewrite turns the ``|`` that introduced this call into a ``;``,
+        which is what the user meant if they wanted a second record mutation.
+        """
+        pipe_at = self._expr.rfind("|", 0, name.span.start)
+        rendered = name.name if name.namespace is None else (
+            f"{name.namespace}.{name.name}"
+        )
+        suggestion = (
+            None if pipe_at < 0
+            else f"{self._expr[:pipe_at].rstrip()}; {self._expr[pipe_at + 1:].lstrip()}"
+        )
+        message = (
+            f"ambiguous `|`: {rendered!r} is given an explicit selector but "
+            f"follows a bare tool call, which takes the current focus; `|` "
+            f"cannot mean both. Use `;` to sequence record mutations"
+        )
+        if suggestion is not None:
+            message += f":\n  {suggestion}"
+        return self._error(message, name.span)
 
     def _parse_qualified_name_for_bare(self) -> "_ast.QualifiedName":
         """Like _parse_qualified_name but without requiring LPAREN lookahead for namespace."""

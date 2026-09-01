@@ -32,6 +32,66 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import argparse
 
+#: Version of the transform expression language this build implements.
+#: 1 = invocations and `|`; 2 = statements (`;`), focused pipes, `=`/`<-`,
+#: `<<` with field sets and complements, and the `nest`/`unnest` tools.
+EXPRESSION_LANGUAGE_VERSION = 2
+
+#: Help text for the positional `expression` argument.
+EXPRESSION_HELP = (
+    "structural transform expression: `;`-sequenced statements of tool calls, "
+    "focused `|` pipes, `=` copy, `<-` move, and `<<` move-into"
+)
+
+#: Shown under `--help` for both expression-taking commands.  Every expression
+#: here is executable as written; they are exercised by the docs test.
+EXPRESSION_EPILOG = """\
+Expression language:
+  ;   sequence mutations of one evolving record
+  |   keep transforming the current focused value
+  =   copy a value        <-  move a value
+  <<  move fields into an object      ^  complement a field set
+
+Examples (note the single quotes — see Shell quoting below):
+
+  # Sequence two independent mutations
+  datapipe transform 'tojson(.tools); tojson(.metadata)' in.jsonl out.jsonl
+
+  # Focus a value and pipe it through tools
+  datapipe transform '.metadata | fromjson | tojson' in.jsonl out.jsonl
+
+  # Nest everything except the named fields, then serialize
+  datapipe transform '.metadata << .(^instance_id|messages) | tojson' \\
+      in.jsonl out.jsonl
+
+  # The same thing with the named tool
+  datapipe transform \\
+      'nest(., key="metadata", exclude=["instance_id","messages"], jsonify=true)' \\
+      in.jsonl out.jsonl
+
+  # Decode metadata, lift two fields out of it, re-serialize the rest
+  datapipe transform \\
+      'fromjson(.metadata); . << .metadata.(temperature|score); tojson(.metadata)' \\
+      in.jsonl out.jsonl
+
+Shell quoting:
+  ALWAYS wrap the expression in single quotes in bash, zsh, and other POSIX
+  shells.  Every structural operator is a shell metacharacter: `<<` starts a
+  heredoc, `<-` redirects input, `;` ends the command, `|` pipes it, `(` and
+  `)` open a subshell, `^` is a history substitution in some shells, and
+  `[]` globs.  Unquoted, the shell consumes them before datapipe is started.
+
+      Right:  datapipe transform '.m << .(^id)' in.jsonl out.jsonl
+      Wrong:  datapipe transform .m << .(^id) in.jsonl out.jsonl
+
+  Single quotes pass the text through verbatim; double quotes still expand
+  `$` and backticks, so prefer single.  To embed a literal single quote,
+  close and reopen the run: 'normalize(.body, pad='"'"'-'"'"')'.
+
+Use `datapipe inspect-expression EXPR` to see the statements, focus
+boundaries, and resolved tools before running any data.
+"""
+
 # ---------------------------------------------------------------------------
 # Argument-parser fragment (registered by main.py)
 # ---------------------------------------------------------------------------
@@ -41,21 +101,19 @@ def add_transform_parser(subparsers) -> None:
     """Attach the ``transform`` sub-command to *subparsers*."""
     p = subparsers.add_parser(
         "transform",
-        help="apply a jq-like expression to JSONL records",
+        help="apply a structural transform expression to JSONL records",
         description=(
-            "Compile a jq-like expression and apply it to every record in a\n"
-            "JSONL file.  Outer JSON parsing and serialization happen inside\n"
-            "workers automatically — do not include fromjson(.) or tojson(.)\n"
-            "for the outer row.\n\n"
-            "Examples:\n"
-            "  datapipe transform 'fromjson(.tools)' in.jsonl out.jsonl\n"
-            "  datapipe 'fromjson(.tools) | tojson(.tools[].name)' in.jsonl out.jsonl"
+            "Compile a structural transform expression and apply it to every\n"
+            "record in a JSONL file.  Outer JSON parsing and serialization\n"
+            "happen inside workers automatically — do not include fromjson(.)\n"
+            "or tojson(.) for the outer row."
         ),
+        epilog=EXPRESSION_EPILOG,
         formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
     )
 
     # Positional arguments
-    p.add_argument("expression", help="jq-like transform expression")
+    p.add_argument("expression", help=EXPRESSION_HELP)
     p.add_argument("input", help="input JSONL file or directory")
     p.add_argument("output", help="output JSONL file or directory")
 
@@ -158,16 +216,15 @@ def add_inspect_expression_parser(subparsers) -> None:
         "inspect-expression",
         help="compile a transform expression and show how it resolves",
         description=(
-            "Compile a jq-like expression without opening any data and report\n"
-            "the resolved tools, their providers and contracts, the bound\n"
-            "arguments, and the pipeline stages the expression produces.\n\n"
-            "Examples:\n"
-            "  datapipe inspect-expression 'fromjson(.tools)'\n"
-            "  datapipe inspect-expression --json 'fromjson(.a) | tojson(.a.b)'"
+            "Compile a structural transform expression without opening any\n"
+            "data and report its statements and focus boundaries, the resolved\n"
+            "tools with their providers and contracts, the bound arguments,\n"
+            "and the pipeline stages the expression produces."
         ),
+        epilog=EXPRESSION_EPILOG,
         formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
     )
-    p.add_argument("expression", help="jq-like transform expression")
+    p.add_argument("expression", help=EXPRESSION_HELP)
     p.add_argument(
         "--json", dest="as_json", action="store_true",
         help="emit the compilation result as JSON instead of text",
@@ -560,7 +617,7 @@ def describe_compiled(compiled, expression: str, *, validate: str = "always") ->
         ]
         return {
             "expression": expression,
-            "expression_language": 1,
+            "expression_language": EXPRESSION_LANGUAGE_VERSION,
             "statements": statements,
             "stages": stages,
             "validate": validate,
@@ -568,6 +625,7 @@ def describe_compiled(compiled, expression: str, *, validate: str = "always") ->
 
     return {
         "expression": expression,
+        "expression_language": EXPRESSION_LANGUAGE_VERSION,
         "invocations": [_describe_invocation(inv) for inv in compiled.invocations],
         "stages": stages,
         "validate": validate,
@@ -611,21 +669,22 @@ def _render_move_source(src: dict) -> str:
 def _print_compiled(compiled, expression: str, *, validate: str = "always") -> None:
     """Print a human-readable description of the compiled expression or program."""
     doc = describe_compiled(compiled, expression, validate=validate)
-    print("expression-language: 1")
+    print(f"expression-language: {doc['expression_language']}")
     print(f"Expression: {doc['expression']}")
 
     if "statements" in doc:
         print(f"Statements: {len(doc['statements'])}")
         for stmt in doc["statements"]:
             focus = stmt["focus"]
-            header = f"  statement [{stmt['index']}]"
+            header = f"  Statement {stmt['index']}"
             if focus is not None:
-                header += f"  focus: {focus}"
+                header += f"  (focus: {focus})"
             print(header)
             op = stmt["operation"]
             if op["kind"] == "assignment":
+                verb = "move" if op["move"] else "copy"
                 print(
-                    f"    {op['destination']} {op['operator']} "
+                    f"    {verb} {op['destination']} {op['operator']} "
                     f"{op['source']}"
                 )
                 if op["transform"] is not None:
@@ -637,14 +696,16 @@ def _print_compiled(compiled, expression: str, *, validate: str = "always") -> N
                     )
             elif op["kind"] == "move_into":
                 print(f"    move-into {op['destination']}")
-                for src in op["sources"]:
-                    print(f"      source: {_render_move_source(src)}")
+                rendered = [_render_move_source(s) for s in op["sources"]]
+                print(f"      sources: {', '.join(rendered)}")
             else:
                 _print_call(
-                    op, indent="    ", label=f"{op['tool']}({op['selector']})"
+                    op,
+                    indent="    ",
+                    label=f"call {op['tool']} at {op['selector']}",
                 )
             for pipe in stmt["pipes"]:
-                _print_call(pipe, indent="    ", label=f"| {pipe['tool']}")
+                _print_call(pipe, indent="    ", label=f"pipe: {pipe['tool']}")
     else:
         print(f"Invocations: {len(doc['invocations'])}")
         for inv in doc["invocations"]:

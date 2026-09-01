@@ -669,6 +669,22 @@ Reject moves where:
 - two sources derive the same destination key;
 - wildcard expansion produces duplicate references.
 
+**When these are checked (S6).** A positive field set is fully static, so all
+of the above are compile errors. A complement's membership is only known per
+record, so only two things can be decided statically for it: whether the base
+resolves, and whether the base *is* the destination — `.m << .m.(^a)`, where
+every derived key would land back on the field it came from, is rejected at
+compile time.
+
+Everything else about a complement is checked per record against the actual
+membership, by the same effective-destination rule the static path uses. In
+particular `. << .metadata.(^note)` compiles: a root destination is an ancestor
+of every base, but that is §6.6's intended extraction, and only a *specific*
+member (a `.metadata.metadata`) can genuinely conflict — that member is
+rejected at runtime, leaving the record untouched. S4 rejected the whole form
+on the possibility, which made complements strictly less powerful than positive
+sets for no safety gain; S6 narrowed the check.
+
 ### 8.9 Array sources
 
 Initial `<<` field inference applies only to object fields. Array indexes and
@@ -978,6 +994,13 @@ Statement 1
   call finalize at .
 ```
 
+Implemented in S6. The real output carries the same structure plus an
+`expression-language:` version line, a `(focus: ...)` annotation on statements
+that publish one, and the provider/contract/argument block for each call. The
+JSON path exposes the same tree — `statements[]` with `focus`, `operation`
+(`kind`, `destination`, `sources`) and `pipes` — so both surfaces describe the
+same thing.
+
 ## 14. Implementation phases
 
 ### Phase S0: Freeze semantics and examples
@@ -1238,5 +1261,11 @@ supported for **one minor release** from the introduction of `;` (Phase S1).
 The deprecation warning is emitted at compile time, not at runtime, so it
 appears once when the expression is compiled rather than once per record.
 
-Operationally: Phase S1 emits a deprecation warning; Phase S6 removes the
-support and updates the migration guide.
+Operationally: Phase S1 emits a deprecation warning; Phase S6 updates the
+migration guide and the CLI documentation.
+
+S6 note: the legacy form still compiles — removing it is deferred to the next
+minor release, so the one-release window is measured from that removal rather
+than from S6. What S6 did add is the §13.3 *ambiguity* rejection: an explicit
+selector following a bare focus call (`fromjson(.a) | tojson | tojson(.b)`) is
+no longer a bare parse error but a diagnostic naming the `;` rewrite.

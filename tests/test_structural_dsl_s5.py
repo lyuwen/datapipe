@@ -713,21 +713,19 @@ UNNEST_EQUIVALENCE_CASES = [
         {"key": "m", "include": ["deep"]},
         ". << .m.(deep)",
     ),
-    # A nested *complement* under a root destination is rejected statically by
-    # S4 (`_check_complement_base`: the root is an ancestor of every base), so
-    # the reference form spells out the complement's expansion for this record.
-    # See test_nested_complement_under_a_root_destination_is_statically_rejected.
+    # S6 narrowed the complement base check, so the reference form is now the
+    # complement itself rather than a hand-expanded positive set.
     (
         "exclude-form",
         {"id": "x", "m": {"a": 1, "b": 2, "c": 3}},
         {"key": "m", "exclude": ["b"]},
-        ". << .m.(a|c)",
+        ". << .m.(^b)",
     ),
     (
         "exclude-form-parsed-and-jsonified",
         {"id": "x", "m": '{"a":1,"b":2,"c":3}'},
         {"key": "m", "exclude": ["b"], "parse": True, "jsonify": True},
-        "fromjson(.m); . << .m.(a|c); tojson(.m)",
+        "fromjson(.m); . << .m.(^b); tojson(.m)",
     ),
     (
         "parse-only",
@@ -751,32 +749,33 @@ UNNEST_EQUIVALENCE_CASES = [
         "unicode-and-scalars",
         {"m": {"note": "héllo", "n": 3, "t": True, "nil": None, "keep": 0}},
         {"key": "m", "exclude": ["keep"], "jsonify": True},
-        ". << .m.(note|n|t|nil); tojson(.m)",
+        ". << .m.(^keep); tojson(.m)",
     ),
 ]
 
 
-def test_nested_complement_under_a_root_destination_is_statically_rejected():
-    """Why two equivalence cases spell the complement out as a positive set.
+def test_nested_complement_under_a_root_destination_compiles():
+    """S6 narrowed `_check_complement_base` to base == destination only.
 
-    S4's `_check_complement_base` rejects `. << .m.(^b)` at compile time: the
-    root is an ancestor of every base, and a complement's members are unknown
-    until the record arrives, so the check cannot tell this apart from moving
-    the destination's own subtree into itself.  `unnest(exclude=...)` computes
-    the complement itself and emits a positive set, which stays legal.
+    S4 rejected `. << .m.(^b)` because the root is an ancestor of every base.
+    That was a conservative over-rejection: only a *specific* member can
+    conflict, and `_check_move_entries` rejects exactly that member at runtime.
+    So `unnest(exclude=...)` no longer expands its complement by hand.
     """
-    from datapipe.dsl.errors import ToolConfigurationError
-
     from datapipe.dsl.compiler import compile_program
 
-    with pytest.raises(ToolConfigurationError) as exc:
-        compile_program(". << .m.(^b)")
-    assert "destination is an ancestor" in exc.value.base_message
-
-    # The positive expansion the tool emits instead compiles and runs.
-    assert _run(". << .m.(a|c)", {"m": {"a": 1, "b": 2, "c": 3}}) == {
+    compile_program(". << .m.(^b)")
+    assert _run(". << .m.(^b)", {"m": {"a": 1, "b": 2, "c": 3}}) == {
         "m": {"b": 2}, "a": 1, "c": 3,
     }
+
+    # The base *being* the destination stays a compile error: every derived key
+    # would land back on the field it came from, for every possible record.
+    from datapipe.dsl.errors import ToolConfigurationError
+
+    with pytest.raises(ToolConfigurationError) as exc:
+        compile_program(".m << .m.(^a)")
+    assert "the source is the destination itself" in exc.value.base_message
 
 
 @pytest.mark.parametrize(
@@ -871,14 +870,14 @@ def test_failing_unnest_jsonify_leaves_the_record_unmodified():
     from datapipe.tools.builtins.structural import unnest
 
     record = {"m": {"a": 1, "bad": float("inf")}}
-    before = {"m": {"a": 1}}
+    before = copy.deepcopy(record)
     with pytest.raises(ToolExecutionError):
         unnest(record, key="m", include=["a"], jsonify=True)
+    # The whole call is atomic: `a` was never lifted to the root and `m` still
+    # holds both of its original keys.
+    assert record == before
     assert list(record) == ["m"]
-    assert record["m"]["a"] == 1
     assert record["m"]["bad"] == float("inf")
-    assert set(record["m"]) == {"a", "bad"}
-    assert before  # sanity
 
 
 # ===========================================================================

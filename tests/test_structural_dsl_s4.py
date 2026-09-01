@@ -651,8 +651,7 @@ def test_inspect_expression_text_output_renders_a_move_into(capsys):
     assert inspect_expression_command(_Args()) == 0
     out = capsys.readouterr().out
     assert "move-into .metadata" in out
-    assert "source: .a" in out
-    assert "complement(b, c)" in out
+    assert "sources: .a, complement(b, c)" in out
 
 
 def test_transform_cli_end_to_end(tmp_path):

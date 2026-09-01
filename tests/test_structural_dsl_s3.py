@@ -804,7 +804,7 @@ def test_print_compiled_handles_assignments(capsys):
     # Anchored to the indented statement line: the bare text also appears in
     # the `Expression:` echo and the stage summary, so a substring test alone
     # would pass with the assignment-rendering branch removed entirely.
-    assert "\n    .a = .b\n" in out
+    assert "\n    copy .a = .b\n" in out
 
 
 # ===========================================================================

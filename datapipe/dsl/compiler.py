@@ -1126,22 +1126,34 @@ def _check_complement_base(
     node: "_ast.MoveInto",
     expression: str,
 ) -> None:
-    """Reject a complement whose base sits at or inside the destination (§8.8).
+    """Reject a complement whose base *is* the destination (§8.8).
 
     A complement's members are only known per record, so only the base can be
-    checked statically.  The base being at or under the destination would move
-    the destination's own subtree into itself.  The reverse — the destination
-    inside the base, as in ``.metadata << .(^instance_id)`` — is the intended
-    blanket move, kept safe by the §8.7 self-exclusion at runtime.
+    checked statically.  ``.m << .m.(^a)`` is provably wrong for every record —
+    every derived key lands back on the very field it came from — so it is
+    worth a compile error rather than a per-record one.
+
+    Anything else is left to the runtime, which has the record and therefore
+    the complement's actual membership.  Two directions matter:
+
+    - the destination inside the base, as in ``.metadata << .(^instance_id)`` —
+      the intended blanket move, kept safe by the §8.7 self-exclusion;
+    - the base inside the destination, as in §6.6's ``. << .metadata.(^note)`` —
+      the intended extraction.  Only a *specific* member can conflict here (a
+      ``.metadata.metadata`` whose derived key reproduces the base), and
+      ``_check_move_entries`` rejects exactly that member by the same
+      effective-destination rule ``_check_move_overlap`` applies statically.
+      Rejecting the whole form because one hypothetical member could conflict
+      is what made the positive and complement field sets differ in power.
     """
     if dest_path is None or base_path is None:
         return
-    if base_path[: len(dest_path)] != dest_path:
+    if base_path != dest_path:
         return
     raise ToolConfigurationError(
         f"overlapping source and destination in move-into "
         f"{_render_selector(node.destination)} << {_render_field_set(source)}: "
-        f"the destination is an ancestor of the source",
+        f"the source is the destination itself",
         expression=expression,
         span=node.span,
     )

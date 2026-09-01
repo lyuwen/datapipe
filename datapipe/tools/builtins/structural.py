@@ -13,6 +13,16 @@ positive sets, §8.6 harmless exclusion misses, §8.7 destination
 self-exclusion, §6.4 source ordering, and the ``_detached()`` aliasing rule
 are all inherited, not restated.
 
+Where equivalence by construction stops
+---------------------------------------
+Two degenerate configurations have no symbolic counterpart to be equivalent
+*to*, because the grammar has no empty field set — ``.m << .()`` is a syntax
+error.  ``nest(include=[])`` and ``unnest(include=[])`` therefore fall back to
+the "not supplied" reading (see ``_selection``) and behave as the complement of
+nothing: nest everything, extract everything.  For those two inputs the
+desugared source string this module reports is the program it actually ran,
+but no user could have typed it.
+
 ``nest`` (§6.7)
 ---------------
 ``nest(., key="metadata", exclude=["a","b"], jsonify=true)`` desugars to
@@ -23,6 +33,11 @@ instead; supplying neither nests every other field.
 -----------------
 ``unnest(., key="metadata", include=["x"], parse=true, jsonify=true)``
 desugars to ``fromjson(.metadata); . << .metadata.(x); tojson(.metadata)``.
+``exclude`` produces the complement form ``. << .metadata.(^x)`` directly; it
+used to expand the complement against the live record because S4 rejected a
+complement under a root destination, but S6 narrowed that check to the one
+case it can actually prove (base == destination), so the sugar and the
+symbolic form are now the same program.
 
 Atomicity across a multi-statement desugaring
 ---------------------------------------------
@@ -55,13 +70,11 @@ and so an unsupported policy fails loudly instead of being ignored.
 
 from __future__ import annotations
 
-import functools
 from functools import lru_cache
 from typing import Any
 
 from datapipe.tools.decorator import tool
 from datapipe.tools.contract import ToolExample
-from datapipe.tools.errors import StructuralExecutionError
 from datapipe.tools.types import JsonType
 
 #: The only collision policy `<<` implements (§8.4).
@@ -139,7 +152,7 @@ def nest(
     _check_policy("missing", missing, _MISSING_POLICIES, "nest")
 
     # One statement, so S4's deferred write is already all-or-nothing (§8.1).
-    return _nest_program(key, names, complement, jsonify).process(record, None)
+    return _run(_nest_program(key, names, complement, jsonify), record)
 
 
 @tool(
@@ -220,21 +233,9 @@ def unnest(
     # is a single statement and already atomic, so it skips the copy.
     working = record if not (parse or jsonify) else _detached(record)
     if parse:
-        working = _parse_program(key).process(working, None)
+        working = _run(_parse_program(key), working)
 
-    if complement:
-        # `. << .<key>.(^...)` does not compile: a root destination is an
-        # ancestor of every base, and `_check_complement_base` cannot tell that
-        # apart from moving the destination's subtree into itself, because a
-        # complement's members are unknown until the record arrives.  Naming
-        # the remaining fields turns it into the positive set S4 accepts.
-        # §6.4 ordering does not depend on the order produced here — S4
-        # re-expands a positive set in the source object's own key order — and
-        # §8.6 still holds because an excluded name the source lacks simply
-        # never appears.
-        names = _expand_complement(working, key, names, "unnest")
-
-    return _unnest_program(key, names, jsonify).process(working, None)
+    return _run(_unnest_program(key, names, complement, jsonify), working)
 
 
 # ---------------------------------------------------------------------------
@@ -296,44 +297,6 @@ def _check_policy(
         f"{tool_name}: {value!r} is not a supported {param!r} policy; "
         f"expected {' or '.join(repr(a) for a in allowed)}"
     )
-
-
-def _expand_complement(
-    record: dict, key: str, excluded: "tuple[str, ...]", tool_name: str
-) -> "tuple[str, ...]":
-    """Return the source object's keys minus *excluded*, in source order (§6.4).
-
-    The two precondition failures here duplicate checks the S4 move-into path
-    already performs, because a complement must be expanded against the live
-    record *before* the statement can be built.  They raise the same
-    ``StructuralExecutionError`` S4 would, so a caller sees one error type
-    regardless of which selection form it used.
-    """
-    fail = functools.partial(
-        StructuralExecutionError,
-        record_seq=None,
-        statement_index=0,
-        operation="move-into",
-        selector=".",
-        destination_path=".",
-        policy="error",
-    )
-    if key not in record:
-        raise fail(
-            source_path=f".{key}",
-            reason=f"{tool_name}: record has no field {key!r}",
-        )
-    source = record[key]
-    if not isinstance(source, dict):
-        raise fail(
-            source_path=f".{key}",
-            reason=(
-                f"{tool_name}: .{key} is a {type(source).__name__}, not an "
-                "object; decode it first (parse=true)"
-            ),
-        )
-    skip = set(excluded)
-    return tuple(name for name in source if name not in skip)
 
 
 # ---------------------------------------------------------------------------
@@ -428,13 +391,34 @@ def _bare_pipe(fn: Any, index: int) -> Any:
 
 
 def _stage(statements: tuple, source: str) -> Any:
-    """Wrap compiled statements in the executing stage."""
+    """Wrap compiled statements in the executing stage.
+
+    Built at ``validate="always"``; the effective mode is applied per call by
+    ``_run`` so one cached stage serves every mode.
+    """
     from datapipe.dsl.compiler import CompiledProgram
     from datapipe.stages.tool_program import CompiledProgramStage
 
     return CompiledProgramStage(
         CompiledProgram(statements=statements, source=source), name=source
     )
+
+
+def _run(stage: Any, record: Any) -> Any:
+    """Execute *stage* under the validation mode of the enclosing stage.
+
+    A ``target="record"`` tool is handed only its record, so the outer
+    ``--validate`` mode reaches these desugared inner programs through the
+    ``_ACTIVE_VALIDATE`` ContextVar rather than through the signature.  The
+    stage itself is cached and shared, so the mode is applied to a cheap
+    per-call view of it instead of by rebuilding the stage.
+    """
+    from datapipe.stages.tool_program import active_validate_mode
+
+    mode = active_validate_mode()
+    if mode != stage.validate:
+        stage = stage.with_validate(mode)
+    return stage.process(record, None)
 
 
 # The desugared program depends only on the configuration, never on the record,
@@ -469,16 +453,19 @@ def _parse_program(key: str) -> Any:
 
 
 @lru_cache(maxsize=256)
-def _unnest_program(key: str, names: "tuple[str, ...]", jsonify: bool) -> Any:
+def _unnest_program(
+    key: str, names: "tuple[str, ...]", complement: bool, jsonify: bool
+) -> Any:
     """``. << .<key>.(names)`` followed by an optional ``tojson(.<key>)``."""
     from datapipe.tools.builtins.json import tojson
 
     statements = [
         _move_into_statement(
-            _key_selector(), _key_selector(key), names, False, ()
+            _key_selector(), _key_selector(key), names, complement, ()
         )
     ]
-    source = f". << .{key}.({'|'.join(names)})"
+    caret = "^" if complement else ""
+    source = f". << .{key}.({caret}{'|'.join(names)})"
     if jsonify:
         statements.append(_tool_statement(tojson, _key_selector(key), 1))
         source += f"; tojson(.{key})"

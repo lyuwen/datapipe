@@ -26,6 +26,7 @@ Architecture (§10 of the CLI plan)
 
 from __future__ import annotations
 
+import contextvars
 from copy import deepcopy as _deepcopy
 from typing import Any, Callable
 
@@ -47,6 +48,25 @@ SAMPLE_LIMIT = 100
 
 #: Accepted runtime validation modes (§10.3 of the CLI plan).
 VALIDATE_MODES = ("always", "sample", "off")
+
+#: The validation mode the enclosing stage is running under, published for the
+#: duration of each ``process()`` call.
+#:
+#: A ``target="record"`` tool receives only ``(record, **arguments)`` — the
+#: contract deliberately keeps tool functions ignorant of the runtime.  The
+#: built-in ``nest``/``unnest`` are the one case where that hurts: they desugar
+#: into a nested ``CompiledProgramStage`` of their own, and without this channel
+#: that inner stage would validate on every record even under ``--validate off``.
+#: A ContextVar carries the mode without widening the tool signature, and is
+#: correct under threads because each thread gets its own value.
+_ACTIVE_VALIDATE: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "datapipe_active_validate", default="always"
+)
+
+
+def active_validate_mode() -> str:
+    """Return the validation mode of the innermost running stage."""
+    return _ACTIVE_VALIDATE.get()
 
 
 class CompiledToolProgramStage(Stage):
@@ -141,6 +161,13 @@ class CompiledToolProgramStage(Stage):
 
     def process(self, value: Any, ctx: WorkerContext) -> Any:
         """Execute all invocations in sequence against *value*."""
+        token = _ACTIVE_VALIDATE.set(self._validate)
+        try:
+            return self._process(value, ctx)
+        finally:
+            _ACTIVE_VALIDATE.reset(token)
+
+    def _process(self, value: Any, ctx: WorkerContext) -> Any:
         # Lazy resolution: if setup() was not called (e.g. sequential executor
         # or direct stage usage in tests), resolve on the first process() call.
         if len(self._resolved_fns) < len(self._compiled.invocations):
@@ -414,6 +441,22 @@ class CompiledProgramStage(Stage):
         self.name = name or _short_name(compiled.source)
         self._name_explicit = name is not None
 
+    def with_validate(self, validate: str) -> "CompiledProgramStage":
+        """Return a view of this stage running under *validate*.
+
+        The compiled program and any resolved callables are shared, so this
+        costs one small object and no re-resolution.  Its own sample counter
+        starts at zero, which is the same per-worker semantics a stage
+        constructed directly at that mode would have.
+        """
+        clone = CompiledProgramStage(
+            self._compiled,
+            name=self.name if self._name_explicit else None,
+            validate=validate,
+        )
+        clone._resolved_fns = self._resolved_fns
+        return clone
+
     @property
     def validate(self) -> str:
         return self._validate
@@ -516,6 +559,13 @@ class CompiledProgramStage(Stage):
         writes the (optionally transformed) value, and — for a move — removes
         the source only once the write has succeeded.
         """
+        token = _ACTIVE_VALIDATE.set(self._validate)
+        try:
+            return self._process(value, ctx)
+        finally:
+            _ACTIVE_VALIDATE.reset(token)
+
+    def _process(self, value: Any, ctx: WorkerContext) -> Any:
         from datapipe.dsl.compiler import CompiledAssignment, CompiledMoveInto
 
         if len(self._resolved_fns) < self._expected_fn_count():
