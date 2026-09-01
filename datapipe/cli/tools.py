@@ -219,19 +219,20 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         return 0
 
     # Check built-in tools first so they are always inspectable.
-    _BUILTIN_TOOL_NAMES = {"fromjson", "tojson"}
-    if name in _BUILTIN_TOOL_NAMES:
+    from datapipe.dsl.compiler import _get_builtin_registry
+    _builtins = _get_builtin_registry()
+    if name in _builtins:
         from datapipe.tools.decorator import get_contract
-        from datapipe.tools.builtins.json import fromjson, tojson
-        _builtins = {"fromjson": fromjson, "tojson": tojson}
         fn = _builtins[name]
         contract = get_contract(fn)
         if contract is None:
             print(f"error: built-in {name!r} has no contract", file=sys.stderr)
             return 1
+        from datapipe.stages.tool_program import builtin_provider_id
+        provider_id = builtin_provider_id(fn)
         from datapipe.tools.types import describe
         data_tool: dict = {
-            "provider_id": "builtin:json",
+            "provider_id": provider_id,
             "tool": {
                 "name": contract.name,
                 "target": contract.target,
@@ -251,7 +252,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         else:
             t = data_tool["tool"]
             print(f"tool:          {t['name']}")
-            print(f"provider:      builtin:json")
+            print(f"provider:      {provider_id}")
             print(f"target:        {t['target']}")
             print(f"cardinality:   {t['cardinality']}")
             print(f"deterministic: {t['deterministic']}")

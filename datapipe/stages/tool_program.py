@@ -273,8 +273,18 @@ class CompiledToolProgramStage(Stage):
         return f"CompiledToolProgramStage({self.name!r})"
 
 
-#: Module path of the built-in JSON provider.
-_BUILTIN_JSON_MODULE = "datapipe.tools.builtins.json"
+#: Module paths of the built-in providers, mapped to their provider identity.
+_BUILTIN_MODULES = {
+    "datapipe.tools.builtins.json": "builtin:json",
+    "datapipe.tools.builtins.structural": "builtin:structural",
+}
+
+
+def builtin_provider_id(fn: Callable) -> str:
+    """Return the provider identity string for a built-in or local callable."""
+    module = getattr(fn, "__module__", None) or "<unknown>"
+    builtin = _BUILTIN_MODULES.get(module)
+    return builtin if builtin is not None else f"provider:{module}"
 
 
 def _provider_id(inv: ToolInvocation) -> str:
@@ -282,10 +292,7 @@ def _provider_id(inv: ToolInvocation) -> str:
     if inv.tool_descriptor is not None:
         return inv.tool_descriptor.provider.provider_id
     # Built-in or test-local callable stored directly in builtin_fn.
-    module = getattr(inv.builtin_fn, "__module__", None) or "<unknown>"
-    if module == _BUILTIN_JSON_MODULE:
-        return "builtin:json"
-    return f"provider:{module}"
+    return builtin_provider_id(inv.builtin_fn)
 
 
 def _bare_contract(bare_fn: Callable) -> Any:
@@ -303,10 +310,7 @@ def _bare_provider_id(bare: "CompiledBareCall", bare_fn: Callable) -> str:
     """Return the provider identity string for a focused bare pipe call."""
     if bare.descriptor is not None:
         return bare.descriptor.provider.provider_id
-    module = getattr(bare_fn, "__module__", None) or "<unknown>"
-    if module == _BUILTIN_JSON_MODULE:
-        return "builtin:json"
-    return f"provider:{module}"
+    return builtin_provider_id(bare_fn)
 
 
 def _short_name(expression: str, max_len: int = 40) -> str:

@@ -294,15 +294,18 @@ def _annotation_name(annotation: Any) -> str:
 # ---------------------------------------------------------------------------
 
 # Names that are permanently reserved and cannot be shadowed by providers.
-_BUILTIN_NAMES: frozenset[str] = frozenset({"fromjson", "tojson"})
+_BUILTIN_NAMES: frozenset[str] = frozenset({"fromjson", "tojson", "nest", "unnest"})
 
 
 def _build_builtin_registry() -> dict[str, Callable]:
     """Return the canonical mapping of tool name → function for built-ins."""
     from datapipe.tools.builtins.json import fromjson, tojson
+    from datapipe.tools.builtins.structural import nest, unnest
     return {
         "fromjson": fromjson,
         "tojson": tojson,
+        "nest": nest,
+        "unnest": unnest,
     }
 
 
