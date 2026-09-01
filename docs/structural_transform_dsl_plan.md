@@ -1262,10 +1262,16 @@ The deprecation warning is emitted at compile time, not at runtime, so it
 appears once when the expression is compiled rather than once per record.
 
 Operationally: Phase S1 emits a deprecation warning; Phase S6 updates the
-migration guide and the CLI documentation.
+migration guide and the CLI documentation. Removal lands in the first minor
+release after the one that ships `;`.
 
-S6 note: the legacy form still compiles — removing it is deferred to the next
-minor release, so the one-release window is measured from that removal rather
-than from S6. What S6 did add is the §13.3 *ambiguity* rejection: an explicit
-selector following a bare focus call (`fromjson(.a) | tojson | tojson(.b)`) is
-no longer a bare parse error but a diagnostic naming the `;` rewrite.
+Amended during S6 (decision recorded): the original text said S6 *removes* the
+legacy form. That would have given a zero-length compatibility window, because
+S1 through S6 all land in a single unreleased branch — the window is defined
+above as one minor *release*, which requires `;` to have shipped first. §14's
+S6 deliverable list asks only for "deprecation diagnostics", so removal is
+deferred and the window is measured from the release that introduces `;`.
+
+What S6 did add is the §13.3 *ambiguity* rejection: an explicit selector
+following a bare focus call (`fromjson(.a) | tojson | tojson(.b)`) is no longer
+a bare parse error but a diagnostic naming the `;` rewrite.
