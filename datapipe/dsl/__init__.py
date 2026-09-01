@@ -14,6 +14,11 @@ Phase S1 additions:
     from datapipe.dsl import Program, Statement
     from datapipe.dsl.compiler import CompiledProgram
 
+Phase S2 additions:
+
+    from datapipe.dsl import BareToolCall
+    from datapipe.dsl.compiler import CompiledBareCall, CompiledStatement
+
 """
 
 from datapipe.dsl.errors import (
@@ -25,6 +30,7 @@ from datapipe.dsl.errors import (
 )
 from datapipe.dsl.ast import (
     Argument,
+    BareToolCall,
     Each,
     Expression,
     Field,
@@ -40,8 +46,10 @@ from datapipe.dsl.ast import (
 from datapipe.dsl.parser import parse, parse_program
 from datapipe.dsl.selector import CompiledSelector, Reference
 from datapipe.dsl.compiler import (
+    CompiledBareCall,
     CompiledExpression,
     CompiledProgram,
+    CompiledStatement,
     ToolInvocation,
     compile_expression,
     compile_program,
@@ -56,6 +64,7 @@ __all__ = [
     "ToolResolutionError",
     # AST nodes
     "Argument",
+    "BareToolCall",
     "Each",
     "Expression",
     "Field",
@@ -74,8 +83,10 @@ __all__ = [
     "CompiledSelector",
     "Reference",
     # Compiler
+    "CompiledBareCall",
     "CompiledExpression",
     "CompiledProgram",
+    "CompiledStatement",
     "ToolInvocation",
     "compile_expression",
     "compile_program",

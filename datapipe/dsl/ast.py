@@ -128,6 +128,18 @@ class Invocation:
     span: Span
 
 
+@dataclass(frozen=True)
+class BareToolCall:
+    """A bare tool reference in a focused pipe: just a name, optionally with args.
+
+    Used in ``statement.pipes`` after the base operation establishes a target.
+    The selector is implied by the current focus.
+    """
+    qualified_name: QualifiedName
+    arguments: tuple[Argument, ...]
+    span: Span
+
+
 # ---------------------------------------------------------------------------
 # Top-level expression
 # ---------------------------------------------------------------------------
@@ -142,13 +154,18 @@ class Expression:
 
 @dataclass(frozen=True)
 class Statement:
-    """One record-mutation statement: a base operation with optional focused pipes.
+    """One record-mutation statement.
 
-    For Phase S1 the base operation is always an ``Invocation``;
-    ``pipes`` is always empty until Phase S2.
+    For invocation-first statements (existing form), ``focus_selector`` is None
+    and ``operation`` is an ``Invocation``.
+
+    For selector-first focused statements, ``focus_selector`` is the leading
+    selector, ``operation`` is the first bare tool call, and ``pipes`` has
+    further bare tool calls.
     """
-    operation: Invocation          # use existing Invocation for now
-    pipes: tuple[()]               # empty until S2
+    operation: "Invocation | BareToolCall"
+    pipes: "tuple[BareToolCall, ...]"
+    focus_selector: "Selector | None"   # None for invocation-first statements
     span: Span
 
 

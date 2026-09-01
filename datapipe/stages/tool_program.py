@@ -39,7 +39,7 @@ from datapipe.tools.types import describe, infer_json_type, matches
 # to avoid circular imports at module load time.
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from datapipe.dsl.compiler import CompiledProgram
+    from datapipe.dsl.compiler import CompiledBareCall, CompiledProgram
 #: Number of records each worker validates in ``sample`` mode before it starts
 #: trusting the provider.
 SAMPLE_LIMIT = 100
@@ -287,6 +287,27 @@ def _provider_id(inv: ToolInvocation) -> str:
     return f"provider:{module}"
 
 
+def _bare_contract(bare_fn: Callable) -> Any:
+    """Return the ``ToolContract`` attached to *bare_fn*, or None if absent."""
+    from datapipe.tools.decorator import get_contract
+    return get_contract(bare_fn)
+
+
+def _fn_name(bare_fn: Callable) -> str:
+    """Best-effort display name for a bare call whose contract is unavailable."""
+    return getattr(bare_fn, "__name__", None) or "<unknown>"
+
+
+def _bare_provider_id(bare: "CompiledBareCall", bare_fn: Callable) -> str:
+    """Return the provider identity string for a focused bare pipe call."""
+    if bare.descriptor is not None:
+        return bare.descriptor.provider.provider_id
+    module = getattr(bare_fn, "__module__", None) or "<unknown>"
+    if module == _BUILTIN_JSON_MODULE:
+        return "builtin:json"
+    return f"provider:{module}"
+
+
 def _short_name(expression: str, max_len: int = 40) -> str:
     """Return a display-friendly name derived from the expression string."""
     clean = " ".join(expression.split())
@@ -355,27 +376,59 @@ class CompiledProgramStage(Stage):
         """Resolve provider callables once per worker before any records arrive."""
         self._resolve_all()
 
+    def _expected_fn_count(self) -> int:
+        """Total callables to resolve: one per base operation plus one per bare pipe."""
+        return sum(1 + len(stmt.pipes) for stmt in self._compiled.statements)
+
     def _resolve_all(self) -> None:
-        """Resolve all tool callables into ``_resolved_fns`` if not already done."""
-        if len(self._resolved_fns) == len(self._compiled.statements):
+        """Resolve all tool callables into ``_resolved_fns`` if not already done.
+
+        Both base operations and focused bare pipe calls are resolved, keyed by
+        their ``expression_index`` (unique across the whole program).
+        """
+        if len(self._resolved_fns) == self._expected_fn_count():
             return
         from datapipe.tools.loader import resolve_tool
-        for inv in self._compiled.statements:
-            if inv.expression_index in self._resolved_fns:
-                continue
-            if inv.tool_descriptor is not None:
-                fn = resolve_tool(inv.tool_descriptor.provider, inv.tool_descriptor.tool_name)
-            else:
-                assert inv.builtin_fn is not None, (
-                    f"ToolInvocation {inv.tool_name!r}: both tool_descriptor and "
-                    "builtin_fn are None — exactly one must be set"
-                )
-                fn = inv.builtin_fn
-            self._resolved_fns[inv.expression_index] = fn
+        for stmt in self._compiled.statements:
+            inv = stmt.operation
+            if inv.expression_index not in self._resolved_fns:
+                if inv.tool_descriptor is not None:
+                    fn = resolve_tool(
+                        inv.tool_descriptor.provider, inv.tool_descriptor.tool_name
+                    )
+                else:
+                    assert inv.builtin_fn is not None, (
+                        f"ToolInvocation {inv.tool_name!r}: both tool_descriptor and "
+                        "builtin_fn are None — exactly one must be set"
+                    )
+                    fn = inv.builtin_fn
+                self._resolved_fns[inv.expression_index] = fn
+
+            for bare in stmt.pipes:
+                if bare.expression_index in self._resolved_fns:
+                    continue
+                if bare.descriptor is not None:
+                    bfn = resolve_tool(
+                        bare.descriptor.provider, bare.descriptor.tool_name
+                    )
+                else:
+                    assert bare.callable is not None, (
+                        "CompiledBareCall: both descriptor and callable are None — "
+                        "exactly one must be set"
+                    )
+                    bfn = bare.callable
+                self._resolved_fns[bare.expression_index] = bfn
 
     def process(self, value: Any, ctx: WorkerContext) -> Any:
-        """Execute all statements in sequence against *value*."""
-        if len(self._resolved_fns) < len(self._compiled.statements):
+        """Execute all statements in sequence against *value*.
+
+        Each statement resolves its target selector against the evolving root
+        record, applies the base operation, then feeds the result through any
+        focused bare pipe calls before writing back to the same location.
+        A wildcard selector applies the whole chain elementwise to each match.
+        The value returned is always the root record, never the focused value.
+        """
+        if len(self._resolved_fns) < self._expected_fn_count():
             self._resolve_all()
 
         record = value
@@ -385,7 +438,8 @@ class CompiledProgramStage(Stage):
         if checking:
             self._validated_records += 1
 
-        for inv in self._compiled.statements:
+        for stmt in self._compiled.statements:
+            inv = stmt.operation
             tool_fn = self._resolved_fns[inv.expression_index]
 
             try:
@@ -405,6 +459,7 @@ class CompiledProgramStage(Stage):
                 ) from exc
 
             if not refs:
+                # Zero matches from an empty wildcard — no-op.
                 continue
 
             wildcard = inv.selector.has_wildcard
@@ -453,10 +508,118 @@ class CompiledProgramStage(Stage):
                         match_ordinal=match_ordinal,
                     )
 
+                # Focused pipes: feed the value through each bare call in order,
+                # keeping the same location as the focus.
+                for bare in stmt.pipes:
+                    result = self._run_bare_call(
+                        bare,
+                        result,
+                        record_seq=record_seq,
+                        selector_text=inv.selector.render(),
+                        matched_path=ref.path,
+                        match_ordinal=match_ordinal,
+                        checking=checking,
+                    )
+
                 new_values.append(result)
 
             record = inv.selector.apply(record, refs, new_values)
         return record
+
+    def _run_bare_call(
+        self,
+        bare: "CompiledBareCall",
+        value: Any,
+        *,
+        record_seq: int | None,
+        selector_text: str,
+        matched_path: str | None,
+        match_ordinal: int | None,
+        checking: bool,
+    ) -> Any:
+        """Apply one focused bare pipe call to *value* and return the result."""
+        bare_fn = self._resolved_fns[bare.expression_index]
+        contract = _bare_contract(bare_fn)
+        tool_name = contract.name if contract is not None else _fn_name(bare_fn)
+
+        if checking and contract is not None and not matches(value, contract.input_type):
+            raise self._bare_mismatch(
+                bare,
+                tool_name=tool_name,
+                bare_fn=bare_fn,
+                record_seq=record_seq,
+                stage="input",
+                expected=contract.input_type,
+                value=value,
+                selector_text=selector_text,
+                matched_path=matched_path,
+                match_ordinal=match_ordinal,
+            )
+
+        try:
+            result = bare_fn(value, **bare.bound_args)
+        except ToolExecutionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ToolExecutionError(
+                record_seq=record_seq,
+                invocation_index=bare.expression_index,
+                tool_name=tool_name,
+                provider_id=_bare_provider_id(bare, bare_fn),
+                expression_span=bare.span,
+                selector=selector_text,
+                matched_path=matched_path,
+                match_ordinal=match_ordinal,
+                stage="call",
+                cause=exc,
+            ) from exc
+
+        if checking and contract is not None and not matches(result, contract.output_type):
+            raise self._bare_mismatch(
+                bare,
+                tool_name=tool_name,
+                bare_fn=bare_fn,
+                record_seq=record_seq,
+                stage="output",
+                expected=contract.output_type,
+                value=result,
+                selector_text=selector_text,
+                matched_path=matched_path,
+                match_ordinal=match_ordinal,
+            )
+
+        return result
+
+    def _bare_mismatch(
+        self,
+        bare: "CompiledBareCall",
+        *,
+        tool_name: str,
+        bare_fn: Callable,
+        record_seq: int | None,
+        stage: str,
+        expected: Any,
+        value: Any,
+        selector_text: str,
+        matched_path: str | None,
+        match_ordinal: int | None,
+    ) -> ToolExecutionError:
+        """Build a ``ToolExecutionError`` for a bare pipe call type mismatch."""
+        actual = infer_json_type(value)
+        actual_name = actual.value if actual is not None else type(value).__name__
+        return ToolExecutionError(
+            record_seq=record_seq,
+            invocation_index=bare.expression_index,
+            tool_name=tool_name,
+            provider_id=_bare_provider_id(bare, bare_fn),
+            expression_span=bare.span,
+            selector=selector_text,
+            matched_path=matched_path,
+            match_ordinal=match_ordinal,
+            expected_type=describe(expected),
+            actual_type=actual_name,
+            stage=stage,
+        )
 
     def _should_validate_record(self) -> bool:
         if self._validate == "always":

@@ -577,6 +577,37 @@ class CompiledExpression:
 
 
 # ---------------------------------------------------------------------------
+# Multi-statement program IR (Phase S2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CompiledBareCall:
+    """A resolved bare tool call for use in focused pipe execution."""
+    expression_index: int
+    callable: Callable | None        # None for provider tools
+    descriptor: ToolDescriptor | None  # set for provider tools
+    bound_args: dict[str, Any]
+    span: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class CompiledStatement:
+    """One compiled statement: a base operation plus optional focused pipes."""
+    operation: ToolInvocation          # base operation
+    pipes: tuple[CompiledBareCall, ...]
+    focus_selector: CompiledSelector | None  # None for invocation-first
+    span: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class CompiledProgram:
+    """Compiled representation of a multi-statement program."""
+    statements: tuple[CompiledStatement, ...]
+    source: str
+
+
+# ---------------------------------------------------------------------------
 # Compiler entry point
 # ---------------------------------------------------------------------------
 
@@ -658,58 +689,100 @@ def compile_expression(expression: str) -> CompiledExpression:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class CompiledProgram:
-    """Compiled representation of a multi-statement program.
-
-    Each statement is one ``ToolInvocation`` (Phase S1).
-    """
-    statements: tuple[ToolInvocation, ...]
-    source: str
-
-
 def compile_program(expression: str) -> CompiledProgram:
     """Compile a multi-statement program expression.
 
-    Calls ``parse_program`` then compiles each statement's invocation using
-    the same resolution logic as ``compile_expression``.
+    Calls ``parse_program`` then compiles each statement into a
+    ``CompiledStatement``.  Invocation-first statements have
+    ``focus_selector=None``; selector-first focused statements carry the
+    compiled focus selector and use it as the base operation's selector.
+
+    ``expression_index`` values are unique across every operation and bare
+    call in the whole program so the executing stage can key resolved
+    callables by index.
     """
     program = parse_program(expression)
     registry = _build_full_registry()
-    invocations: list[ToolInvocation] = []
+    statements: list[CompiledStatement] = []
 
-    for i, stmt in enumerate(program.statements):
-        inv_node = stmt.operation
-        tool_fn, tool_desc = _resolve_tool(inv_node.qualified_name, registry, expression)
+    # Monotonic counter shared by base operations and bare pipe calls so every
+    # resolved callable has a distinct key in the stage's _resolved_fns dict.
+    index = 0
+
+    for stmt in program.statements:
+        op_node = stmt.operation
+
+        tool_fn, tool_desc = _resolve_tool(op_node.qualified_name, registry, expression)
         contract = get_contract(tool_fn)
         if contract is None:
             raise ToolResolutionError(
-                f"tool {inv_node.qualified_name.display!r} has no contract; "
+                f"tool {op_node.qualified_name.display!r} has no contract; "
                 "only @tool-decorated functions are supported",
                 expression=expression,
-                span=inv_node.qualified_name.span,
+                span=op_node.qualified_name.span,
             )
 
-        selector = _compile_selector(inv_node.selector, contract, expression)
+        # Invocation-first statements carry their own selector; focused
+        # statements take the leading focus selector as the operation target.
+        if stmt.focus_selector is None:
+            selector_node = op_node.selector
+        else:
+            selector_node = stmt.focus_selector
+
+        selector = _compile_selector(selector_node, contract, expression)
         arguments = _bind_arguments(
-            inv_node.arguments, contract, expression, inv_node.span
+            op_node.arguments, contract, expression, op_node.span
         )
 
-        invocations.append(ToolInvocation(
+        operation = ToolInvocation(
             tool_descriptor=tool_desc,
             builtin_fn=tool_fn if tool_desc is None else None,
             tool_name=contract.name,
             contract=contract,
             selector=selector,
             arguments=arguments,
-            expression_index=i,
-            expression_span=(inv_node.span.start, inv_node.span.end),
+            expression_index=index,
+            expression_span=(op_node.span.start, op_node.span.end),
+        )
+        index += 1
+
+        # Compile each bare pipe call against the same focus.
+        pipes: list[CompiledBareCall] = []
+        for bare_node in stmt.pipes:
+            bare_fn, bare_desc = _resolve_tool(
+                bare_node.qualified_name, registry, expression
+            )
+            bare_contract = get_contract(bare_fn)
+            if bare_contract is None:
+                raise ToolResolutionError(
+                    f"tool {bare_node.qualified_name.display!r} has no contract; "
+                    "only @tool-decorated functions are supported",
+                    expression=expression,
+                    span=bare_node.qualified_name.span,
+                )
+            bare_args = _bind_arguments(
+                bare_node.arguments, bare_contract, expression, bare_node.span
+            )
+            pipes.append(CompiledBareCall(
+                expression_index=index,
+                callable=bare_fn if bare_desc is None else None,
+                descriptor=bare_desc,
+                bound_args=bare_args,
+                span=(bare_node.span.start, bare_node.span.end),
+            ))
+            index += 1
+
+        statements.append(CompiledStatement(
+            operation=operation,
+            pipes=tuple(pipes),
+            focus_selector=selector if stmt.focus_selector is not None else None,
+            span=(stmt.span.start, stmt.span.end),
         ))
 
     # _check_static_compatibility is not called here: statements operate on
     # independent selectors with no output-to-input type flow between them.
     return CompiledProgram(
-        statements=tuple(invocations),
+        statements=tuple(statements),
         source=expression,
     )
 

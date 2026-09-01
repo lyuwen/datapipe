@@ -125,7 +125,14 @@ class _Parser:
         )
 
     def parse_program(self) -> "_ast.Program":
-        """Parse a ``;``-separated sequence of invocations into a ``Program``."""
+        """Parse a ``;``-separated sequence of statements into a ``Program``.
+
+        Each statement can be:
+        - An invocation-first statement: ``name(selector, ...)`` optionally
+          followed by ``| bare_tool | bare_tool ...``
+        - A selector-first focused statement: ``.field | bare_tool | ...``
+          where the selector establishes the focus and each bare tool applies to it.
+        """
         start = self._peek().span.start
         statements: list["_ast.Statement"] = []
 
@@ -145,26 +152,15 @@ class _Parser:
                 if self._peek().type is TT.EOF:
                     break
                 # Parse next statement
-                inv = self._parse_invocation()
-                stmt_span = inv.span
-                statements.append(_ast.Statement(
-                    operation=inv,
-                    pipes=(),
-                    span=stmt_span,
-                ))
+                stmt = self._parse_statement()
+                statements.append(stmt)
                 continue
 
             if tok.type is TT.EOF:
                 break
 
-            # Parse first invocation (or if we ended up here from a PIPE chain)
-            inv = self._parse_invocation()
-            stmt_span = inv.span
-            statements.append(_ast.Statement(
-                operation=inv,
-                pipes=(),
-                span=stmt_span,
-            ))
+            stmt = self._parse_statement()
+            statements.append(stmt)
 
         if not statements:
             tok = self._peek()
@@ -183,6 +179,115 @@ class _Parser:
         return _ast.Program(
             statements=tuple(statements),
             span=Span(start, end),
+        )
+
+    def _parse_statement(self) -> "_ast.Statement":
+        """Parse one statement.
+
+        Selector-first form: ``.field | bare_tool | bare_tool ...``
+        Invocation-first form: ``name(selector, ...) | bare_tool | ...``
+        """
+        tok = self._peek()
+
+        # Selector-first: starts with DOT not immediately followed by IDENT+LPAREN
+        # (which would be the start of an invocation's qualified name, not a selector).
+        # A selector starts with DOT; an invocation starts with IDENT.
+        if tok.type is TT.DOT:
+            # Peek further to confirm this is a standalone selector and not
+            # something else: after the DOT we expect IDENT, LBRACKET, or EOF/PIPE/SEMI
+            # — basically anything that _parse_selector handles.
+            selector = self._parse_selector()
+            # Now we must see PIPE to make it a focused statement.
+            if self._peek().type is not TT.PIPE:
+                raise self._error(
+                    "selector-first statement requires '|' after selector",
+                    self._peek().span,
+                )
+            self._advance()  # consume |
+            # First tool after the selector is the operation (as BareToolCall)
+            op_bare = self._parse_bare_tool_call()
+            pipes: list["_ast.BareToolCall"] = []
+            while self._peek().type is TT.PIPE:
+                self._advance()  # consume |
+                pipes.append(self._parse_bare_tool_call())
+            span = Span(selector.span.start, (pipes[-1] if pipes else op_bare).span.end)
+            return _ast.Statement(
+                operation=op_bare,
+                pipes=tuple(pipes),
+                focus_selector=selector,
+                span=span,
+            )
+
+        # Invocation-first: starts with IDENT
+        inv = self._parse_invocation()
+        pipes_inv: list["_ast.BareToolCall"] = []
+        while self._peek().type is TT.PIPE:
+            self._advance()  # consume |
+            pipes_inv.append(self._parse_bare_tool_call())
+        span = Span(inv.span.start, (pipes_inv[-1] if pipes_inv else inv).span.end)
+        return _ast.Statement(
+            operation=inv,
+            pipes=tuple(pipes_inv),
+            focus_selector=None,
+            span=span,
+        )
+
+    def _parse_bare_tool_call(self) -> "_ast.BareToolCall":
+        """Parse a bare tool reference: ``name`` or ``name(key=val, ...)`` (no selector).
+
+        A bare call must be an IDENT (optionally namespace-qualified) not followed
+        by ``(`` with a selector argument.  If ``(`` is present, only keyword
+        arguments (no positional selector) are allowed.
+        """
+        name = self._parse_qualified_name_for_bare()
+        arguments: list["_ast.Argument"] = []
+
+        if self._peek().type is TT.LPAREN:
+            self._advance()  # consume (
+            # Keyword arguments only — no selector
+            while self._peek().type is not TT.RPAREN:
+                if self._peek().type is TT.EOF:
+                    raise self._error("unterminated bare tool call argument list")
+                arg = self._parse_argument()
+                arguments.append(arg)
+                if self._peek().type is TT.COMMA:
+                    self._advance()
+            close = self._expect(TT.RPAREN, "')'")
+            span = Span(name.span.start, close.span.end)
+        else:
+            span = name.span
+
+        return _ast.BareToolCall(
+            qualified_name=name,
+            arguments=tuple(arguments),
+            span=span,
+        )
+
+    def _parse_qualified_name_for_bare(self) -> "_ast.QualifiedName":
+        """Like _parse_qualified_name but without requiring LPAREN lookahead for namespace."""
+        ident_tok = self._expect(TT.IDENT, "tool name")
+        first = str(ident_tok.value)
+        span_start = ident_tok.span.start
+
+        # Check for optional namespace: identifier "." identifier
+        # For bare calls we check DOT + IDENT ahead (regardless of what follows IDENT).
+        if (
+            self._peek().type is TT.DOT
+            and self._pos + 1 < len(self._tokens)
+            and self._tokens[self._pos + 1].type is TT.IDENT
+        ):
+            self._advance()  # consume .
+            second_tok = self._advance()  # consume identifier
+            return _ast.QualifiedName(
+                namespace=first,
+                name=str(second_tok.value),
+                span=Span(span_start, second_tok.span.end),
+            )
+
+        return _ast.QualifiedName(
+            namespace=None,
+            name=first,
+            span=ident_tok.span,
         )
 
     def _parse_invocation(self) -> "_ast.Invocation":
