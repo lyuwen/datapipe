@@ -39,6 +39,16 @@ from datapipe.dsl import ast as _ast
 from datapipe.dsl.errors import ExpressionSyntaxError, Span
 from datapipe.dsl.lexer import TT, Token, tokenize
 
+#: Maximum nesting depth for array and object literals in an argument value.
+#:
+#: Literals are the parser's only unbounded recursion — every other rule
+#: descends a fixed number of levels.  Without a bound, a deeply nested literal
+#: exhausts the interpreter stack and surfaces as ``RecursionError``, which is
+#: not an ``ExpressionSyntaxError`` and so escapes every caller that handles
+#: malformed expressions.  The limit is far above any realistic configuration
+#: value and well under CPython's default recursion limit.
+_MAX_LITERAL_DEPTH = 64
+
 
 def parse(expression: str) -> "_ast.Expression":
     """Parse *expression* and return an :class:`~datapipe.dsl.ast.Expression`.
@@ -624,7 +634,7 @@ class _Parser:
             span=span,
         )
 
-    def _parse_literal(self) -> "_ast.Literal":
+    def _parse_literal(self, depth: int = 0) -> "_ast.Literal":
         tok = self._peek()
 
         if tok.type is TT.STRING:
@@ -640,10 +650,10 @@ class _Parser:
             return _ast.Literal(value=float(tok.value), span=tok.span)  # type: ignore[arg-type]
 
         if tok.type is TT.LBRACKET:
-            return self._parse_array_literal()
+            return self._parse_array_literal(depth)
 
         if tok.type is TT.LBRACE:
-            return self._parse_object_literal()
+            return self._parse_object_literal(depth)
 
         if tok.type is TT.IDENT:
             raw = str(tok.value)
@@ -668,15 +678,28 @@ class _Parser:
             tok.span,
         )
 
-    def _parse_array_literal(self) -> "_ast.Literal":
+    def _check_literal_depth(self, depth: int, tok: Token) -> None:
+        """Reject a literal nested past ``_MAX_LITERAL_DEPTH``.
+
+        Turns what would be a ``RecursionError`` into an ordinary syntax error,
+        so callers that handle malformed expressions handle this too.
+        """
+        if depth >= _MAX_LITERAL_DEPTH:
+            raise self._error(
+                f"literal nested more than {_MAX_LITERAL_DEPTH} levels deep",
+                tok.span,
+            )
+
+    def _parse_array_literal(self, depth: int = 0) -> "_ast.Literal":
         open_tok = self._advance()  # consume [
+        self._check_literal_depth(depth, open_tok)
         items: list[Any] = []
 
         if self._peek().type is not TT.RBRACKET:
-            items.append(self._parse_literal().value)
+            items.append(self._parse_literal(depth + 1).value)
             while self._peek().type is TT.COMMA:
                 self._advance()
-                items.append(self._parse_literal().value)
+                items.append(self._parse_literal(depth + 1).value)
 
         close = self._expect(TT.RBRACKET, "']'")
         return _ast.Literal(
@@ -684,21 +707,22 @@ class _Parser:
             span=Span(open_tok.span.start, close.span.end),
         )
 
-    def _parse_object_literal(self) -> "_ast.Literal":
+    def _parse_object_literal(self, depth: int = 0) -> "_ast.Literal":
         """Parse an object literal ``{"key": value, ...}`` as a plain dict."""
         open_tok = self._advance()  # consume {
+        self._check_literal_depth(depth, open_tok)
         items: dict[str, Any] = {}
 
         if self._peek().type is not TT.RBRACE:
             key_tok = self._expect(TT.STRING, "string key")
             self._expect(TT.COLON, "':'")
-            val = self._parse_literal()
+            val = self._parse_literal(depth + 1)
             items[str(key_tok.value)] = val.value
             while self._peek().type is TT.COMMA:
                 self._advance()
                 key_tok = self._expect(TT.STRING, "string key")
                 self._expect(TT.COLON, "':'")
-                val = self._parse_literal()
+                val = self._parse_literal(depth + 1)
                 items[str(key_tok.value)] = val.value
 
         close = self._expect(TT.RBRACE, "'}'")
