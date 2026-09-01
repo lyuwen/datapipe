@@ -47,7 +47,8 @@ happen to each record?
 - A single transformation (one or a piped sequence of DSL tool invocations)
 - No custom Python logic needed
 - No per-worker state (no resources to load at setup time)
-- Standard built-in tools (`fromjson`, `tojson`, etc.) cover the need
+- The need is covered by `fromjson` / `tojson` (the only built-in tools) or by
+  a provider the user has already installed via `datapipe tools install`
 
 **Python path** — use when ANY of the following is true:
 - Multiple distinct processing stages

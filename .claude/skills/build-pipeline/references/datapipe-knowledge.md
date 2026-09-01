@@ -329,18 +329,51 @@ class BadStage(Stage):
 ```
 expression  = invocation ( '|' invocation )*
 invocation  = tool_name '(' selector [ ',' arg ( ',' arg )* ] ')'
-selector    = '.'                    # whole record
-            | '.' field              # top-level field
-            | '.' field '.' field    # nested field
 arg         = name '=' json_literal
+```
+
+Selector semantics (strict by default — a missing field or out-of-range index
+is a `SelectorResolutionError`, not a silent skip):
+
+| Selector | Meaning |
+|----------|---------|
+| `.` | Root — one match, the whole record |
+| `.field` | Dict key lookup |
+| `["key.with.dots"]` | Dict key lookup via quoted string |
+| `[0]` | List index lookup (negative indices are errors) |
+| `[]` | Every element of a list (wildcard); empty list → zero matches, still success |
+
+Applying `[]` to a non-list raises `SelectorResolutionError`.
+
+### Available built-in tools
+
+**Only two tools ship built-in** — `fromjson` and `tojson`. Anything else
+requires a custom provider installed via `datapipe tools install`. If the
+user's transformation needs logic beyond JSON encode/decode and they have no
+installed provider, the shell path is not viable — use the Python path
+instead.
+
+```python
+fromjson(value, *, recursive=False, containers_only=True)
+    # input:  string | array | object     output: any
+    # Decode a JSON-encoded string. recursive=True traverses arrays and
+    # objects decoding nested JSON-encoded strings.
+
+tojson(value, *, ensure_ascii=False, compact=True, sort_keys=False)
+    # input:  any                          output: string
+    # Serialize to a JSON string. An already-string value is re-serialized
+    # as a JSON string literal.
 ```
 
 Example expressions:
 ```
 fromjson(.tools)
 fromjson(.tools) | tojson(.tools[].name)
-uppercase(.title, locale="en")
+fromjson(.payload, recursive=true)
+tojson(.metadata, sort_keys=true)
 ```
+
+Note that DSL literals use JSON spelling — `true`/`false`, not `True`/`False`.
 
 The compiler resolves tool names against the registry, validates
 selector/target scope, binds arguments, and fills defaults. The resulting
