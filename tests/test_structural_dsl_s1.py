@@ -220,13 +220,26 @@ def test_semicolon_in_string_literal_not_detected():
     assert not any(tok.type is TT.SEMICOLON for tok in tokens)
 
 
-def test_has_semicolons_false_for_string_with_semicolon():
-    """_has_semicolons returns False when the only semicolon is inside a string."""
-    from datapipe.cli.transform import _has_semicolons
-    assert _has_semicolons('fromjson(.a, key="x;y")') is False
+def test_routing_ignores_semicolon_inside_string_literal():
+    """A quoted semicolon leaves the expression on the single-statement path.
+
+    Routing is decided by ``parse_program`` plus ``_needs_program_path`` rather
+    than by scanning for semicolon characters, so a semicolon inside a string
+    literal must not promote the expression to the multi-statement path.
+    """
+    from datapipe.cli.transform import _needs_program_path
+    from datapipe.dsl.parser import parse_program
+
+    program = parse_program('fromjson(.a, key="x;y")')
+    assert len(program.statements) == 1
+    assert _needs_program_path(program) is False
 
 
-def test_has_semicolons_true_for_real_separator():
-    """_has_semicolons returns True when a top-level semicolon is present."""
-    from datapipe.cli.transform import _has_semicolons
-    assert _has_semicolons("fromjson(.a); fromjson(.b)") is True
+def test_routing_detects_real_statement_separator():
+    """A top-level semicolon routes to the multi-statement program path."""
+    from datapipe.cli.transform import _needs_program_path
+    from datapipe.dsl.parser import parse_program
+
+    program = parse_program("fromjson(.a); fromjson(.b)")
+    assert len(program.statements) == 2
+    assert _needs_program_path(program) is True

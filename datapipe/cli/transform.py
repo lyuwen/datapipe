@@ -5,9 +5,10 @@ Implements the user-facing transform command from §3.1 of the CLI plan:
     datapipe transform [OPTIONS] EXPRESSION INPUT OUTPUT
     datapipe [OPTIONS] EXPRESSION INPUT OUTPUT          # shorthand
 
-The expression is compiled to a ``CompiledToolProgramStage``, wrapped in a
-``Pipeline``, and executed via the same ``Pipeline.run()`` path as
-``datapipe run``.  No separate executor or IO adapters are added — the
+The expression is compiled to a ``CompiledToolProgramStage`` (legacy
+single-expression form) or a ``CompiledProgramStage`` (multi-statement
+programs and focused pipes), wrapped in a ``Pipeline``, and executed via the
+same ``Pipeline.run()`` path as ``datapipe run``.  No separate executor or IO adapters are added — the
 transform command is purely a frontend over the existing runtime.
 
 Implicit outer JSON load/dump (§6.3 of the CLI plan):
@@ -30,18 +31,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import argparse
-
-from datapipe.dsl.lexer import TT, tokenize as _tokenize
-
-
-def _has_semicolons(expression: str) -> bool:
-    """Return True if the expression contains a top-level SEMICOLON token."""
-    try:
-        tokens = _tokenize(expression)
-    except Exception:
-        return False
-    return any(tok.type is TT.SEMICOLON for tok in tokens)
-
 
 # ---------------------------------------------------------------------------
 # Argument-parser fragment (registered by main.py)
@@ -205,20 +194,68 @@ def inspect_expression_command(args: "argparse.Namespace") -> int:
 # ---------------------------------------------------------------------------
 
 
+def _needs_program_path(program) -> bool:
+    """Return True when *program* uses syntax only ``compile_program`` supports.
+
+    A single invocation-first statement with no bare pipes — ``fromjson(.a)`` —
+    has identical semantics under either compiler, so it keeps the legacy
+    ``CompiledExpression`` shape.  That holds the single-invocation
+    ``--dry-run`` / ``inspect-expression`` output stable.  Multi-statement
+    programs, selector-first focused statements, and bare pipes all require
+    the program compiler.
+
+    The positive cases would also reach ``compile_program`` via the legacy
+    fallback in ``_compile_or_report`` (they fail the legacy parse), so this
+    predicate is strictly load-bearing only for its negative case.  It stays
+    explicit regardless: routing the canonical language on a *parse failure*
+    of the deprecated grammar would be an accident waiting to break.
+    """
+    if len(program.statements) > 1:
+        return True
+    return any(
+        stmt.focus_selector is not None or stmt.pipes
+        for stmt in program.statements
+    )
+
+
 def _compile_or_report(expression: str):
-    """Compile *expression*, printing a diagnostic and returning None on error."""
+    """Compile *expression*, printing a diagnostic and returning None on error.
+
+    Routing tries ``parse_program`` first because the multi-statement form is
+    the canonical language.  The legacy ``compile_expression`` path is the
+    fallback: it is the only one that accepts ``invocation | invocation``
+    (which it also deprecates).  When *neither* form parses, the
+    ``parse_program`` diagnostic is the one reported.
+    """
+    from datapipe.dsl.compiler import compile_expression, compile_program
     from datapipe.dsl.errors import (
         ExpressionSyntaxError,
         ToolConfigurationError,
         ToolResolutionError,
     )
+    from datapipe.dsl.parser import parse_program
+
+    program_ast = None
+    program_error = None
     try:
-        if _has_semicolons(expression):
-            from datapipe.dsl.compiler import compile_program
+        program_ast = parse_program(expression)
+    except ExpressionSyntaxError as exc:
+        program_error = exc
+
+    try:
+        if program_ast is not None and _needs_program_path(program_ast):
             return compile_program(expression)
-        else:
-            from datapipe.dsl.compiler import compile_expression
+
+        # Either the program parse failed (legacy `a | b` form) or the program
+        # is a single plain invocation whose legacy output shape we preserve.
+        try:
             return compile_expression(expression)
+        except ExpressionSyntaxError:
+            if program_ast is not None:
+                # parse_program accepted it; only the legacy grammar objects.
+                return compile_program(expression)
+            # Neither grammar parses — report the canonical diagnostic.
+            raise program_error
     except (ExpressionSyntaxError, ToolResolutionError, ToolConfigurationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return None
@@ -361,84 +398,183 @@ def _literal(value) -> str:
     return json.dumps(value)
 
 
+def _describe_provider(descriptor) -> dict:
+    """Render the provider identity block for a tool descriptor (None = built-in)."""
+    if descriptor is None:
+        return {"provider_id": "builtin", "alias": None, "mode": "builtin"}
+    pd = descriptor.provider
+    return {
+        "provider_id": pd.provider_id,
+        "alias": pd.alias,
+        "mode": pd.mode,
+        "source_path": pd.source_path,
+        "sha256": pd.sha256,
+        "api_version": pd.api_version,
+    }
+
+
+def _describe_contract(contract) -> dict | None:
+    """Render a ``ToolContract`` as a JSON-serializable dict (None passes through)."""
+    if contract is None:
+        return None
+    from datapipe.tools.types import describe as describe_type
+
+    return {
+        "target": contract.target,
+        "input": describe_type(contract.input_type),
+        "output": describe_type(contract.output_type),
+        "cardinality": contract.cardinality.value,
+        "deterministic": contract.deterministic,
+    }
+
+
+def _describe_invocation(inv) -> dict:
+    """Render one ``ToolInvocation`` (base operation or legacy pipe element)."""
+    return {
+        "index": inv.expression_index,
+        "tool": inv.tool_name,
+        "selector": inv.selector.render(),
+        "provider": _describe_provider(inv.tool_descriptor),
+        "contract": _describe_contract(inv.contract),
+        "arguments": dict(inv.arguments),
+    }
+
+
+def _describe_bare_call(bare) -> dict:
+    """Render one ``CompiledBareCall`` from a focused pipe.
+
+    A ``CompiledBareCall`` carries no ``selector`` (its target is the enclosing
+    statement's focus) and no contract — provider bare calls hold only a
+    descriptor, so the contract is recovered best-effort by resolving the tool.
+    Resolution failure degrades to a null contract rather than crashing a
+    ``--dry-run``.
+    """
+    from datapipe.tools.decorator import get_contract
+
+    fn = bare.callable
+    if fn is None and bare.descriptor is not None:
+        try:
+            from datapipe.tools.loader import resolve_tool
+            fn = resolve_tool(bare.descriptor.provider, bare.descriptor.tool_name)
+        except Exception:  # noqa: BLE001 - inspection must not fail the command
+            fn = None
+
+    contract = get_contract(fn) if fn is not None else None
+    if contract is not None:
+        tool_name = contract.name
+    elif bare.descriptor is not None:
+        tool_name = bare.descriptor.tool_name
+    else:
+        tool_name = getattr(fn, "__name__", None) or "<unknown>"
+
+    return {
+        "index": bare.expression_index,
+        "tool": tool_name,
+        "provider": _describe_provider(bare.descriptor),
+        "contract": _describe_contract(contract),
+        "arguments": dict(bare.bound_args),
+    }
+
+
 def describe_compiled(compiled, expression: str, *, validate: str = "always") -> dict:
-    """Build a JSON-serializable description of a compiled expression.
+    """Build a JSON-serializable description of a compiled expression or program.
 
     Shared by ``transform --dry-run`` and ``inspect-expression`` so both
     surfaces report identical resolution results (§3.3 of the CLI plan).
-    """
-    from datapipe.tools.types import describe as describe_type
 
-    invocations = []
-    for inv in compiled.invocations:
-        contract = inv.contract
-        descriptor = inv.tool_descriptor
-        if descriptor is None:
-            provider = {"provider_id": "builtin", "alias": None, "mode": "builtin"}
-        else:
-            pd = descriptor.provider
-            provider = {
-                "provider_id": pd.provider_id,
-                "alias": pd.alias,
-                "mode": pd.mode,
-                "source_path": pd.source_path,
-                "sha256": pd.sha256,
-                "api_version": pd.api_version,
-            }
-        invocations.append({
-            "index": inv.expression_index,
-            "tool": inv.tool_name,
-            "selector": inv.selector.render(),
-            "provider": provider,
-            "contract": {
-                "target": contract.target,
-                "input": describe_type(contract.input_type),
-                "output": describe_type(contract.output_type),
-                "cardinality": contract.cardinality.value,
-                "deterministic": contract.deterministic,
-            },
-            "arguments": dict(inv.arguments),
-        })
+    ``CompiledExpression`` yields the legacy ``invocations`` shape.
+    ``CompiledProgram`` yields a ``statements`` list instead, since it has no
+    ``invocations`` attribute: each entry reports its index, focus selector,
+    base operation and pipes.
+    """
+    from datapipe.dsl.compiler import CompiledProgram
 
     stages = [
         {"index": i, "name": stage.name, "type": type(stage).__name__}
         for i, stage in enumerate(_build_pipeline(compiled, validate=validate))
     ]
 
+    if isinstance(compiled, CompiledProgram):
+        statements = [
+            {
+                "index": i,
+                "focus": (
+                    None if stmt.focus_selector is None
+                    else stmt.focus_selector.render()
+                ),
+                "operation": _describe_invocation(stmt.operation),
+                "pipes": [_describe_bare_call(b) for b in stmt.pipes],
+            }
+            for i, stmt in enumerate(compiled.statements)
+        ]
+        return {
+            "expression": expression,
+            "expression_language": 1,
+            "statements": statements,
+            "stages": stages,
+            "validate": validate,
+        }
+
     return {
         "expression": expression,
-        "invocations": invocations,
+        "invocations": [_describe_invocation(inv) for inv in compiled.invocations],
         "stages": stages,
         "validate": validate,
     }
 
 
+def _print_call(call: dict, *, indent: str, label: str) -> None:
+    """Print one operation or pipe entry from a ``describe_compiled`` document."""
+    args = call["arguments"]
+    args_str = (
+        ", ".join(f"{k}={_literal(v)}" for k, v in args.items())
+        if args
+        else "(none)"
+    )
+    provider = call["provider"]
+    contract = call["contract"]
+    print(f"{indent}[{call['index']}] {label}")
+    provider_str = provider["provider_id"]
+    alias = provider["alias"]
+    if alias:
+        provider_str += f" (alias {alias}, {provider['mode']})"
+    detail = indent + "      "
+    print(f"{detail}provider:    {provider_str}")
+    if contract is not None:
+        print(f"{detail}target:      {contract['target']}")
+        print(f"{detail}input:       {contract['input']}")
+        print(f"{detail}output:      {contract['output']}")
+        print(f"{detail}cardinality: {contract['cardinality']}")
+    print(f"{detail}arguments:   {args_str}")
+
+
 def _print_compiled(compiled, expression: str, *, validate: str = "always") -> None:
-    """Print a human-readable description of the compiled expression."""
+    """Print a human-readable description of the compiled expression or program."""
     doc = describe_compiled(compiled, expression, validate=validate)
-    print("expression-language: 1  (structural extensions: planned, not yet active)")
+    print("expression-language: 1")
     print(f"Expression: {doc['expression']}")
-    print(f"Invocations: {len(doc['invocations'])}")
-    for inv in doc["invocations"]:
-        args = inv["arguments"]
-        args_str = (
-            ", ".join(f"{k}={_literal(v)}" for k, v in args.items())
-            if args
-            else "(none)"
-        )
-        provider = inv["provider"]
-        contract = inv["contract"]
-        print(f"  [{inv['index']}] {inv['tool']}({inv['selector']})")
-        alias = provider["alias"]
-        provider_str = provider["provider_id"]
-        if alias:
-            provider_str += f" (alias {alias}, {provider['mode']})"
-        print(f"        provider:    {provider_str}")
-        print(f"        target:      {contract['target']}")
-        print(f"        input:       {contract['input']}")
-        print(f"        output:      {contract['output']}")
-        print(f"        cardinality: {contract['cardinality']}")
-        print(f"        arguments:   {args_str}")
+
+    if "statements" in doc:
+        print(f"Statements: {len(doc['statements'])}")
+        for stmt in doc["statements"]:
+            focus = stmt["focus"]
+            header = f"  statement [{stmt['index']}]"
+            if focus is not None:
+                header += f"  focus: {focus}"
+            print(header)
+            op = stmt["operation"]
+            _print_call(
+                op, indent="    ", label=f"{op['tool']}({op['selector']})"
+            )
+            for pipe in stmt["pipes"]:
+                _print_call(pipe, indent="    ", label=f"| {pipe['tool']}")
+    else:
+        print(f"Invocations: {len(doc['invocations'])}")
+        for inv in doc["invocations"]:
+            _print_call(
+                inv, indent="  ", label=f"{inv['tool']}({inv['selector']})"
+            )
+
     print("Stages:")
     for stage in doc["stages"]:
         print(f"  [{stage['index']}] {stage['name']}  ({stage['type']})")
