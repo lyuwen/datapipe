@@ -825,3 +825,111 @@ def test_s1_multi_statement_still_works():
 def test_s2_selector_without_pipe_or_assignment_still_errors():
     with pytest.raises(ExpressionSyntaxError):
         parse_program(".metadata")
+
+
+# ===========================================================================
+# Impure tools must never see the live record (Finding 1)
+# ===========================================================================
+
+MUTATING_PROVIDER_SRC = """\
+from datapipe.tools import tool, JsonType
+
+
+@tool(
+    name="popx",
+    target="value",
+    input=JsonType.OBJECT,
+    output=JsonType.OBJECT,
+    description="Remove key 'x' from the value, in place, and return it.",
+)
+def popx(value):
+    value.pop("x", None)
+    return value
+
+
+@tool(
+    name="popx_boom",
+    target="value",
+    input=JsonType.OBJECT,
+    output=JsonType.OBJECT,
+    description="Mutate the value in place and then fail.",
+)
+def popx_boom(value):
+    value.pop("x", None)
+    raise ValueError("popx_boom always fails")
+"""
+
+
+@pytest.fixture()
+def mutating_tools(tmp_path):
+    """Install `popx` (mutates in place) and `popx_boom` (mutates, then raises)."""
+    from datapipe.tools.installer import install_provider
+
+    src = tmp_path / "s3_mutating.py"
+    src.write_text(MUTATING_PROVIDER_SRC)
+    install_provider(src, yes=True)
+
+
+# A tool is not required to be pure.  §6.1 guarantees `=` leaves the source
+# present and unchanged, so the value handed to the tool must be detached.
+def test_mutating_transform_does_not_corrupt_the_copy_source(mutating_tools):
+    stage = _stage(".a = popx(.b)")
+    out = stage.process({"b": {"x": 1, "y": 2}}, None)
+    assert out == {"b": {"x": 1, "y": 2}, "a": {"y": 2}}
+
+
+def test_mutating_bare_pipe_call_does_not_corrupt_the_copy_source(mutating_tools):
+    """The trailing bare calls of a pipe chain are fed the same value."""
+    stage = _stage(".a = .b | popx")
+    out = stage.process({"b": {"x": 1, "y": 2}}, None)
+    assert out == {"b": {"x": 1, "y": 2}, "a": {"y": 2}}
+
+
+# Mutate-then-raise is the atomicity case: §8.1 says a failed statement leaves
+# the record byte-for-byte as it arrived, so the whole record is compared.
+def test_failing_mutating_transform_leaves_the_copy_record_untouched(mutating_tools):
+    import copy as _copy
+
+    stage = _stage(".a = popx_boom(.b)")
+    record = {"b": {"x": 1, "y": 2}, "other": [{"x": 9}]}
+    expected = _copy.deepcopy(record)
+    with pytest.raises(ToolExecutionError) as exc:
+        stage.process(record, None)
+    assert isinstance(exc.value.cause, ValueError)
+    assert record == expected
+
+
+def test_failing_mutating_transform_leaves_the_move_record_untouched(mutating_tools):
+    import copy as _copy
+
+    stage = _stage(".a <- popx_boom(.b)")
+    record = {"b": {"x": 1, "y": 2}, "other": [{"x": 9}]}
+    expected = _copy.deepcopy(record)
+    with pytest.raises(ToolExecutionError) as exc:
+        stage.process(record, None)
+    assert isinstance(exc.value.cause, ValueError)
+    assert record == expected
+
+
+def test_failing_mutating_bare_call_leaves_the_copy_record_untouched(mutating_tools):
+    import copy as _copy
+
+    stage = _stage(".a = .b | popx_boom")
+    record = {"b": {"x": 1, "y": 2}, "other": [{"x": 9}]}
+    expected = _copy.deepcopy(record)
+    with pytest.raises(ToolExecutionError) as exc:
+        stage.process(record, None)
+    assert isinstance(exc.value.cause, ValueError)
+    assert record == expected
+
+
+def test_failing_mutating_bare_call_leaves_the_move_record_untouched(mutating_tools):
+    import copy as _copy
+
+    stage = _stage(".a <- .b | popx_boom")
+    record = {"b": {"x": 1, "y": 2}, "other": [{"x": 9}]}
+    expected = _copy.deepcopy(record)
+    with pytest.raises(ToolExecutionError) as exc:
+        stage.process(record, None)
+    assert isinstance(exc.value.cause, ValueError)
+    assert record == expected

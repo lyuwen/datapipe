@@ -839,7 +839,17 @@ class CompiledProgramStage(Stage):
             )
 
         # -- 5. compute the transformed value ------------------------------
-        new_value = src_ref.value
+        # Tools are not required to be pure, so anything handed to a transform
+        # or a trailing pipe must already be detached from the record: a tool
+        # that mutates its argument in place would otherwise corrupt the live
+        # source (§6.1 says `=` leaves it unchanged), and one that mutates and
+        # *then* raises would defeat the resolve-before-mutate atomicity rule
+        # for both `=` and `<-`.  This replaces the output-side detach below
+        # rather than adding to it, so a statement still costs one deep copy.
+        chain_input = src_ref.value
+        if op.transform is not None or stmt.pipes:
+            chain_input = _detached(src_ref.value)
+        new_value = chain_input
         if op.transform is not None:
             new_value = self._run_transform(
                 op.transform,
@@ -864,7 +874,10 @@ class CompiledProgramStage(Stage):
         # is present, because a transform normally yields a fresh value.  One
         # that returned its own argument puts us back in exactly the rejected
         # case, so re-run the check now that the value is known.
-        if op.transform is not None and new_value is src_ref.value:
+        # The sentinel is the object actually handed to the chain: with a
+        # detached input, an identity transform returns *that copy*, so
+        # comparing against ``src_ref.value`` would never fire.
+        if op.transform is not None and new_value is chain_input:
             detail = overlap_reason(
                 dest_parts,
                 src_ref.path_parts,
@@ -886,7 +899,14 @@ class CompiledProgramStage(Stage):
         # Containers are deep-copied so the destination cannot be mutated
         # through the source (or vice versa) by a later statement; §6.1 says
         # `=` copies.  Scalars are immutable and skip the per-record cost.
-        written = _detached(new_value)
+        # When step 5 already detached the chain input, the value in hand is
+        # derived from that copy and shares nothing with the record, so a
+        # second copy here would be pure cost.
+        written = (
+            new_value
+            if chain_input is not src_ref.value
+            else _detached(new_value)
+        )
         if dest_parent_container is not None:
             dest_parent_container[dest_key] = written
         else:

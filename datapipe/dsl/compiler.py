@@ -803,6 +803,29 @@ def compile_program(expression: str) -> CompiledProgram:
                 stmt, op_node, registry, expression, index
             )
 
+        # The location a trailing pipe operates on.  A tool operation feeds
+        # the value at its own selector (invocation-first statements have
+        # focus=None but still target that selector); `=` / `<-` / `<<` feed
+        # the value written to their destination.
+        if isinstance(operation, (CompiledAssignment, CompiledMoveInto)):
+            pipe_focus = operation.destination
+        else:
+            pipe_focus = operation.selector
+
+        # The declared output feeding the first bare call, when one is known.
+        # Structural operations (`<<`, and `=` / `<-` without a transform)
+        # produce no declared type, which leaves the chain unprovable.
+        if isinstance(operation, CompiledAssignment):
+            chain_out = (
+                (operation.transform.tool_name, operation.transform.contract.output_type)
+                if operation.transform is not None
+                else None
+            )
+        elif isinstance(operation, CompiledMoveInto):
+            chain_out = None
+        else:
+            chain_out = (operation.tool_name, operation.contract.output_type)
+
         # Compile each bare pipe call against the same focus.
         pipes: list[CompiledBareCall] = []
         for bare_node in stmt.pipes:
@@ -817,6 +840,30 @@ def compile_program(expression: str) -> CompiledProgram:
                     expression=expression,
                     span=bare_node.qualified_name.span,
                 )
+            # A record-target tool rewrites the whole row, so it is only
+            # meaningful when the focus it is piped into is the root.  The
+            # first operation is checked by _compile_selector; trailing bare
+            # calls carry no selector of their own and are checked here.
+            if bare_contract.target == "record" and not pipe_focus.is_root:
+                _reject_non_root_record_target(
+                    bare_contract, expression, bare_node.span
+                )
+
+            # Within one statement the base operation and its bare calls are
+            # connected by value flow (`new_value = bare(new_value)`), so the
+            # conservative disjointness check applies along the chain.
+            if chain_out is not None:
+                _reject_disjoint_types(
+                    producer_name=chain_out[0],
+                    out_spec=chain_out[1],
+                    consumer_name=bare_contract.name,
+                    in_spec=bare_contract.input_type,
+                    path_label=pipe_focus.render(),
+                    expression=expression,
+                    span=bare_node.span,
+                )
+            chain_out = (bare_contract.name, bare_contract.output_type)
+
             bare_args = _bind_arguments(
                 bare_node.arguments, bare_contract, expression, bare_node.span
             )
@@ -836,8 +883,10 @@ def compile_program(expression: str) -> CompiledProgram:
             span=(stmt.span.start, stmt.span.end),
         ))
 
-    # _check_static_compatibility is not called here: statements operate on
-    # independent selectors with no output-to-input type flow between them.
+    # No cross-statement compatibility pass: separate statements operate on
+    # independent selectors with no output-to-input value flow between them,
+    # so nothing there is statically provable.  Within a statement the flow is
+    # explicit, and that chain is checked above as each bare call is compiled.
     return CompiledProgram(
         statements=tuple(statements),
         source=expression,
@@ -1367,10 +1416,6 @@ def _check_static_compatibility(
     consumer's declared input.  Wildcards, differing paths, and anything
     involving ``ANY`` are left to runtime validation.
     """
-    from datapipe.tools.types import JsonType, as_type_spec
-
-    any_spec = as_type_spec(JsonType.ANY)
-
     for producer, consumer in zip(invocations, invocations[1:]):
         if producer.selector.has_wildcard or consumer.selector.has_wildcard:
             continue
@@ -1381,32 +1426,62 @@ def _check_static_compatibility(
         if producer.contract.target != consumer.contract.target:
             continue
 
-        out_spec = producer.contract.output_type
-        in_spec = consumer.contract.input_type
-        if out_spec == any_spec or in_spec == any_spec:
-            continue
-
-        if any(
-            _matches(v, out_spec) and _matches(v, in_spec) for v in _PROBES
-        ):
-            continue
-        # No probe matched the producer's output at all: we cannot prove the
-        # output is inhabited, so we cannot prove a contradiction either.
-        if not any(_matches(v, out_spec) for v in _PROBES):
-            continue
-
-        from datapipe.tools.types import describe as _describe
-        raise ToolConfigurationError(
-            f"tool {producer.tool_name!r} outputs "
-            f"{_describe(out_spec)} at {producer.selector.render()}, but "
-            f"{consumer.tool_name!r} accepts only {_describe(in_spec)} there; "
-            "no value can satisfy both",
+        _reject_disjoint_types(
+            producer_name=producer.tool_name,
+            out_spec=producer.contract.output_type,
+            consumer_name=consumer.tool_name,
+            in_spec=consumer.contract.input_type,
+            path_label=producer.selector.render(),
             expression=expression,
             span=Span(
                 consumer.expression_span[0],
                 consumer.expression_span[1],
             ) if consumer.expression_span else None,
         )
+
+
+def _reject_disjoint_types(
+    *,
+    producer_name: str,
+    out_spec: Any,
+    consumer_name: str,
+    in_spec: Any,
+    path_label: str,
+    expression: str,
+    span: "Span | None",
+) -> None:
+    """Raise when no JSON value can satisfy both *out_spec* and *in_spec*.
+
+    The single disjointness core, shared by the legacy adjacent-invocation
+    pass and the within-statement pipe-chain check, so both report the same
+    diagnostic shape.  Conservative by construction: an unknown spec, ``ANY``
+    on either side, or an output no probe inhabits proves nothing and is
+    silently accepted.
+    """
+    if out_spec is None or in_spec is None:
+        return
+
+    from datapipe.tools.types import JsonType, as_type_spec, describe as _describe
+
+    any_spec = as_type_spec(JsonType.ANY)
+    if out_spec == any_spec or in_spec == any_spec:
+        return
+
+    if any(_matches(v, out_spec) and _matches(v, in_spec) for v in _PROBES):
+        return
+    # No probe matched the producer's output at all: we cannot prove the
+    # output is inhabited, so we cannot prove a contradiction either.
+    if not any(_matches(v, out_spec) for v in _PROBES):
+        return
+
+    raise ToolConfigurationError(
+        f"tool {producer_name!r} outputs "
+        f"{_describe(out_spec)} at {path_label}, but "
+        f"{consumer_name!r} accepts only {_describe(in_spec)} there; "
+        "no value can satisfy both",
+        expression=expression,
+        span=span,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1451,13 +1526,28 @@ def _compile_selector(
 ) -> CompiledSelector:
     """Validate selector against the contract's target scope and compile it."""
     if contract.target == "record" and not selector_node.is_root:
-        raise ToolConfigurationError(
-            f"tool {contract.name!r} has target='record' and requires the "
-            "root selector '.', but a field selector was supplied",
-            expression=expression,
-            span=selector_node.span,
-        )
+        _reject_non_root_record_target(contract, expression, selector_node.span)
     return CompiledSelector(selector_node)
+
+
+def _reject_non_root_record_target(
+    contract: ToolContract,
+    expression: str,
+    span: "Span | None",
+) -> None:
+    """Raise the single diagnostic for a record-target tool aimed off the root.
+
+    Both entry points share this wording: an explicit selector checked by
+    ``_compile_selector``, and a bare pipe call whose statement focus is not
+    the root.  *span* is the offending syntax in each case (the selector, or
+    the bare call itself), so the caret points at what the author wrote.
+    """
+    raise ToolConfigurationError(
+        f"tool {contract.name!r} has target='record' and requires the "
+        "root selector '.', but a field selector was supplied",
+        expression=expression,
+        span=span,
+    )
 
 
 def _bind_arguments(
