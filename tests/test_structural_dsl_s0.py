@@ -20,8 +20,17 @@ def test_7_1_fromjson_sequence_semicolon():
 # ---------------------------------------------------------------------------
 
 def test_7_2_tojson_single_currently_valid():
-    result = parse("tojson(.tools[].function.parameters)")
-    assert result is not None  # placeholder until Program node exists
+    expression = "tojson(.tools[].function.parameters)"
+
+    legacy = parse(expression)
+    assert isinstance(legacy, Expression)
+    assert len(legacy.invocations) == 1
+    assert legacy.invocations[0].qualified_name.name == "tojson"
+
+    program = parse_program(expression)
+    assert isinstance(program, Program)
+    assert len(program.statements) == 1
+    assert program.statements[0].operation.qualified_name.name == "tojson"
 
 
 # ---------------------------------------------------------------------------
