@@ -1,0 +1,9 @@
+{
+  "name": "datapipe",
+  "version": "0.1.0",
+  "description": "Skills for building and maintaining datapipe data pipelines.",
+  "author": {
+    "name": "Lyuwen Fu"
+  },
+  "keywords": ["datapipe", "pipeline", "data-processing"]
+}
