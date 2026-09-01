@@ -324,3 +324,74 @@ class TestCliEndToEnd:
         rc = main(["inspect-expression", "fromjson("])
         assert rc == 1
         assert "error" in capsys.readouterr().err.lower()
+
+
+class TestRouterExceptionContainment:
+    """``_compile_or_report`` must not leak non-syntax exceptions as tracebacks.
+
+    The first ``parse_program`` call used to sit outside the ``try`` block that
+    reports "error compiling expression:", so anything other than an
+    ``ExpressionSyntaxError`` escaped to the caller as a raw traceback.
+    """
+
+    def test_non_syntax_error_in_first_parse_is_reported(self, capsys, monkeypatch):
+        import datapipe.dsl.parser as parser_mod
+
+        def boom(expression):
+            raise RuntimeError("parser exploded")
+
+        monkeypatch.setattr(parser_mod, "parse_program", boom)
+
+        result = _compile_or_report("fromjson(.a)")
+
+        assert result is None
+        err = capsys.readouterr().err
+        assert "error compiling expression:" in err
+        assert "parser exploded" in err
+
+    def test_non_syntax_error_propagates_to_cli_exit_code(self, capsys, monkeypatch):
+        import datapipe.dsl.parser as parser_mod
+
+        def boom(expression):
+            raise RuntimeError("parser exploded")
+
+        monkeypatch.setattr(parser_mod, "parse_program", boom)
+
+        rc = main(["inspect-expression", "fromjson(.a)"])
+
+        assert rc == 1
+        assert "parser exploded" in capsys.readouterr().err
+
+
+class TestRoutingUnchangedAfterContainmentFix:
+    """The six routing cases must behave identically after the try-block move."""
+
+    def test_selector_first_routes_to_program(self):
+        assert isinstance(_compile_or_report(".metadata | fromjson"), CompiledProgram)
+
+    def test_invocation_with_bare_pipe_routes_to_program(self):
+        assert isinstance(_compile_or_report("fromjson(.a) | tojson"), CompiledProgram)
+
+    def test_multi_statement_routes_to_program(self):
+        assert isinstance(
+            _compile_or_report("fromjson(.a); tojson(.b)"), CompiledProgram
+        )
+
+    def test_legacy_invocation_pipe_routes_to_expression_with_warning(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            compiled = _compile_or_report("fromjson(.a) | tojson(.b)")
+
+        assert isinstance(compiled, CompiledExpression)
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+    def test_single_invocation_keeps_legacy_expression_shape(self):
+        assert isinstance(_compile_or_report("fromjson(.a)"), CompiledExpression)
+
+    def test_syntax_error_reports_cleanly_and_returns_none(self, capsys):
+        result = _compile_or_report("fromjson(")
+
+        assert result is None
+        err = capsys.readouterr().err
+        assert err.startswith("error:")
+        assert "Traceback" not in err

@@ -532,3 +532,83 @@ def test_pickle_roundtrip_preserves_pipes():
     revived = pickle.loads(pickle.dumps(stage))
     assert len(revived._compiled.statements[0].pipes) == 1
     assert revived.process({"metadata": "[1,2,3]"}, None) == {"metadata": "[1,2,3]"}
+
+
+# ---------------------------------------------------------------------------
+# 23. Bare-call argument lists use the same comma grammar as invocations
+# ---------------------------------------------------------------------------
+
+def _bare_args(source: str):
+    """Return the bare tool call's arguments from a selector-first statement."""
+    stmt = parse_program(source).statements[0]
+    return stmt.operation.arguments
+
+
+class TestBareCallArgumentCommas:
+    """A missing comma between bare-call arguments must be a syntax error.
+
+    The invocation form (``tojson(.a, compact=false indent=2)``) already
+    rejects this; the bare form used to accept it and silently bind both
+    arguments.  These tests pin the two paths to one grammar.
+    """
+
+    def test_missing_comma_between_bare_arguments_rejected(self):
+        with pytest.raises(ExpressionSyntaxError) as exc_info:
+            parse_program(".a | tojson(compact=false indent=2)")
+        message = str(exc_info.value)
+        assert "expected ')'" in message
+        assert "indent" in message
+
+    def test_missing_comma_matches_invocation_diagnostic(self):
+        """Same defect, same diagnostic, whichever form the user wrote."""
+        from datapipe.dsl.parser import parse
+
+        with pytest.raises(ExpressionSyntaxError) as bare_exc:
+            parse_program(".a | tojson(compact=false indent=2)")
+        with pytest.raises(ExpressionSyntaxError) as inv_exc:
+            parse("tojson(.a, compact=false indent=2)")
+
+        assert bare_exc.value.args[0].splitlines()[0] == inv_exc.value.args[0].splitlines()[0]
+
+    def test_correct_commas_bind_both_arguments(self):
+        args = _bare_args(".a | tojson(compact=false, indent=2)")
+        assert [(a.name, a.value.value) for a in args] == [
+            ("compact", False),
+            ("indent", 2),
+        ]
+
+    def test_single_argument_still_parses(self):
+        args = _bare_args(".a | tojson(compact=false)")
+        assert [(a.name, a.value.value) for a in args] == [("compact", False)]
+
+    def test_empty_argument_list_still_parses(self):
+        stmt = parse_program(".a | tojson()").statements[0]
+        assert stmt.operation.qualified_name.name == "tojson"
+        assert stmt.operation.arguments == ()
+
+    def test_no_parens_form_still_parses(self):
+        stmt = parse_program(".a | tojson").statements[0]
+        assert stmt.operation.qualified_name.name == "tojson"
+        assert stmt.operation.arguments == ()
+
+    def test_trailing_comma_rejected_matching_invocation_form(self):
+        """``_parse_invocation`` rejects a trailing comma; the bare form must too."""
+        from datapipe.dsl.parser import parse
+
+        with pytest.raises(ExpressionSyntaxError) as bare_exc:
+            parse_program(".a | tojson(compact=false,)")
+        with pytest.raises(ExpressionSyntaxError) as inv_exc:
+            parse("tojson(.a, compact=false,)")
+
+        assert "expected argument name" in str(bare_exc.value)
+        assert bare_exc.value.args[0].splitlines()[0] == inv_exc.value.args[0].splitlines()[0]
+
+    def test_unterminated_bare_argument_list_rejected(self):
+        with pytest.raises(ExpressionSyntaxError) as exc_info:
+            parse_program(".a | tojson(compact=false")
+        assert "expected ')'" in str(exc_info.value)
+
+    def test_missing_comma_rejected_in_later_pipe_stage(self):
+        """The stricter loop applies to every bare call in the chain."""
+        with pytest.raises(ExpressionSyntaxError):
+            parse_program(".a | fromjson | tojson(compact=false indent=2)")

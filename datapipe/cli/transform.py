@@ -238,11 +238,11 @@ def _compile_or_report(expression: str):
     program_ast = None
     program_error = None
     try:
-        program_ast = parse_program(expression)
-    except ExpressionSyntaxError as exc:
-        program_error = exc
+        try:
+            program_ast = parse_program(expression)
+        except ExpressionSyntaxError as exc:
+            program_error = exc
 
-    try:
         if program_ast is not None and _needs_program_path(program_ast):
             return compile_program(expression)
 

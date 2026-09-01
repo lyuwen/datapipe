@@ -244,14 +244,13 @@ class _Parser:
 
         if self._peek().type is TT.LPAREN:
             self._advance()  # consume (
-            # Keyword arguments only — no selector
-            while self._peek().type is not TT.RPAREN:
-                if self._peek().type is TT.EOF:
-                    raise self._error("unterminated bare tool call argument list")
-                arg = self._parse_argument()
-                arguments.append(arg)
-                if self._peek().type is TT.COMMA:
-                    self._advance()
+            # Keyword arguments only — no selector.  Comma-driven like
+            # _parse_invocation so a missing comma is a syntax error.
+            if self._peek().type is not TT.RPAREN:
+                arguments.append(self._parse_argument())
+                while self._peek().type is TT.COMMA:
+                    self._advance()  # consume ,
+                    arguments.append(self._parse_argument())
             close = self._expect(TT.RPAREN, "')'")
             span = Span(name.span.start, close.span.end)
         else:
