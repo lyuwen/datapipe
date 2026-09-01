@@ -13,7 +13,7 @@ Grammar::
                         (PIPE bare_call)*
     move_source  := selector | field_set
     field_set    := selector DOT LPAREN COMPLEMENT? IDENT (PIPE IDENT)* RPAREN
-    rhs          := selector | invocation
+    rhs          := selector | literal | invocation
     focused      := selector PIPE bare_call (PIPE bare_call)*
     invocation   := qualified_name LPAREN selector (COMMA argument)* RPAREN
     argument     := IDENT EQUALS literal
@@ -48,6 +48,14 @@ from datapipe.dsl.lexer import TT, Token, tokenize
 #: malformed expressions.  The limit is far above any realistic configuration
 #: value and well under CPython's default recursion limit.
 _MAX_LITERAL_DEPTH = 64
+
+#: Token types that can only ever begin a literal value.
+_LITERAL_START_TOKENS = frozenset(
+    {TT.STRING, TT.INTEGER, TT.FLOAT, TT.LBRACKET, TT.LBRACE}
+)
+
+#: Bare words the lexer emits as IDENT but the grammar reads as literals.
+_LITERAL_KEYWORDS = frozenset({"true", "True", "false", "False", "null", "None"})
 
 
 def parse(expression: str) -> "_ast.Expression":
@@ -172,6 +180,7 @@ class _Parser:
                     break
                 # Parse next statement
                 stmt = self._parse_statement()
+                self._expect_statement_end()
                 statements.append(stmt)
                 continue
 
@@ -179,6 +188,7 @@ class _Parser:
                 break
 
             stmt = self._parse_statement()
+            self._expect_statement_end()
             statements.append(stmt)
 
         if not statements:
@@ -198,6 +208,28 @@ class _Parser:
         return _ast.Program(
             statements=tuple(statements),
             span=Span(start, end),
+        )
+
+    def _expect_statement_end(self) -> None:
+        """Require ``;`` or end-of-input after a completed statement.
+
+        ``;`` is the sequencing token (plan §5.3, §9), not decoration.  Without
+        this check the parser simply re-entered ``_parse_statement`` wherever
+        the position landed, so ``tojson(.a) .b = .c`` — a missing separator —
+        parsed as two statements and *ran*.  Rejecting here covers every
+        statement form uniformly, instead of leaving the error to whether the
+        next statement happens to start with a token nothing can consume.
+        """
+        tok = self._peek()
+        if tok.type is TT.SEMICOLON or tok.type is TT.EOF:
+            return
+        raise self._error(
+            f"expected ';' or end of expression after a statement, got "
+            f"{tok.type.name}"
+            + (f" {tok.value!r}" if tok.value is not None else "")
+            + "; statements are separated by ';' — a missing ';' is the "
+            "usual cause",
+            tok.span,
         )
 
     def _parse_statement(self) -> "_ast.Statement":
@@ -293,10 +325,12 @@ class _Parser:
         )
 
     def _parse_assignment_rhs(self) -> "_ast.AssignmentRHS":
-        """Parse an assignment right-hand side: a selector or a transform of one.
+        """Parse an assignment right-hand side: a path, a literal, or a transform.
 
         ``.b``               → source ``.b``, no transform
         ``fromjson(.b)``     → source ``.b``, transform the invocation
+        ``5`` / ``true`` / ``{"k": 1}``
+                             → constant value, no source (plan §9 ``literal``)
         """
         tok = self._peek()
 
@@ -304,6 +338,17 @@ class _Parser:
             selector = self._parse_selector()
             return _ast.AssignmentRHS(
                 source=selector, transform=None, span=selector.span
+            )
+
+        # A literal RHS.  Bare ``true``/``false``/``null`` arrive as IDENT, so
+        # they are split out here before the invocation branch claims every
+        # IDENT; no tool may take one of those names as its own.
+        if tok.type in _LITERAL_START_TOKENS or (
+            tok.type is TT.IDENT and str(tok.value) in _LITERAL_KEYWORDS
+        ):
+            literal = self._parse_literal()
+            return _ast.AssignmentRHS(
+                source=None, transform=None, span=literal.span, literal=literal
             )
 
         if tok.type is TT.IDENT:
@@ -315,8 +360,8 @@ class _Parser:
             )
 
         raise self._error(
-            f"expected a selector or a tool invocation on the right-hand side "
-            f"of an assignment, got {tok.type.name}"
+            f"expected a selector, a literal value, or a tool invocation on the "
+            f"right-hand side of an assignment, got {tok.type.name}"
             + (f" {tok.value!r}" if tok.value is not None else ""),
             tok.span,
         )

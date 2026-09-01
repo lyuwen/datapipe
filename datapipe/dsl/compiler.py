@@ -596,6 +596,17 @@ class CompiledBareCall:
 
 
 @dataclass(frozen=True)
+class CompiledLiteral:
+    """A constant assignment right-hand side (``.a = 5``).
+
+    Holds the parsed JSON value.  Containers are deep-copied per record at
+    write time, never handed out directly, so no two records — and no record
+    and the compiled program — can ever share one.
+    """
+    value: Any
+
+
+@dataclass(frozen=True)
 class CompiledAssignment:
     """A compiled ``=`` / ``<-`` statement operation.
 
@@ -604,14 +615,18 @@ class CompiledAssignment:
     final key may be absent (that is what assignment creates).  They are
     ``None`` when the final part is an index or wildcard, in which case the
     whole destination selector is resolved instead.
+
+    ``source`` is ``None`` exactly when ``literal`` is set: a constant
+    right-hand side names no location to read, move, or overlap with.
     """
     destination: CompiledSelector
-    source: CompiledSelector
+    source: CompiledSelector | None
     transform: "ToolInvocation | CompiledBareCall | None"
     is_move: bool
     span: tuple[int, int]
     dest_parent: CompiledSelector | None = None
     dest_key: str | None = None
+    literal: CompiledLiteral | None = None
 
 
 @dataclass(frozen=True)
@@ -945,6 +960,31 @@ def _compile_assignment(
 ) -> tuple[CompiledAssignment, CompiledSelector, int]:
     """Compile a ``=`` / ``<-`` statement, applying the §12 static rejections."""
     op_label = "move" if node.is_move else "copy"
+
+    # A literal right-hand side is a constant: it names no location, so there
+    # is nothing for a move to remove.  Same rule as the root-source case
+    # below, reached one step earlier because there is no selector at all.
+    if node.rhs.literal is not None:
+        if node.is_move:
+            raise ToolConfigurationError(
+                f"move (`<-`) requires a statically identifiable source path, "
+                f"but the right-hand side is a literal value with no source to "
+                f"remove; use `=` to assign the constant",
+                expression=expression,
+                span=node.rhs.span,
+            )
+        dest_parent, dest_key = _split_destination(node.destination)
+        operation = CompiledAssignment(
+            destination=CompiledSelector(node.destination),
+            source=None,
+            transform=None,
+            is_move=False,
+            span=(node.span.start, node.span.end),
+            dest_parent=dest_parent,
+            dest_key=dest_key,
+            literal=CompiledLiteral(value=node.rhs.literal.value),
+        )
+        return operation, operation.destination, index
 
     # A move must have a statically identifiable primary source to delete.
     # The root selector names no removable field, so it is only ever a
@@ -1361,6 +1401,11 @@ def _reject_static_overlap(
     Only paths that are fully static are compared; a wildcard defers the same
     check to runtime, where the concrete paths are known.
     """
+    if node.rhs.source is None:
+        # A literal right-hand side reads no location, so there is nothing it
+        # could overlap with.
+        return
+
     dest = _static_path(node.destination)
     src = _static_path(node.rhs.source)
     if dest is None or src is None:

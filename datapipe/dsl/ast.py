@@ -149,12 +149,19 @@ class BareToolCall:
 class AssignmentRHS:
     """Right-hand side of an assignment.
 
-    ``source`` is the primary source selector (required for moves).
-    ``transform`` is an optional tool applied to the source value.
+    Exactly one of ``source`` and ``literal`` is set, matching the plan §9
+    grammar ``value_expression := path | literal | invocation``:
+
+    - ``source`` is the primary source selector, shared with ``transform``'s
+      own selector when a transform is present.  A move (``<-``) requires it,
+      because there is nothing else to remove.
+    - ``literal`` is a constant right-hand side (``.a = 5``).  It has no path,
+      so it never carries a transform and is rejected for ``<-``.
     """
-    source: Selector
+    source: "Selector | None"
     transform: "Invocation | BareToolCall | None"
     span: Span
+    literal: "Literal | None" = None
 
 
 @dataclass(frozen=True)

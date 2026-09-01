@@ -27,6 +27,7 @@ Architecture (§10 of the CLI plan)
 from __future__ import annotations
 
 import contextvars
+import json as _json
 from copy import deepcopy as _deepcopy
 from typing import Any, Callable
 
@@ -396,6 +397,14 @@ def _ref_path(refs: list) -> str | None:
     return refs[0].path if len(refs) == 1 else None
 
 
+def _render_literal(value: Any) -> str:
+    """Render a literal RHS for a diagnostic, as the JSON the user wrote."""
+    try:
+        return _json.dumps(value)
+    except (TypeError, ValueError):  # pragma: no cover - parser yields JSON only
+        return repr(value)
+
+
 def _detached(value: Any) -> Any:
     """Return *value* with no shared structure, so writing it creates no alias.
 
@@ -746,16 +755,22 @@ class CompiledProgramStage(Stage):
         """
         op = stmt.operation
         fail = self._structural_failure(op, stmt_index, record_seq)
+        literal = op.literal
 
         # -- 1. resolve the source ----------------------------------------
-        try:
-            src_refs = op.source.resolve(record)
-        except SelectorResolutionError as exc:
-            raise fail(
-                source_path=exc.path or op.source.render(),
-                reason=f"source path cannot be resolved: {exc}",
-                cause=exc,
-            ) from exc
+        # A literal right-hand side has no source to resolve, so every step
+        # keyed to one (cardinality, overlap, move removal) is skipped rather
+        # than run against a selector that is not there.
+        src_refs: list | None = None
+        if literal is None:
+            try:
+                src_refs = op.source.resolve(record)
+            except SelectorResolutionError as exc:
+                raise fail(
+                    source_path=exc.path or op.source.render(),
+                    reason=f"source path cannot be resolved: {exc}",
+                    cause=exc,
+                ) from exc
 
         # -- 2. resolve / prepare the destination --------------------------
         # Only the final field is created by assignment; a missing intermediate
@@ -768,13 +783,12 @@ class CompiledProgramStage(Stage):
                 parent_refs = op.dest_parent.resolve(record)
             except SelectorResolutionError as exc:
                 raise fail(
-                    source_path=_ref_path(src_refs),
+                    destination_path=exc.path or op.dest_parent.render(),
                     reason=f"destination parent cannot be resolved: {exc}",
                     cause=exc,
                 ) from exc
             if len(parent_refs) != 1:
                 raise fail(
-                    source_path=_ref_path(src_refs),
                     reason=(
                         f"destination parent must resolve to exactly one "
                         f"location, got {len(parent_refs)}"
@@ -783,7 +797,9 @@ class CompiledProgramStage(Stage):
             parent_value = parent_refs[0].value
             if not isinstance(parent_value, dict):
                 raise fail(
-                    source_path=_ref_path(src_refs),
+                    destination_path=_join_path(
+                        parent_refs[0].path_parts + (op.dest_key,)
+                    ),
                     reason=(
                         f"destination parent {parent_refs[0].path} is a "
                         f"{type(parent_value).__name__}, not an object"
@@ -798,13 +814,12 @@ class CompiledProgramStage(Stage):
                 dest_refs = op.destination.resolve(record)
             except SelectorResolutionError as exc:
                 raise fail(
-                    source_path=_ref_path(src_refs),
+                    destination_path=exc.path or op.destination.render(),
                     reason=f"destination cannot be resolved: {exc}",
                     cause=exc,
                 ) from exc
             if len(dest_refs) != 1:
                 raise fail(
-                    source_path=_ref_path(src_refs),
                     reason=(
                         f"destination must resolve to exactly one location, "
                         f"got {len(dest_refs)}"
@@ -814,29 +829,31 @@ class CompiledProgramStage(Stage):
             dest_parts = dest_ref.path_parts
 
         # -- 3. validate source cardinality --------------------------------
-        if len(src_refs) != 1:
-            raise fail(
-                destination_path=_join_path(dest_parts),
-                reason=(
-                    f"source must resolve to exactly one reference, got "
-                    f"{len(src_refs)}"
-                ),
-            )
-        src_ref = src_refs[0]
+        src_ref = None
+        if literal is None:
+            if len(src_refs) != 1:
+                raise fail(
+                    destination_path=_join_path(dest_parts),
+                    reason=(
+                        f"source must resolve to exactly one reference, got "
+                        f"{len(src_refs)}"
+                    ),
+                )
+            src_ref = src_refs[0]
 
-        # -- 4. detect runtime overlap -------------------------------------
-        detail = overlap_reason(
-            dest_parts,
-            src_ref.path_parts,
-            is_move=op.is_move,
-            has_transform=op.transform is not None,
-        )
-        if detail is not None:
-            raise fail(
-                source_path=src_ref.path,
-                destination_path=_join_path(dest_parts),
-                reason=f"overlapping source and destination: {detail}",
+            # -- 4. detect runtime overlap ---------------------------------
+            detail = overlap_reason(
+                dest_parts,
+                src_ref.path_parts,
+                is_move=op.is_move,
+                has_transform=op.transform is not None,
             )
+            if detail is not None:
+                raise fail(
+                    source_path=src_ref.path,
+                    destination_path=_join_path(dest_parts),
+                    reason=f"overlapping source and destination: {detail}",
+                )
 
         # -- 5. compute the transformed value ------------------------------
         # Tools are not required to be pure, so anything handed to a transform
@@ -846,9 +863,17 @@ class CompiledProgramStage(Stage):
         # *then* raises would defeat the resolve-before-mutate atomicity rule
         # for both `=` and `<-`.  This replaces the output-side detach below
         # rather than adding to it, so a statement still costs one deep copy.
-        chain_input = src_ref.value
-        if op.transform is not None or stmt.pipes:
-            chain_input = _detached(src_ref.value)
+        # A literal is detached unconditionally: the compiled program holds one
+        # container per statement, so handing it out would alias it into every
+        # record that statement touches (and into the program itself).
+        detached_input = True
+        if literal is not None:
+            chain_input = _detached(literal.value)
+        else:
+            chain_input = src_ref.value
+            detached_input = op.transform is not None or bool(stmt.pipes)
+            if detached_input:
+                chain_input = _detached(src_ref.value)
         new_value = chain_input
         if op.transform is not None:
             new_value = self._run_transform(
@@ -902,11 +927,7 @@ class CompiledProgramStage(Stage):
         # When step 5 already detached the chain input, the value in hand is
         # derived from that copy and shares nothing with the record, so a
         # second copy here would be pure cost.
-        written = (
-            new_value
-            if chain_input is not src_ref.value
-            else _detached(new_value)
-        )
+        written = new_value if detached_input else _detached(new_value)
         if dest_parent_container is not None:
             dest_parent_container[dest_key] = written
         else:
@@ -1256,6 +1277,17 @@ class CompiledProgramStage(Stage):
         else:
             operation = "move" if op.is_move else "copy"
 
+        # A literal right-hand side has no selector and no concrete path, so
+        # the diagnostic names the constant instead and leaves ``source:`` off
+        # entirely rather than inventing a path that does not exist.
+        literal = getattr(op, "literal", None)
+        if literal is not None:
+            rendered_source = _render_literal(literal.value)
+            default_source_path = None
+        else:
+            rendered_source = op.source.render()
+            default_source_path = rendered_source
+
         def build(
             *,
             source_path: str | None = None,
@@ -1267,8 +1299,8 @@ class CompiledProgramStage(Stage):
                 record_seq=record_seq,
                 statement_index=stmt_index,
                 operation=operation,
-                selector=op.source.render(),
-                source_path=source_path or op.source.render(),
+                selector=rendered_source,
+                source_path=source_path or default_source_path,
                 destination_path=destination_path or op.destination.render(),
                 expression_span=op.span,
                 policy="error",

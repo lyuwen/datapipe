@@ -99,9 +99,9 @@ class TestExpressionRouting:
         # parse_program: "requires '|', '=', or '<-' after selector"
         # legacy:        "expected tool name, got DOT"
         (".a", "after selector"),
-        # parse_program: "expected '(', got EOF"
+        # parse_program: "expected ';' or end of expression after a statement"
         # legacy:        "unexpected token IDENT 'tojson'"
-        ("fromjson(.a) tojson", "expected '('"),
+        ("fromjson(.a) tojson", "expected ';'"),
     ])
     def test_unparseable_reports_the_program_diagnostic(
         self, expression, expected, capsys,

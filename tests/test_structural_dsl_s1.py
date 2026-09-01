@@ -243,3 +243,50 @@ def test_routing_detects_real_statement_separator():
     program = parse_program("fromjson(.a); fromjson(.b)")
     assert len(program.statements) == 2
     assert _needs_program_path(program) is True
+
+
+# ---------------------------------------------------------------------------
+# `;` is required between statements
+#
+# The parser used to re-enter _parse_statement wherever the position landed,
+# so a missing separator parsed as two statements and *ran*.  A typo that
+# executes is a worse failure than a syntax error.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("expression, unexpected", [
+    ("tojson(.a) .b = .c", "."),
+    (".a | tojson fromjson(.b)", "fromjson"),
+    ("nest(.) .a = .b", "."),
+    # Previously rejected too, but only by accident: the second statement
+    # happened to start with a token nothing could consume ("expected tool
+    # name, got EQUALS").  It must now give the same diagnostic as the rest.
+    (".a = .b .c = .d", "="),
+])
+def test_missing_semicolon_between_statements_is_rejected(expression, unexpected):
+    with pytest.raises(ExpressionSyntaxError) as exc:
+        parse_program(expression)
+    message = str(exc.value)
+    assert "expected ';'" in message
+    assert "a missing ';' is the usual cause" in message
+
+
+def test_missing_semicolon_caret_points_at_the_unexpected_token():
+    """The caret must land on the token that should have been preceded by ';'."""
+    expression = ".a | tojson fromjson(.b)"
+    with pytest.raises(ExpressionSyntaxError) as exc:
+        parse_program(expression)
+    # `fromjson` is the second occurrence of that text; the span must be the
+    # one that starts the would-be second statement, not the tool in `.b`.
+    assert exc.value.span.start == expression.index("fromjson")
+
+
+def test_semicolon_separated_statements_still_parse():
+    """The new check must not reject anything that was already legal."""
+    for expression in (
+        "tojson(.a); .b = .c",
+        ".a | tojson; fromjson(.b)",
+        "nest(.); .a = .b",
+        ".a = .b; .c = .d",
+        ".a = .b;",
+    ):
+        assert isinstance(parse_program(expression), Program)

@@ -1,6 +1,8 @@
 # Structural Transform DSL Extension Plan
 
-> **Status:** proposed architectural extension  
+> **Status:** implemented on `feat/structural-transform-dsl` — §14 phases S0-S7,
+> the §7 catalogue, and the §16 definition of done are all delivered and tested.
+> The one deliberate deferral is the §13.5 legacy-pipe decision recorded below.  
 > **Runtime foundation:** [`parallel_record_pipeline_architecture.md`](parallel_record_pipeline_architecture.md)  
 > **CLI and tool foundation:** [`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md)
 
@@ -254,6 +256,21 @@ without deleting `.metadata.temperature`.
 Ordinary assignment must never imply deletion. This matches jq, Python, and
 common user expectations.
 
+The right side may also be a literal (`value_expression := path | literal |
+invocation`, §9), which assigns a constant:
+
+```text
+.status = "processed"
+.retries = 0
+.tags = ["a", "b"]
+```
+
+Every JSON literal form is accepted, including nested arrays and objects, and
+a literal may be followed by trailing pipes (`.a = 5 | tojson` writes `"5"`),
+which operate on the constant at the published focus like any other value. A
+container literal is copied per record, so no two records — and no record and
+the compiled program — ever share one object.
+
 ### 6.2 Exact move assignment: `<-`
 
 ```text
@@ -272,6 +289,10 @@ A transform may be applied during a move:
 The source expression must have one statically identifiable primary source
 reference. Arbitrary computed expressions without a source path cannot be
 destructively moved; use `=` instead.
+
+For the same reason a literal is not a `movable_expression` (§9): a constant
+names no location, so there is nothing for the move to remove. `.a <- 5` is
+rejected at compile time and the diagnostic directs the user to `=`.
 
 ### 6.3 Move into object: `<<`
 

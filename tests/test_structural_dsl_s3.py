@@ -161,9 +161,16 @@ def test_assignment_focus_is_the_destination():
     assert stmt.pipes[0].qualified_name.name == "tojson"
 
 
-def test_rhs_must_be_a_selector_or_invocation():
-    with pytest.raises(ExpressionSyntaxError):
-        parse_program(".a = 42")
+def test_rhs_must_be_a_selector_a_literal_or_an_invocation():
+    """A right-hand side that is none of the three grammar forms is rejected.
+
+    ``|`` cannot begin a value expression, so this exercises the fallthrough
+    diagnostic rather than a form the grammar accepts (``.a = 42`` is a
+    literal — see the literal-RHS tests).
+    """
+    with pytest.raises(ExpressionSyntaxError) as exc:
+        parse_program(".a = | tojson")
+    assert "right-hand side" in str(exc.value)
 
 
 def test_empty_rhs_rejected():
@@ -857,6 +864,18 @@ def popx(value):
 def popx_boom(value):
     value.pop("x", None)
     raise ValueError("popx_boom always fails")
+
+
+@tool(
+    name="grow",
+    target="value",
+    input=JsonType.OBJECT,
+    output=JsonType.OBJECT,
+    description="Append to the value's 'k' list in place. Not idempotent.",
+)
+def grow(value):
+    value.setdefault("k", []).append(1)
+    return value
 """
 
 
@@ -933,3 +952,215 @@ def test_failing_mutating_bare_call_leaves_the_move_record_untouched(mutating_to
         stage.process(record, None)
     assert isinstance(exc.value.cause, ValueError)
     assert record == expected
+
+
+# ===========================================================================
+# Literal right-hand side (plan §9 `value_expression := path | literal | ...`)
+# ===========================================================================
+
+
+@pytest.mark.parametrize("expression, expected", [
+    (".a = 5", 5),
+    (".a = -3", -3),
+    (".a = 1.5", 1.5),
+    (".a = true", True),
+    (".a = false", False),
+    (".a = null", None),
+    ('.a = "s"', "s"),
+    (".a = []", []),
+    (".a = [1, [2, {\"k\": 3}]]", [1, [2, {"k": 3}]]),
+    (".a = {}", {}),
+    ('.a = {"k": [1, 2], "n": null}', {"k": [1, 2], "n": None}),
+])
+def test_literal_rhs_assigns_the_constant(expression, expected):
+    """Every JSON literal form the argument grammar accepts works as an RHS."""
+    out = _stage(expression).process({"b": 1}, None)
+    assert out == {"b": 1, "a": expected}
+
+
+def test_literal_rhs_parses_with_no_source_selector():
+    """The AST records a literal, not a selector — nothing to move or overlap."""
+    program = parse_program(".a = 5")
+    rhs = program.statements[0].operation.rhs
+    assert rhs.source is None
+    assert rhs.transform is None
+    assert rhs.literal.value == 5
+
+
+def test_literal_rhs_reuses_the_shared_literal_depth_bound():
+    """A literal RHS is parsed by the same bounded parser as an argument value."""
+    from datapipe.dsl.parser import _MAX_LITERAL_DEPTH
+
+    deep = "[" * (_MAX_LITERAL_DEPTH + 2) + "]" * (_MAX_LITERAL_DEPTH + 2)
+    with pytest.raises(ExpressionSyntaxError) as exc:
+        parse_program(f".a = {deep}")
+    assert "nested more than" in str(exc.value)
+
+
+def test_move_rejects_a_literal_rhs():
+    """`<-` needs a source path to delete; a constant has none (§6.2)."""
+    from datapipe.dsl.compiler import compile_program
+
+    with pytest.raises(ToolConfigurationError) as exc:
+        compile_program(".a <- 5")
+    message = str(exc.value)
+    assert "statically identifiable source path" in message
+    assert "use `=` to assign the constant" in message
+
+
+def test_move_rejects_a_container_literal_rhs():
+    from datapipe.dsl.compiler import compile_program
+
+    with pytest.raises(ToolConfigurationError) as exc:
+        compile_program('.a <- {"k": 1}')
+    assert "no source to remove" in str(exc.value)
+
+
+def test_literal_rhs_to_an_existing_destination_overwrites():
+    """Overlap analysis has no source to dereference and must not fire."""
+    out = _stage(".a = 7").process({"a": {"deep": [1]}}, None)
+    assert out == {"a": 7}
+
+
+def test_literal_rhs_onto_its_own_ancestor_is_allowed():
+    """`.a.b = 5` where `.a` exists: no source path, so no self-overlap."""
+    out = _stage(".a.b = 5").process({"a": {"c": 1}}, None)
+    assert out == {"a": {"c": 1, "b": 5}}
+
+
+def test_container_literal_is_not_shared_between_records():
+    """Two records assigned the same container literal must not alias.
+
+    This is the aliasing class that has bitten this branch twice: the compiled
+    program holds one literal object, so handing it out directly would let a
+    mutation to one record's destination show up in every other record and in
+    the program itself.
+    """
+    stage = _stage('.a = {"k": [1]}')
+    first = stage.process({}, None)
+    second = stage.process({}, None)
+
+    assert first["a"] is not second["a"]
+    assert first["a"]["k"] is not second["a"]["k"]
+
+    first["a"]["k"].append(99)
+    assert second == {"a": {"k": [1]}}, "mutating one record reached another"
+
+    third = stage.process({}, None)
+    assert third == {"a": {"k": [1]}}, "the compiled literal itself was mutated"
+
+
+def test_a_mutating_pipe_cannot_corrupt_the_stored_literal(mutating_tools):
+    """A tool that mutates its argument must not reach the compiled literal.
+
+    `grow` appends in place and is deliberately *not* idempotent, so handing
+    the stored literal to it live would leave the constant growing by one
+    element per record — which is exactly what an idempotent probe would miss.
+    """
+    stage = _stage('.a = {"k": []} | grow')
+    assert stage.process({}, None) == {"a": {"k": [1]}}
+    assert stage.process({}, None) == {"a": {"k": [1]}}, (
+        "the second record saw a literal the first record had mutated"
+    )
+
+
+def test_literal_rhs_survives_pickling():
+    """The compiled literal crosses the spawn boundary intact."""
+    from datapipe.dsl.compiler import compile_program
+
+    program = compile_program('.a = {"k": [1, 2]}')
+    revived = pickle.loads(pickle.dumps(program))
+    assert revived.statements[0].operation.literal.value == {"k": [1, 2]}
+
+
+def test_trailing_pipes_run_on_the_literal_value():
+    """`.a = 5 | tojson`: the literal is written, then the pipes transform it.
+
+    A trailing pipe operates on the value at the published focus (the
+    destination), which for a literal RHS is the constant itself.
+    """
+    assert _stage(".a = 5 | tojson").process({}, None) == {"a": "5"}
+
+
+def test_trailing_pipes_on_a_container_literal_do_not_mutate_the_program():
+    stage = _stage('.a = {"k": 1} | tojson')
+    assert stage.process({}, None) == {"a": '{"k":1}'}
+    # Re-running proves the pipe did not consume or mutate the stored literal.
+    assert stage.process({}, None) == {"a": '{"k":1}'}
+
+
+def test_literal_rhs_diagnostic_names_the_constant_not_a_path():
+    """A failure on a literal statement has no source path to report."""
+    stage = _stage(".missing.a = 5")
+    with pytest.raises(StructuralExecutionError) as exc:
+        stage.process({}, None)
+    assert exc.value.source_path is None
+    assert exc.value.selector == "5"
+
+
+# ===========================================================================
+# §12 path attribution: a destination failure names the destination
+# ===========================================================================
+
+
+def test_missing_destination_parent_reports_the_destination_path():
+    """The failure is about the destination, so `destination:` must name it.
+
+    Regression: this branch reported ``source_path=<resolved source>`` and no
+    concrete destination, so a user whose destination was missing got a
+    diagnostic whose ``source:`` line pointed at the wrong half of the
+    statement.
+    """
+    with pytest.raises(StructuralExecutionError) as exc:
+        _stage(".missing.deep = .b").process({"b": 1}, None)
+
+    err = exc.value
+    assert "destination parent cannot be resolved" in err.reason
+    # The concrete destination-side path that failed to resolve.
+    assert err.destination_path == ".missing"
+    # The source resolved fine, so it stays the statement's static selector
+    # rather than being presented as the failing path.
+    assert err.source_path == ".b"
+    assert "destination: .missing" in str(err)
+
+
+def test_destination_parent_that_is_not_an_object_reports_the_destination():
+    """The reported destination is the concrete one, not the written selector.
+
+    A wildcard in the destination parent makes the difference visible: the
+    static render is ``.a[].b`` while the location that actually failed is
+    ``.a[0].b``.
+    """
+    with pytest.raises(StructuralExecutionError) as exc:
+        _stage(".a[].b = .c").process({"a": [[1, 2]], "c": 9}, None)
+
+    err = exc.value
+    assert "not an object" in err.reason
+    assert err.destination_path == ".a[0].b"
+
+
+def test_unresolvable_wildcard_destination_reports_the_destination_path():
+    """The sibling `destination.resolve` failure has the same attribution.
+
+    The destination walks through a wildcard, so the concrete path where
+    resolution stopped (``.a[0]``) differs from the written selector.
+    """
+    with pytest.raises(StructuralExecutionError) as exc:
+        _stage(".a[].missing[] = .c").process({"a": [{}], "c": 9}, None)
+
+    err = exc.value
+    assert "destination cannot be resolved" in err.reason
+    assert err.destination_path == ".a[0]"
+
+
+def test_ambiguous_destination_reports_the_static_destination():
+    """A wildcard matching several locations names the destination selector."""
+    with pytest.raises(StructuralExecutionError) as exc:
+        _stage(".a[] = .b[]").process({"a": [1, 2], "b": [3, 4]}, None)
+
+    err = exc.value
+    assert "destination must resolve to exactly one location" in err.reason
+    assert err.destination_path == ".a[]"
+    # The old code passed a source path that is None for a multi-match source,
+    # dropping the source line entirely from a destination-side failure.
+    assert err.source_path == ".b[]"
