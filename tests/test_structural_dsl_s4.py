@@ -193,7 +193,7 @@ def _compile(expression: str):
 def test_index_source_under_move_into_is_rejected():
     with pytest.raises(ToolConfigurationError) as exc:
         _compile(".metadata << .values[0]")
-    assert "<<" in str(exc.value) or "move" in str(exc.value).lower()
+    assert "cannot infer a destination key" in str(exc.value)
 
 
 def test_wildcard_source_under_move_into_is_rejected():
@@ -222,7 +222,7 @@ def test_duplicate_field_names_in_a_set_are_rejected():
 def test_two_sources_deriving_the_same_key_are_rejected():
     with pytest.raises(ToolConfigurationError) as exc:
         _compile(".m << .a, .b.a")
-    assert "a" in str(exc.value)
+    assert "two sources derive the same destination key 'a'" in str(exc.value)
 
 
 def test_positive_set_and_path_deriving_the_same_key_are_rejected():
