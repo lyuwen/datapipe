@@ -79,7 +79,7 @@ def test_compile_program_two_invocations():
 # 7. End-to-end: SequentialExecutor
 # ---------------------------------------------------------------------------
 
-def test_e2e_sequential():
+def test_e2e_sequential(tmp_path):
     from datapipe.dsl.compiler import compile_program
     from datapipe.stages.tool_program import CompiledProgramStage
     from datapipe.pipeline import Pipeline
@@ -87,38 +87,29 @@ def test_e2e_sequential():
     from datapipe.io.jsonl import JsonlSource, JsonlSink
     from datapipe.stage import JsonLoadStage, JsonDumpStage
     import json
-    import tempfile
-    import os
 
     record = {"a": "[1]", "b": "[2]"}
     compiled = compile_program("fromjson(.a); fromjson(.b)")
     stage = CompiledProgramStage(compiled)
     pipeline = Pipeline([JsonLoadStage(), stage, JsonDumpStage()])
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        f.write(json.dumps(record) + "\n")
-        input_path = f.name
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        output_path = f.name
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    input_path.write_text(json.dumps(record) + "\n")
 
-    try:
-        source = JsonlSource(input_path, raw=True)
-        sink = JsonlSink(output_path, raw=True)
-        pipeline.run(source=source, sink=sink, executor=SequentialExecutor())
+    source = JsonlSource(str(input_path), raw=True)
+    sink = JsonlSink(str(output_path), raw=True)
+    pipeline.run(source=source, sink=sink, executor=SequentialExecutor())
 
-        with open(output_path) as f:
-            out = json.loads(f.read().strip())
-        assert out == {"a": [1], "b": [2]}
-    finally:
-        os.unlink(input_path)
-        os.unlink(output_path)
+    out = json.loads(output_path.read_text().strip())
+    assert out == {"a": [1], "b": [2]}
 
 
 # ---------------------------------------------------------------------------
 # 8. End-to-end: ProcessExecutor (proves cross-process pickling)
 # ---------------------------------------------------------------------------
 
-def test_e2e_process():
+def test_e2e_process(tmp_path):
     from datapipe.dsl.compiler import compile_program
     from datapipe.stages.tool_program import CompiledProgramStage
     from datapipe.pipeline import Pipeline
@@ -126,34 +117,25 @@ def test_e2e_process():
     from datapipe.io.jsonl import JsonlSource, JsonlSink
     from datapipe.stage import JsonLoadStage, JsonDumpStage
     import json
-    import tempfile
-    import os
 
     record = {"a": "[1]", "b": "[2]"}
     compiled = compile_program("fromjson(.a); fromjson(.b)")
     stage = CompiledProgramStage(compiled)
     pipeline = Pipeline([JsonLoadStage(), stage, JsonDumpStage()])
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        f.write(json.dumps(record) + "\n")
-        input_path = f.name
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        output_path = f.name
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    input_path.write_text(json.dumps(record) + "\n")
 
-    try:
-        source = JsonlSource(input_path, raw=True)
-        sink = JsonlSink(output_path, raw=True)
-        pipeline.run(
-            source=source, sink=sink,
-            executor=ProcessExecutor(workers=1),
-        )
+    source = JsonlSource(str(input_path), raw=True)
+    sink = JsonlSink(str(output_path), raw=True)
+    pipeline.run(
+        source=source, sink=sink,
+        executor=ProcessExecutor(workers=1),
+    )
 
-        with open(output_path) as f:
-            out = json.loads(f.read().strip())
-        assert out == {"a": [1], "b": [2]}
-    finally:
-        os.unlink(input_path)
-        os.unlink(output_path)
+    out = json.loads(output_path.read_text().strip())
+    assert out == {"a": [1], "b": [2]}
 
 
 # ---------------------------------------------------------------------------
@@ -225,3 +207,26 @@ def test_legacy_pipe_warning_not_emitted_single():
         warnings.simplefilter("error", DeprecationWarning)
         # Should not raise
         compile_expression("fromjson(.a)")
+
+
+# ---------------------------------------------------------------------------
+# 12. Routing: semicolon inside a string literal does not trigger compile_program
+# ---------------------------------------------------------------------------
+
+def test_semicolon_in_string_literal_not_detected():
+    """A semicolon inside a quoted string must not be seen as a statement separator."""
+    from datapipe.dsl.lexer import tokenize, TT
+    tokens = tokenize('fromjson(.a, key="x;y")')
+    assert not any(tok.type is TT.SEMICOLON for tok in tokens)
+
+
+def test_has_semicolons_false_for_string_with_semicolon():
+    """_has_semicolons returns False when the only semicolon is inside a string."""
+    from datapipe.cli.transform import _has_semicolons
+    assert _has_semicolons('fromjson(.a, key="x;y")') is False
+
+
+def test_has_semicolons_true_for_real_separator():
+    """_has_semicolons returns True when a top-level semicolon is present."""
+    from datapipe.cli.transform import _has_semicolons
+    assert _has_semicolons("fromjson(.a); fromjson(.b)") is True

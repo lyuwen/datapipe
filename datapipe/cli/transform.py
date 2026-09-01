@@ -31,6 +31,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import argparse
 
+from datapipe.dsl.lexer import TT, tokenize as _tokenize
+
+
+def _has_semicolons(expression: str) -> bool:
+    """Return True if the expression contains a top-level SEMICOLON token."""
+    try:
+        tokens = _tokenize(expression)
+    except Exception:
+        return False
+    return any(tok.type is TT.SEMICOLON for tok in tokens)
+
 
 # ---------------------------------------------------------------------------
 # Argument-parser fragment (registered by main.py)
@@ -202,7 +213,7 @@ def _compile_or_report(expression: str):
         ToolResolutionError,
     )
     try:
-        if ";" in expression:
+        if _has_semicolons(expression):
             from datapipe.dsl.compiler import compile_program
             return compile_program(expression)
         else:

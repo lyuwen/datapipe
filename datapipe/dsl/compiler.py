@@ -706,6 +706,8 @@ def compile_program(expression: str) -> CompiledProgram:
             expression_span=(inv_node.span.start, inv_node.span.end),
         ))
 
+    # _check_static_compatibility is not called here: statements operate on
+    # independent selectors with no output-to-input type flow between them.
     return CompiledProgram(
         statements=tuple(invocations),
         source=expression,
