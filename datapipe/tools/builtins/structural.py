@@ -55,11 +55,13 @@ and so an unsupported policy fails loudly instead of being ignored.
 
 from __future__ import annotations
 
+import functools
 from functools import lru_cache
 from typing import Any
 
 from datapipe.tools.decorator import tool
 from datapipe.tools.contract import ToolExample
+from datapipe.tools.errors import StructuralExecutionError
 from datapipe.tools.types import JsonType
 
 #: The only collision policy `<<` implements (§8.4).
@@ -299,14 +301,36 @@ def _check_policy(
 def _expand_complement(
     record: dict, key: str, excluded: "tuple[str, ...]", tool_name: str
 ) -> "tuple[str, ...]":
-    """Return the source object's keys minus *excluded*, in source order (§6.4)."""
+    """Return the source object's keys minus *excluded*, in source order (§6.4).
+
+    The two precondition failures here duplicate checks the S4 move-into path
+    already performs, because a complement must be expanded against the live
+    record *before* the statement can be built.  They raise the same
+    ``StructuralExecutionError`` S4 would, so a caller sees one error type
+    regardless of which selection form it used.
+    """
+    fail = functools.partial(
+        StructuralExecutionError,
+        record_seq=None,
+        statement_index=0,
+        operation="move-into",
+        selector=".",
+        destination_path=".",
+        policy="error",
+    )
     if key not in record:
-        raise ValueError(f"{tool_name}: record has no field {key!r}")
+        raise fail(
+            source_path=f".{key}",
+            reason=f"{tool_name}: record has no field {key!r}",
+        )
     source = record[key]
     if not isinstance(source, dict):
-        raise ValueError(
-            f"{tool_name}: .{key} is a {type(source).__name__}, not an object; "
-            "decode it first (parse=true)"
+        raise fail(
+            source_path=f".{key}",
+            reason=(
+                f"{tool_name}: .{key} is a {type(source).__name__}, not an "
+                "object; decode it first (parse=true)"
+            ),
         )
     skip = set(excluded)
     return tuple(name for name in source if name not in skip)

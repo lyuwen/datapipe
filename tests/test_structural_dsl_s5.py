@@ -473,15 +473,26 @@ def test_parse_true_on_an_undecodable_source_errors():
 def test_absent_key_errors_and_changes_nothing():
     from datapipe.tools.builtins.structural import unnest
 
+    # With parse=True the missing key is hit by the `fromjson` statement first,
+    # so it surfaces as a ToolExecutionError before any move-into runs.
     record = {"other": 1}
-    with pytest.raises((ToolExecutionError, StructuralExecutionError)):
+    with pytest.raises(ToolExecutionError):
         unnest(record, key="m", include=["a"], parse=True)
     assert record == {"other": 1}
 
+    # Without parse, both selection forms must report the same precondition
+    # failure with the same error type: `include` reaches it inside the S4
+    # move-into path, while `exclude` must expand its complement first and
+    # raises it directly.
     record2 = {"other": 1}
-    with pytest.raises((ToolExecutionError, StructuralExecutionError)):
+    with pytest.raises(StructuralExecutionError):
         unnest(record2, key="m", include=["a"])
     assert record2 == {"other": 1}
+
+    record3 = {"other": 1}
+    with pytest.raises(StructuralExecutionError):
+        unnest(record3, key="m", exclude=["a"])
+    assert record3 == {"other": 1}
 
 
 # 15. jsonify=true re-encodes the remaining source object.
