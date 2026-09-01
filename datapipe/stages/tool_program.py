@@ -49,24 +49,49 @@ SAMPLE_LIMIT = 100
 #: Accepted runtime validation modes (§10.3 of the CLI plan).
 VALIDATE_MODES = ("always", "sample", "off")
 
-#: The validation mode the enclosing stage is running under, published for the
-#: duration of each ``process()`` call.
+#: The enclosing stage's validation decision **for the current record**,
+#: published for the duration of each ``process()`` call.
 #:
 #: A ``target="record"`` tool receives only ``(record, **arguments)`` — the
 #: contract deliberately keeps tool functions ignorant of the runtime.  The
 #: built-in ``nest``/``unnest`` are the one case where that hurts: they desugar
 #: into a nested ``CompiledProgramStage`` of their own, and without this channel
 #: that inner stage would validate on every record even under ``--validate off``.
-#: A ContextVar carries the mode without widening the tool signature, and is
+#: A ContextVar carries the decision without widening the tool signature, and is
 #: correct under threads because each thread gets its own value.
+#:
+#: What is published is the *resolved* decision — ``"always"`` or ``"off"`` —
+#: never ``"sample"``.  A sample counter cannot travel down this channel: the
+#: inner stage is an ``lru_cache``d singleton, so it must not own per-record
+#: mutable state, and the per-record view of it that ``_run`` takes starts its
+#: own counter at zero and would therefore never reach ``SAMPLE_LIMIT``.
+#: Resolving first sidesteps both problems.  The outer stage samples its first
+#: ``SAMPLE_LIMIT`` records; the inner program runs exactly once per outer
+#: record, so inheriting the outer decision gives it the identical window a
+#: directly-constructed ``sample`` stage would have had.
 _ACTIVE_VALIDATE: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "datapipe_active_validate", default="always"
 )
 
 
 def active_validate_mode() -> str:
-    """Return the validation mode of the innermost running stage."""
+    """Return the innermost running stage's decision for the current record."""
     return _ACTIVE_VALIDATE.get()
+
+
+#: The ``WorkerContext`` of the enclosing ``process()`` call, published on the
+#: same terms as ``_ACTIVE_VALIDATE`` and for the same reason: a desugared
+#: inner program is invoked from inside a tool function, which has no access to
+#: the runtime.  Without it, an error raised inside ``nest``/``unnest`` reports
+#: ``record ?`` where the equivalent symbolic statement reports ``record 42``.
+_ACTIVE_CONTEXT: "contextvars.ContextVar[WorkerContext | None]" = (
+    contextvars.ContextVar("datapipe_active_context", default=None)
+)
+
+
+def active_worker_context() -> "WorkerContext | None":
+    """Return the ``WorkerContext`` of the innermost running stage, if any."""
+    return _ACTIVE_CONTEXT.get()
 
 
 class CompiledToolProgramStage(Stage):
@@ -161,13 +186,16 @@ class CompiledToolProgramStage(Stage):
 
     def process(self, value: Any, ctx: WorkerContext) -> Any:
         """Execute all invocations in sequence against *value*."""
-        token = _ACTIVE_VALIDATE.set(self._validate)
+        checking = self._begin_record()
+        token = _ACTIVE_VALIDATE.set("always" if checking else "off")
+        ctx_token = _ACTIVE_CONTEXT.set(ctx)
         try:
-            return self._process(value, ctx)
+            return self._process(value, ctx, checking)
         finally:
+            _ACTIVE_CONTEXT.reset(ctx_token)
             _ACTIVE_VALIDATE.reset(token)
 
-    def _process(self, value: Any, ctx: WorkerContext) -> Any:
+    def _process(self, value: Any, ctx: WorkerContext, checking: bool) -> Any:
         # Lazy resolution: if setup() was not called (e.g. sequential executor
         # or direct stage usage in tests), resolve on the first process() call.
         if len(self._resolved_fns) < len(self._compiled.invocations):
@@ -175,10 +203,6 @@ class CompiledToolProgramStage(Stage):
 
         record = value
         record_seq = ctx.record_index if ctx is not None else None
-
-        checking = self._should_validate_record()
-        if checking:
-            self._validated_records += 1
 
         for inv in self._compiled.invocations:
             tool_fn = self._resolved_fns[inv.expression_index]
@@ -257,6 +281,18 @@ class CompiledToolProgramStage(Stage):
         return record
 
     # -- internals ---------------------------------------------------------
+
+    def _begin_record(self) -> bool:
+        """Decide whether contract checks apply to the record about to run.
+
+        Consumes one slot of the ``sample`` window when it returns True.  Kept
+        separate from ``_should_validate_record`` so the decision is made once,
+        before anything runs, and can be published to nested programs.
+        """
+        checking = self._should_validate_record()
+        if checking:
+            self._validated_records += 1
+        return checking
 
     def _should_validate_record(self) -> bool:
         """Return True when contract checks apply to the current record."""
@@ -559,13 +595,16 @@ class CompiledProgramStage(Stage):
         writes the (optionally transformed) value, and — for a move — removes
         the source only once the write has succeeded.
         """
-        token = _ACTIVE_VALIDATE.set(self._validate)
+        checking = self._begin_record()
+        token = _ACTIVE_VALIDATE.set("always" if checking else "off")
+        ctx_token = _ACTIVE_CONTEXT.set(ctx)
         try:
-            return self._process(value, ctx)
+            return self._process(value, ctx, checking)
         finally:
+            _ACTIVE_CONTEXT.reset(ctx_token)
             _ACTIVE_VALIDATE.reset(token)
 
-    def _process(self, value: Any, ctx: WorkerContext) -> Any:
+    def _process(self, value: Any, ctx: WorkerContext, checking: bool) -> Any:
         from datapipe.dsl.compiler import CompiledAssignment, CompiledMoveInto
 
         if len(self._resolved_fns) < self._expected_fn_count():
@@ -573,10 +612,6 @@ class CompiledProgramStage(Stage):
 
         record = value
         record_seq = ctx.record_index if ctx is not None else None
-
-        checking = self._should_validate_record()
-        if checking:
-            self._validated_records += 1
 
         for stmt_index, stmt in enumerate(self._compiled.statements):
             if isinstance(stmt.operation, CompiledAssignment):
@@ -1371,6 +1406,16 @@ class CompiledProgramStage(Stage):
             actual_type=actual_name,
             stage=stage,
         )
+
+    def _begin_record(self) -> bool:
+        """Decide, once, whether the record about to run is validated.
+
+        See ``CompiledToolProgramStage._begin_record``.
+        """
+        checking = self._should_validate_record()
+        if checking:
+            self._validated_records += 1
+        return checking
 
     def _should_validate_record(self) -> bool:
         if self._validate == "always":

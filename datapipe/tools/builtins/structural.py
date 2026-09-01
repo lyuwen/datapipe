@@ -311,20 +311,38 @@ def _detached(value: Any) -> Any:
     return _s3_detached(value)
 
 
+def _lexes_as_field(key: str) -> bool:
+    """Whether ``.key`` would lex as a bare ``Field`` part.
+
+    Mirrors the identifier rule in ``datapipe/dsl/lexer.py`` — leading
+    ``isalpha()`` or ``_``, then ``isalnum()`` or ``_`` — rather than using
+    ``str.isidentifier()``, which accepts a slightly different unicode set.
+    """
+    if not key or not (key[0].isalpha() or key[0] == "_"):
+        return False
+    return all(c.isalnum() or c == "_" for c in key[1:])
+
+
 def _key_selector(*keys: str) -> Any:
     """Build a selector AST for *keys*.
 
-    Quoted-key parts are used rather than ``.field`` parts because a
-    configured key is an arbitrary string, not necessarily an identifier;
-    both canonicalize to the same path, so the compiled selector is identical.
+    A key that would lex as a bare field becomes a ``Field`` part so
+    diagnostics render ``.m`` exactly as the symbolic form does; anything else
+    falls back to a quoted key, which is the only form that can carry an
+    arbitrary string.  Both canonicalize to the same path, so the compiled
+    selector is identical either way — the choice only affects display.
     """
     from datapipe.dsl import ast as _ast
     from datapipe.dsl.errors import Span
 
     span = Span(0, 0)
-    return _ast.Selector(
-        parts=tuple(_ast.QuotedKey(key=k, span=span) for k in keys), span=span
+    parts = tuple(
+        _ast.Field(name=k, span=span)
+        if _lexes_as_field(k)
+        else _ast.QuotedKey(key=k, span=span)
+        for k in keys
     )
+    return _ast.Selector(parts=parts, span=span)
 
 
 def _move_into_statement(
@@ -393,8 +411,8 @@ def _bare_pipe(fn: Any, index: int) -> Any:
 def _stage(statements: tuple, source: str) -> Any:
     """Wrap compiled statements in the executing stage.
 
-    Built at ``validate="always"``; the effective mode is applied per call by
-    ``_run`` so one cached stage serves every mode.
+    Built at ``validate="always"``; the effective decision is applied per call
+    by ``_run`` so one cached stage serves every mode.
     """
     from datapipe.dsl.compiler import CompiledProgram
     from datapipe.stages.tool_program import CompiledProgramStage
@@ -405,20 +423,35 @@ def _stage(statements: tuple, source: str) -> Any:
 
 
 def _run(stage: Any, record: Any) -> Any:
-    """Execute *stage* under the validation mode of the enclosing stage.
+    """Execute *stage* under the enclosing stage's decision for this record.
 
     A ``target="record"`` tool is handed only its record, so the outer
     ``--validate`` mode reaches these desugared inner programs through the
-    ``_ACTIVE_VALIDATE`` ContextVar rather than through the signature.  The
-    stage itself is cached and shared, so the mode is applied to a cheap
-    per-call view of it instead of by rebuilding the stage.
+    ``_ACTIVE_VALIDATE`` ContextVar rather than through the signature.
+
+    What the ContextVar carries is already resolved to ``"always"`` or
+    ``"off"`` — the outer stage decides per record and publishes the outcome,
+    so a ``sample`` run turns the inner program off once the outer window
+    closes.  The inner stage must not do its own counting: it is
+    ``lru_cache``d and shared, so per-record mutable state on it would leak
+    across records, and the cheap per-call view ``with_validate`` returns
+    starts a fresh counter that would never reach ``SAMPLE_LIMIT``.  Because
+    the inner program runs exactly once per outer record, inheriting the
+    outer decision reproduces the outer sampling window precisely.
+
+    The enclosing ``WorkerContext`` travels the same way, so a failure inside
+    the desugared program attributes itself to the same record number the
+    equivalent symbolic statement would report instead of ``record ?``.
     """
-    from datapipe.stages.tool_program import active_validate_mode
+    from datapipe.stages.tool_program import (
+        active_validate_mode,
+        active_worker_context,
+    )
 
     mode = active_validate_mode()
     if mode != stage.validate:
         stage = stage.with_validate(mode)
-    return stage.process(record, None)
+    return stage.process(record, active_worker_context())
 
 
 # The desugared program depends only on the configuration, never on the record,

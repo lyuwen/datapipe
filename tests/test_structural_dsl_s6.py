@@ -9,6 +9,7 @@ rather than being discovered by a reader.
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import json
 import re
@@ -27,6 +28,7 @@ from datapipe.cli.transform import (
 from datapipe.dsl.compiler import CompiledProgram
 from datapipe.dsl.errors import ExpressionSyntaxError
 from datapipe.stages.tool_program import (
+    SAMPLE_LIMIT,
     CompiledProgramStage,
     CompiledToolProgramStage,
 )
@@ -631,6 +633,227 @@ def test_with_validate_shares_resolution_and_resets_the_sample_counter():
     assert stage.validate == "sample"
     assert clone._resolved_fns is stage._resolved_fns
     assert clone._validated_records == 0
+
+
+def _matches_calls(expression: str, validate: str, records: int):
+    """Count contract checks in the outer stage vs. the desugared inner program.
+
+    Depth is what separates them: the outer stage is at depth 1, anything a
+    desugared tool runs is deeper.  Counting the real ``matches()`` calls
+    rather than the sampling decision is the point — a stage can decide to
+    sample and still pay full cost if the decision never reaches the work.
+    """
+    import datapipe.stages.tool_program as tool_program
+    from datapipe.dsl.compiler import compile_program
+
+    counts = {"outer": 0, "inner": 0}
+    depth = {"d": 0}
+    real_matches = tool_program.matches
+    real_process = CompiledProgramStage._process
+
+    def counting_matches(value, spec):
+        counts["outer" if depth["d"] <= 1 else "inner"] += 1
+        return real_matches(value, spec)
+
+    def depth_tracking_process(self, *args, **kwargs):
+        depth["d"] += 1
+        try:
+            return real_process(self, *args, **kwargs)
+        finally:
+            depth["d"] -= 1
+
+    tool_program.matches = counting_matches
+    CompiledProgramStage._process = depth_tracking_process
+    try:
+        stage = CompiledProgramStage(compile_program(expression), validate=validate)
+        for i in range(records):
+            stage.process({"instance_id": f"i{i}", "a": 1, "b": 2}, None)
+    finally:
+        tool_program.matches = real_matches
+        CompiledProgramStage._process = real_process
+    return counts
+
+
+NEST_EXPRESSION = 'nest(., key="m", exclude=["instance_id"], jsonify=true)'
+
+
+def test_sample_mode_actually_samples_inside_the_desugared_program():
+    """S7 finding: `sample` used to cost exactly as much as `always` in here.
+
+    The inner program is an lru_cached singleton, so it cannot own a sample
+    counter, and the per-record view `_run` takes of it starts a fresh counter
+    that never reaches SAMPLE_LIMIT.  The fix resolves the decision in the
+    outer stage and publishes the outcome, so this asserts on the work done,
+    not on the mode a stage reports.
+    """
+    records = SAMPLE_LIMIT * 3
+    always = _matches_calls(NEST_EXPRESSION, "always", records)
+    sample = _matches_calls(NEST_EXPRESSION, "sample", records)
+    off = _matches_calls(NEST_EXPRESSION, "off", records)
+
+    # The inner program is reached at all, so the counts mean something.
+    assert always["inner"] > 0
+
+    # Sampling caps the inner program on the same window as the outer stage.
+    assert sample["inner"] < always["inner"]
+    assert sample["inner"] == always["inner"] // 3
+    assert sample["inner"] / sample["outer"] == always["inner"] / always["outer"]
+
+    # `always` and `off` are unchanged: everything, and nothing.
+    assert off == {"outer": 0, "inner": 0}
+
+
+def test_sample_window_inside_the_desugared_program_is_the_first_records():
+    """Sampling is a prefix, not a sparse sample — and it closes exactly once."""
+    first = _matches_calls(NEST_EXPRESSION, "sample", SAMPLE_LIMIT)
+    beyond = _matches_calls(NEST_EXPRESSION, "sample", SAMPLE_LIMIT * 2)
+
+    assert first["inner"] > 0
+    assert beyond["inner"] == first["inner"]
+
+
+def test_cached_inner_stage_owns_no_sampling_state():
+    """The reason the counter cannot simply live on the inner stage.
+
+    ``_nest_program`` is lru_cached, so every outer stage in the process shares
+    one inner stage object.  If that object owned the sample window, the second
+    outer stage below would find the window already closed and would validate
+    nothing.  Each outer stage must get its own full window.
+    """
+    from datapipe.tools.builtins.structural import _nest_program
+
+    first = _matches_calls(NEST_EXPRESSION, "sample", SAMPLE_LIMIT)
+    second = _matches_calls(NEST_EXPRESSION, "sample", SAMPLE_LIMIT)
+
+    assert first["inner"] > 0
+    assert second == first
+
+    # The shared stage is never switched into sampling mode itself.
+    assert _nest_program("m", ("instance_id",), True, True).validate == "always"
+
+
+def test_each_thread_carries_its_own_validation_decision():
+    """The channel is a ContextVar, so threads must not share the decision.
+
+    Counting ``matches()`` here would mean patching module globals from several
+    threads at once, which measures the harness rather than the product.  What
+    matters is the property underneath: one thread publishing a decision must
+    not be visible to another, and a thread that never publishes sees the
+    default rather than a neighbour's value.
+    """
+    import threading
+
+    from datapipe.stages.tool_program import _ACTIVE_VALIDATE, active_validate_mode
+
+    entered = threading.Event()
+    release = threading.Event()
+    observed: dict[str, str] = {}
+
+    def holder() -> None:
+        token = _ACTIVE_VALIDATE.set("off")
+        try:
+            entered.set()
+            release.wait(timeout=5)
+            observed["holder"] = active_validate_mode()
+        finally:
+            _ACTIVE_VALIDATE.reset(token)
+
+    def observer() -> None:
+        entered.wait(timeout=5)
+        observed["observer"] = active_validate_mode()
+        release.set()
+
+    threads = [threading.Thread(target=holder), threading.Thread(target=observer)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert observed["holder"] == "off"
+    assert observed["observer"] == "always"
+
+
+def test_threaded_execution_samples_and_keeps_results_identical():
+    """Sampling is a cost decision, so threads must agree on the output."""
+    from datapipe.dsl.compiler import compile_program
+
+    records = [{"instance_id": f"i{i}", "a": 1, "b": 2} for i in range(SAMPLE_LIMIT * 2)]
+    expected = [
+        CompiledProgramStage(
+            compile_program(NEST_EXPRESSION), validate="always"
+        ).process(copy.deepcopy(r), None)
+        for r in records
+    ]
+
+    stage = CompiledProgramStage(compile_program(NEST_EXPRESSION), validate="sample")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        actual = list(
+            pool.map(lambda r: stage.process(copy.deepcopy(r), None), records)
+        )
+
+    assert actual == expected
+    # The window is shared by the one stage the threads share, and it closed.
+    assert stage._validated_records == SAMPLE_LIMIT
+
+
+def _nested_failure(expression: str, record: dict, record_index: int):
+    """Run *expression* to failure and return the exception."""
+    from datapipe.context import WorkerContext
+    from datapipe.dsl.compiler import compile_program
+
+    ctx = WorkerContext(
+        rank=0, world_size=1, worker_id=0, local_rank=0, record_index=record_index
+    )
+    stage = CompiledProgramStage(compile_program(expression))
+    with pytest.raises(Exception) as excinfo:
+        stage.process(copy.deepcopy(record), ctx)
+    return excinfo.value
+
+
+def test_desugared_failure_attributes_the_real_record_number():
+    """S7 finding B: the inner program used to be handed a None context."""
+    record = {"a": 1, "m": {"a": 9}}
+    sugar = _nested_failure('nest(., key="m", include=["a"])', record, 42)
+    symbolic = _nested_failure(".m << .(a)", record, 42)
+
+    # The outer error always carried the right number; the nested cause is
+    # what used to render "record ?".
+    assert sugar.record_seq == 42
+    assert "record 42 failed in move-into" in str(sugar.__cause__)
+    assert "record ?" not in str(sugar.__cause__)
+
+    # The nested cause now reads exactly as the symbolic form's error does.
+    assert str(sugar.__cause__) == str(symbolic)
+
+
+def test_desugared_selector_renders_like_the_symbolic_form():
+    """An identifier key renders `.m`, not `.["m"]`; other keys stay quoted."""
+    identifier = _nested_failure(
+        'unnest(., key="m", include=["a"], parse=true)', {"other": 1}, 7
+    )
+    assert identifier.selector == ".m"
+
+    # A key that cannot lex as a bare field has no unquoted spelling.
+    quoted = _nested_failure(
+        'unnest(., key="m-x", include=["a"], parse=true)', {"other": 1}, 7
+    )
+    assert quoted.selector == '.["m-x"]'
+
+
+def test_key_selector_matches_what_the_parser_would_build():
+    """The Field/QuotedKey choice must track the lexer, not str.isidentifier."""
+    from datapipe.dsl import ast as _ast
+    from datapipe.dsl.parser import parse_program
+    from datapipe.tools.builtins.structural import _key_selector
+
+    for key in ("m", "meta_data", "a1", "_x", "true"):
+        built = _key_selector(key).parts[0]
+        parsed = parse_program(f".{key} << .(^z)").statements[0]
+        assert isinstance(built, _ast.Field)
+        assert built.name == parsed.operation.destination.parts[0].name
+
+    for key in ("9a", "a-b", "a b", "", "a.b"):
+        assert isinstance(_key_selector(key).parts[0], _ast.QuotedKey)
 
 
 def test_structural_module_documents_its_degenerate_cases():

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from datapipe.dsl.parser import parse, parse_program
 from datapipe.dsl.ast import Expression, Program
 
@@ -79,18 +77,23 @@ def test_7_7_struct_merge_complement():
 
 
 # ---------------------------------------------------------------------------
-# §7.8  `nest()` built-in — syntax is already valid; tool not yet registered
+# §7.8  `nest()` built-in — registered since S5
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="nest/unnest tools not yet registered; expression cannot be compiled",
-)
-def test_7_8_nest_builtin_unregistered():
-    result = parse(
+def test_7_8_nest_builtin():
+    expression = (
         'nest(., key="metadata", exclude=["instance_id","messages","tools"], jsonify=true)'
     )
-    assert result is not None
+
+    legacy = parse(expression)
+    assert isinstance(legacy, Expression)
+    assert len(legacy.invocations) == 1
+    assert legacy.invocations[0].qualified_name.name == "nest"
+
+    program = parse_program(expression)
+    assert isinstance(program, Program)
+    assert len(program.statements) == 1
+    assert program.statements[0].operation.qualified_name.name == "nest"
 
 
 # ---------------------------------------------------------------------------
