@@ -394,6 +394,7 @@ def describe_compiled(compiled, expression: str, *, validate: str = "always") ->
 def _print_compiled(compiled, expression: str, *, validate: str = "always") -> None:
     """Print a human-readable description of the compiled expression."""
     doc = describe_compiled(compiled, expression, validate=validate)
+    print("expression-language: 1  (structural extensions: planned, not yet active)")
     print(f"Expression: {doc['expression']}")
     print(f"Invocations: {len(doc['invocations'])}")
     for inv in doc["invocations"]:
