@@ -22,6 +22,7 @@ boundary.
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -724,7 +725,7 @@ def compile_expression(expression: str) -> CompiledExpression:
         for inv in invocations
     ):
         suggested = "; ".join(
-            f"{inv.tool_name}({inv.selector.render()})"
+            f"{inv.tool_name}({_render_invocation_args(inv)})"
             for inv in invocations
         )
         warnings.warn(
@@ -740,6 +741,24 @@ def compile_expression(expression: str) -> CompiledExpression:
         invocations=tuple(invocations),
         source=expression,
     )
+
+
+def _render_invocation_args(inv: "ToolInvocation") -> str:
+    """Render an invocation's selector plus any non-default arguments.
+
+    The migration suggestion must be a drop-in replacement for the legacy
+    expression.  Rendering only the selector silently dropped configuration:
+    ``fromjson(.a, recursive=true)`` was suggested as ``fromjson(.a)``, which
+    compiles but does not decode nested payloads, so following the advice
+    changed the output.
+    """
+    parts = [inv.selector.render()]
+    defaults = {p.name: p.default for p in inv.contract.parameters}
+    for name, value in inv.arguments.items():
+        if name in defaults and defaults[name] == value:
+            continue
+        parts.append(f"{name}={json.dumps(value)}")
+    return ", ".join(parts)
 
 
 # ---------------------------------------------------------------------------

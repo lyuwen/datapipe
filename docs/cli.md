@@ -471,6 +471,21 @@ is simply nothing to exclude.
 A trailing `| tojson` binds to the **whole** move-into, not to the last source,
 so it serializes the assembled destination object.
 
+Bare tools after `<<` chain, each transforming the result of the previous one.
+The destination stays the focus for the whole chain, and the record that is
+emitted is still the complete root record:
+
+```bash
+datapipe transform \
+  '.metadata << .(^instance_id|messages) | tojson | fromjson' \
+  in.jsonl out.jsonl
+```
+
+```json
+{"instance_id": "i1", "messages": [{"role": "user"}], "temperature": 0.7, "score": 9}
+{"instance_id": "i1", "messages": [{"role": "user"}], "metadata": {"temperature": 0.7, "score": 9}}
+```
+
 Field sets work in the other direction too. The base can be nested and the
 destination the root, which is how you lift fields out of a metadata object:
 
