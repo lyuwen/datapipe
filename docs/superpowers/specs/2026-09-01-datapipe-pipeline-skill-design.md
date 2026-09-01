@@ -7,19 +7,21 @@
 
 ## Overview
 
-Two skills delivered as a project-scoped Claude Code plugin (`.claude-plugin/` at repo root):
+Two skills delivered as a project-scoped plugin — skills live in `.claude/skills/` for project scope, and a `plugin.json` manifest is included so the plugin can also be installed user-wide:
 
 1. **`build-pipeline`** — interactively scaffold a datapipe pipeline and write it to disk as either a shell script or a Python file, with optional run/test on demand.
 2. **`sync-knowledge`** — regenerate the `datapipe-knowledge.md` reference file by reading current source and architecture docs. Run this whenever the codebase evolves.
 
 ---
 
-## Plugin layout
+## Layout
+
+Project-scoped skills are in `.claude/skills/`. The plugin manifest at `.claude-plugin/plugin.json` (repo root) enables user-scope installation via `claude plugin install`.
+
 
 ```
-.claude-plugin/
-├── plugin.json
-└── skills/
+
+.claude/skills/
     ├── build-pipeline/
     │   ├── SKILL.md                      ← procedure + YAML frontmatter
     │   └── references/
@@ -114,7 +116,7 @@ Regenerate `datapipe-knowledge.md` from current source so `build-pipeline` alway
    - Key invariants (verbatim list, kept short)
    - Common anti-patterns to avoid
    - DSL expression syntax and `datapipe transform` flags
-4. Write the file to `.claude-plugin/skills/build-pipeline/references/datapipe-knowledge.md`.
+4. Write the file to `.claude/skills/build-pipeline/references/datapipe-knowledge.md`.
 5. Report a brief summary of what changed since the last version.
 
 ### When to run
