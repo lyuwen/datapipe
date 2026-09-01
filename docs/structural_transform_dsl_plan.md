@@ -449,11 +449,17 @@ it produces:
 ```json
 {
   "instance_id": "abc",
+  "metadata": "{\"annotation\":\"good\"}",
   "temperature": 0.7,
-  "score": 0.9,
-  "metadata": "{\"annotation\":\"good\"}"
+  "score": 0.9
 }
 ```
+
+Extracted keys are appended after the retained source object, because the
+desugaring below moves them out of `.metadata` and into the root in source
+object order. §15.4 makes byte-identity with that desugaring normative, so the
+key order shown here follows it rather than the reading order of the `include`
+list.
 
 It is convenience sugar for:
 
