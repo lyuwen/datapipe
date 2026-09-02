@@ -474,7 +474,7 @@ unnest(record, *, key="metadata", include=None, exclude=None, parse=False,
 ```
 nest(., key=K, include=[f1,f2])   ≡  .K << .(f1|f2)
 nest(., key=K, exclude=[a,b])     ≡  .K << .(^a|b)
-nest(., key=K, jsonify=true)      ≡  .K << .(^) | tojson
+nest(., key=K, jsonify=true)      ≡  .K << .(<every other field>) | tojson
 unnest(., key=K, include=[x])     ≡  . << .K.(x)
 unnest(., key=K, exclude=[x])     ≡  . << .K.(^x)
 unnest(., key=K, parse=true, jsonify=true, include=[x])
