@@ -245,6 +245,34 @@ def unnest(
 # ---------------------------------------------------------------------------
 
 
+def validate_configuration(
+    *,
+    include: "list | None",
+    exclude: "list | None",
+    collision: str = "error",
+    missing: str = "error",
+    tool_name: str,
+) -> None:
+    """Check a ``nest``/``unnest`` configuration without running the tool.
+
+    The compiler calls this so an invalid configuration is rejected before the
+    source opens, instead of failing once per record -- which under
+    ``--errors skip`` dropped every record and still exited 0.
+
+    It deliberately reuses ``_selection`` and ``_check_policy``, the same
+    validators the tool bodies call, so the compile-time and runtime answers
+    cannot diverge.  They previously did: a hand-written copy in the compiler
+    read an empty list as "supplied" and rejected ``include=[], exclude=["id"]``
+    that the direct call accepts.
+
+    Raises ``ValueError`` (or ``TypeError`` for a non-sequence) exactly as the
+    tool body would; the caller translates that into its own error type.
+    """
+    _check_policy("collision", collision, _COLLISION_POLICIES, tool_name)
+    _check_policy("missing", missing, _MISSING_POLICIES, tool_name)
+    _selection(include, exclude, tool_name)
+
+
 def _selection(
     include: "list | None", exclude: "list | None", tool_name: str
 ) -> "tuple[tuple[str, ...], bool]":

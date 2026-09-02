@@ -714,7 +714,7 @@ def compile_expression(expression: str) -> CompiledExpression:
 
         selector = _compile_selector(inv_node.selector, contract, expression)
         arguments = _bind_arguments(
-            inv_node.arguments, contract, expression, inv_node.span
+            inv_node.arguments, contract, expression, inv_node.span, tool_fn
         )
 
         # Built-in callables live in a real importable module and pickle fine.
@@ -878,7 +878,8 @@ def compile_program(expression: str) -> CompiledProgram:
             chain_out = (bare_contract.name, bare_contract.output_type)
 
             bare_args = _bind_arguments(
-                bare_node.arguments, bare_contract, expression, bare_node.span
+                bare_node.arguments, bare_contract, expression, bare_node.span,
+                bare_fn,
             )
             pipes.append(CompiledBareCall(
                 expression_index=index,
@@ -933,7 +934,7 @@ def _compile_tool_operation(
 
     selector = _compile_selector(selector_node, contract, expression)
     arguments = _bind_arguments(
-        op_node.arguments, contract, expression, op_node.span
+        op_node.arguments, contract, expression, op_node.span, tool_fn
     )
 
     operation = ToolInvocation(
@@ -1019,7 +1020,7 @@ def _compile_assignment(
             contract=contract,
             selector=_compile_selector(node.rhs.source, contract, expression),
             arguments=_bind_arguments(
-                inv_node.arguments, contract, expression, inv_node.span
+                inv_node.arguments, contract, expression, inv_node.span, tool_fn
             ),
             expression_index=index,
             expression_span=(inv_node.span.start, inv_node.span.end),
@@ -1593,11 +1594,49 @@ def _reject_non_root_record_target(
     )
 
 
+def _validate_structural_config(
+    tool_fn: Callable,
+    contract: ToolContract,
+    bound: dict[str, Any],
+    expression: str,
+    span: Span,
+) -> None:
+    """Statically check ``nest``/``unnest`` configuration, if *tool_fn* is one.
+
+    Identity, not name: ``contract.name`` carries no namespace, so a provider
+    tool named ``nest`` is indistinguishable from the built-in by name alone
+    and would otherwise inherit rules that do not apply to it.
+
+    The rules themselves come from the tool module's own validators, so there
+    is exactly one definition of valid configuration.  Re-deriving them here
+    is what previously let the compiler and the runtime disagree about whether
+    an empty list counts as "supplied".
+    """
+    from datapipe.tools.builtins import structural as _structural
+
+    if tool_fn is not _structural.nest and tool_fn is not _structural.unnest:
+        return
+
+    try:
+        _structural.validate_configuration(
+            include=bound.get("include"),
+            exclude=bound.get("exclude"),
+            collision=bound.get("collision", "error"),
+            missing=bound.get("missing", "error"),
+            tool_name=contract.name,
+        )
+    except (ValueError, TypeError) as exc:
+        raise ToolConfigurationError(
+            str(exc), expression=expression, span=span
+        ) from exc
+
+
 def _bind_arguments(
     arg_nodes: "tuple[_ast.Argument, ...]",
     contract: ToolContract,
     expression: str,
     _invocation_span: Span,
+    tool_fn: "Callable | None" = None,
 ) -> dict[str, Any]:
     """Bind expression arguments to the contract's ParameterSpec list.
 
@@ -1636,32 +1675,28 @@ def _bind_arguments(
         _validate_argument_type(value, param, contract.name, expression, arg.span)
         bound[arg.name] = value
 
-    # Cross-parameter semantic validation for built-in structural tools.
-    # These constraints are expressed in the tool docstring and enforced at
-    # runtime by _check_policy/_selection in structural.py, but they are also
-    # statically checkable because the argument values are literals.  Moving
-    # the check here surfaces them before the source opens, which is the
-    # invariant the planner requires.
-    if contract.name in ("nest", "unnest"):
-        if bound.get("include") is not None and bound.get("exclude") is not None:
-            raise ToolConfigurationError(
-                f"arguments 'include' and 'exclude' are mutually exclusive "
-                f"for {contract.name!r}; pass only one",
-                expression=expression,
-                span=_invocation_span,
-            )
-        for arg_name in ("include", "exclude"):
-            value = bound.get(arg_name)
-            if value is not None:
-                bad = [v for v in value if not isinstance(v, str)]
-                if bad:
-                    raise ToolConfigurationError(
-                        f"argument {arg_name!r} for {contract.name!r} must be "
-                        f"a list of field-name strings; got non-string element(s): "
-                        f"{bad[:3]!r}",
-                        expression=expression,
-                        span=_invocation_span,
-                    )
+    # Cross-parameter semantic validation for the built-in structural tools.
+    #
+    # These constraints are statically checkable because the argument values
+    # are literals, so surfacing them here means an invalid configuration fails
+    # before the source opens rather than once per record -- which under
+    # `--errors skip` silently dropped every record and still exited 0.
+    #
+    # Two things this must NOT do, both of which an earlier version got wrong:
+    #
+    # 1. Key on the tool *name*.  `contract.name` carries no namespace, so a
+    #    provider tool legitimately named `nest` would inherit rules written
+    #    for the built-in and fail with an unrelated error.  Identity against
+    #    the actual built-in function objects is the only sound test.
+    # 2. Reimplement the rules.  A second copy drifts from the runtime's, and
+    #    did: it read an empty list as "supplied", so `nest(include=[],
+    #    exclude=["id"])` was rejected by the DSL while the identical direct
+    #    call succeeded.  Delegating to the tool's own validators keeps one
+    #    definition of what valid configuration means.
+    if tool_fn is not None:
+        _validate_structural_config(
+            tool_fn, contract, bound, expression, _invocation_span
+        )
 
     # Fill in defaults for unspecified parameters and validate them.
     for param in contract.parameters:
