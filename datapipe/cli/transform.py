@@ -305,13 +305,21 @@ def _compile_or_report(expression: str):
         finally:
             # Outside the recorder: re-issuing inside it would append to the
             # very list being drained, and the CLI would spin forever.
+            #
+            # Each warning gets exactly ONE visible delivery.  A category the
+            # CLI renders itself is not re-issued, because under `-Wd` or
+            # PYTHONWARNINGS=default the re-issued copy would print again as
+            # Python's file/line form -- the same notice twice, the second one
+            # pointing at this module rather than at anything the user wrote.
+            # Anything the CLI does not render is passed through untouched, so
+            # categories it does not know about still reach the user.
             for entry in caught:
                 if issubclass(entry.category, DeprecationWarning):
                     print(f"warning: {entry.message}", file=sys.stderr)
-            for entry in caught:
-                warnings.warn_explicit(
-                    entry.message, entry.category, entry.filename, entry.lineno
-                )
+                else:
+                    warnings.warn_explicit(
+                        entry.message, entry.category, entry.filename, entry.lineno
+                    )
     except (ExpressionSyntaxError, ToolResolutionError, ToolConfigurationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return None

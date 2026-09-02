@@ -31,7 +31,11 @@ import pytest
 
 from datapipe.cli.transform import _compile_or_report, describe_compiled
 from datapipe.context import WorkerContext
-from datapipe.dsl.compiler import CompiledProgram, compile_program
+from datapipe.dsl.compiler import (
+    CompiledProgram,
+    compile_expression,
+    compile_program,
+)
 from datapipe.execution.process import ProcessExecutor
 from datapipe.execution.sequential import SequentialExecutor
 from datapipe.execution.thread import ThreadExecutor
@@ -421,7 +425,11 @@ def test_criterion_12_legacy_pipe_suggestion_is_a_faithful_rewrite():
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        _compile_or_report(legacy)
+        # The warning is raised by the library compiler, which is where a
+        # caller filtering on the category receives it.  The CLI renders its
+        # own `warning:` line instead of re-raising, so asserting the message
+        # here keeps this criterion pinned to the source of the diagnostic.
+        compile_expression(legacy)
 
     deprecations = [
         w for w in caught if issubclass(w.category, DeprecationWarning)
@@ -445,7 +453,7 @@ def test_criterion_12_suggestion_omits_arguments_left_at_their_defaults():
     """The rewrite stays readable: only non-default arguments are rendered."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        _compile_or_report("fromjson(.a) | fromjson(.b)")
+        compile_expression("fromjson(.a) | fromjson(.b)")
 
     suggested = str(caught[0].message).split("\n")[1].strip()
     assert suggested == "fromjson(.a); fromjson(.b)", suggested

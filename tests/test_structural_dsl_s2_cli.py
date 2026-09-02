@@ -128,10 +128,18 @@ class TestExpressionRouting:
         """Regression guard: the defect made this return None via a parse error."""
         assert _compile_quietly(".metadata | fromjson") is not None
 
-    def test_legacy_pipe_still_warns(self):
-        """The deprecation diagnostic for ``a | b`` survives the routing change."""
+    def test_legacy_pipe_still_warns(self, capsys):
+        """The deprecation diagnostic for ``a | b`` survives the routing change.
+
+        The CLI delivers it as a printed `warning:` line; the library-level
+        ``compile_expression`` still raises the ``DeprecationWarning`` that
+        callers filter on.
+        """
+        _compile_or_report("fromjson(.a) | tojson(.b)")
+        assert "deprecated" in capsys.readouterr().err
+
         with pytest.warns(DeprecationWarning, match="deprecated"):
-            _compile_or_report("fromjson(.a) | tojson(.b)")
+            compile_expression("fromjson(.a) | tojson(.b)")
 
     def test_semicolon_inside_string_stays_on_legacy_path(self):
         """Routing is grammar-driven, not a semicolon-character scan.
@@ -377,13 +385,14 @@ class TestRoutingUnchangedAfterContainmentFix:
             _compile_or_report("fromjson(.a); tojson(.b)"), CompiledProgram
         )
 
-    def test_legacy_invocation_pipe_routes_to_expression_with_warning(self):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            compiled = _compile_or_report("fromjson(.a) | tojson(.b)")
+    def test_legacy_invocation_pipe_routes_to_expression_with_warning(self, capsys):
+        compiled = _compile_or_report("fromjson(.a) | tojson(.b)")
 
         assert isinstance(compiled, CompiledExpression)
-        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+        # The CLI renders the deprecation as its own `warning:` line rather
+        # than re-raising it, so exactly one notice reaches the user whatever
+        # their warning filters are.
+        assert "deprecated" in capsys.readouterr().err
 
     def test_single_invocation_keeps_legacy_expression_shape(self):
         assert isinstance(_compile_or_report("fromjson(.a)"), CompiledExpression)

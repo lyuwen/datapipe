@@ -2,8 +2,10 @@
 
 > **Status:** implemented on `feat/structural-transform-dsl` — §14 phases S0-S7,
 > the §7 catalogue, and the §16 definition of done are all delivered and tested.
-> The one deliberate deferral is the §13.5 legacy-pipe decision recorded below.  
-> **Runtime foundation:** [`parallel_record_pipeline_architecture.md`](parallel_record_pipeline_architecture.md)  
+> The one deliberate deferral is the §13.5 legacy-pipe decision recorded below.
+>
+> **Runtime foundation:** [`parallel_record_pipeline_architecture.md`](parallel_record_pipeline_architecture.md)
+>
 > **CLI and tool foundation:** [`configurable_transform_cli_plan.md`](configurable_transform_cli_plan.md)
 
 ## 1. Purpose
@@ -629,14 +631,30 @@ No source is removed until every precondition succeeds.
 
 ### 8.2 Destination creation
 
-For `<<`, a missing final destination field is created as `{}` when its parent
-exists. Missing intermediate parents remain errors initially.
+All three assignment operators create a missing **final** destination field when
+its parent exists. Missing **intermediate** parents remain errors.
+
+For `<<` the created field is an empty object `{}`, which the move then fills:
 
 ```text
 .metadata << .temperature
 ```
 
 creates `.metadata` when the root exists and no metadata field is present.
+
+For `=` and `<-` the created field simply receives the assigned value, which is
+ordinary assignment semantics — the same as jq and Python — and is what makes
+`.status = "processed"` work against a record that has no `status` yet.
+
+A missing intermediate parent is an error for every operator, so
+`.absent.deep = .b` fails rather than conjuring `.absent`:
+
+| Expression | `{"b": 1}` becomes |
+| --- | --- |
+| `.new = .b` | `{"b": 1, "new": 1}` |
+| `.new <- .b` | `{"new": 1}` |
+| `.new << .b` | `{"new": {"b": 1}}` |
+| `.absent.deep = .b` | error: destination cannot be resolved |
 
 ### 8.3 Destination type
 

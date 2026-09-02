@@ -21,6 +21,7 @@ is exactly what masked the defect.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import warnings
@@ -33,7 +34,7 @@ from datapipe.cli.transform import (
     inspect_expression_command,
     transform_command,
 )
-from datapipe.dsl.compiler import compile_program
+from datapipe.dsl.compiler import compile_expression, compile_program
 from datapipe.execution.process import ProcessExecutor
 from datapipe.execution.sequential import SequentialExecutor
 from datapipe.io.jsonl import JsonlSink, JsonlSource
@@ -337,11 +338,20 @@ def test_cli_stderr_stays_clean_for_the_recommended_form(tmp_path):
     assert "warning:" not in proc.stderr
 
 
-def test_cli_compile_still_re_issues_the_warning_for_library_callers():
-    """Printing to stderr must not consume the warning a caller filters on."""
+def test_library_callers_still_receive_the_filterable_warning():
+    """The CLI's stderr line must not replace the library's warning.
+
+    Was previously asserted against ``_compile_or_report``, which re-issued
+    the captured warning.  That produced *two* visible notices under
+    ``PYTHONWARNINGS=default`` -- the CLI's own line plus Python's file/line
+    form of the same warning, the second pointing into the CLI module rather
+    than at anything the user wrote.  The CLI now renders one notice and does
+    not re-raise; ``compile_expression`` is where a caller filtering on the
+    category actually receives it, and that is unchanged.
+    """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        compiled = _compile_or_report(LEGACY)
+        compiled = compile_expression(LEGACY)
 
     assert compiled is not None
     deprecations = [
@@ -349,6 +359,26 @@ def test_cli_compile_still_re_issues_the_warning_for_library_callers():
     ]
     assert len(deprecations) == 1
     assert "use semicolons" in str(deprecations[0].message)
+
+
+def test_cli_delivers_exactly_one_notice_under_visible_warning_filters():
+    """One visible delivery per compile, whatever the user's filters are.
+
+    Under default filters Python hides ``DeprecationWarning``, so a re-issued
+    copy was invisible and the defect stayed hidden; it only doubled up once a
+    user ran with ``-Wd`` or ``PYTHONWARNINGS=default``.
+    """
+    for env_value in ("", "default", "always"):
+        env = {**os.environ, "PYTHONWARNINGS": env_value}
+        proc = subprocess.run(
+            [sys.executable, "-c", _CLI_MAIN, "inspect-expression", LEGACY],
+            capture_output=True, text=True, env=env,
+        )
+        occurrences = proc.stderr.lower().count("deprecated")
+        assert occurrences == 1, (
+            f"PYTHONWARNINGS={env_value!r}: expected one notice, "
+            f"got {occurrences}\n{proc.stderr}"
+        )
 
 
 def test_cli_compile_of_a_clean_expression_terminates_and_warns_nothing():
