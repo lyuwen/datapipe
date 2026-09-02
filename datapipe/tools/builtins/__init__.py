@@ -6,5 +6,6 @@ mechanisms.
 """
 
 from datapipe.tools.builtins.json import fromjson, tojson
+from datapipe.tools.builtins.structural import nest, unnest
 
-__all__ = ["fromjson", "tojson"]
+__all__ = ["fromjson", "nest", "tojson", "unnest"]

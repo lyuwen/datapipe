@@ -26,6 +26,25 @@ The defining execution property:
 There is no dispatch/gather boundary between stages, and no stage has its own
 worker pool.
 
+## Per-record programs from an expression
+
+The same mental model applies to `datapipe transform`. A transform expression
+*is* a per-record program: `;` sequences mutations of one evolving record, `|`
+keeps transforming the current focused value, and `<<` / `=` / `<-` move values
+between paths. However many statements it has, it compiles to one fused
+per-record program — one dispatch, one gather.
+
+```
+'fromjson(.metadata); . << .metadata.(temperature|score); tojson(.metadata)'
+   -> one worker dispatch
+   -> all three statements, in order, on one record
+   -> one gathered output record
+```
+
+See [cli.md](cli.md#expression-language) for the language, and
+`datapipe inspect-expression EXPR` to see the statements a given expression
+compiles to.
+
 ## The four orthogonal axes
 
 ```

@@ -47,11 +47,16 @@ class Reference:
         The current value at this location.
     path:
         Human-readable path string for diagnostics, e.g. ``.tools[0].name``.
+    path_parts:
+        The same location as a tuple of concrete dict keys and list indices,
+        e.g. ``("tools", 0, "name")``.  Structural statements compare these to
+        detect source/destination overlap that a wildcard hid from the compiler.
     """
     parent: Any          # dict | list | None (root)
     key: "int | str | None"
     value: Any
     path: str
+    path_parts: tuple[str | int, ...] = ()
 
     def replace(self, new_value: Any) -> None:
         """Write *new_value* back to the location described by this reference."""
@@ -98,6 +103,11 @@ class CompiledSelector:
         """True when the selector contains a ``[]`` wildcard part."""
         return any(isinstance(p, _ast.Each) for p in self._parts)
 
+    @property
+    def is_root(self) -> bool:
+        """True when the selector is the bare root selector ``.``."""
+        return self._is_root
+
     def render(self) -> str:
         """Return the original selector text, e.g. ``.tools[].function``.
 
@@ -126,16 +136,16 @@ class CompiledSelector:
         Raises ``SelectorResolutionError`` on missing fields or type mismatches.
         """
         if self._is_root:
-            return [Reference(parent=None, key=None, value=record, path=".")]
+            return [Reference(parent=None, key=None, value=record, path=".", path_parts=())]
 
-        # Iterative descent: maintain a list of (parent, key, value, path)
+        # Iterative descent: maintain a list of (parent, key, value, path, parts)
         # tuples.  Each selector part may expand or filter the list.
-        current: list[tuple[Any, Any, Any, str]] = [(None, None, record, "")]
+        current: list[tuple[Any, Any, Any, str, tuple]] = [(None, None, record, "", ())]
 
         for part in self._parts:
-            next_: list[tuple[Any, Any, Any, str]] = []
+            next_: list[tuple[Any, Any, Any, str, tuple]] = []
 
-            for parent, _key, value, path in current:
+            for parent, _key, value, path, parts in current:
                 if isinstance(part, _ast.Field):
                     if not isinstance(value, dict):
                         raise SelectorResolutionError(
@@ -149,7 +159,10 @@ class CompiledSelector:
                             path=path,
                         )
                     new_path = f"{path}.{part.name}"
-                    next_.append((value, part.name, value[part.name], new_path))
+                    next_.append((
+                        value, part.name, value[part.name],
+                        new_path, parts + (part.name,),
+                    ))
 
                 elif isinstance(part, _ast.QuotedKey):
                     if not isinstance(value, dict):
@@ -164,7 +177,10 @@ class CompiledSelector:
                             path=path,
                         )
                     new_path = f'{path}["{part.key}"]'
-                    next_.append((value, part.key, value[part.key], new_path))
+                    next_.append((
+                        value, part.key, value[part.key],
+                        new_path, parts + (part.key,),
+                    ))
 
                 elif isinstance(part, _ast.Index):
                     if not isinstance(value, list):
@@ -180,7 +196,10 @@ class CompiledSelector:
                             path=path,
                         )
                     new_path = f"{path}[{part.index}]"
-                    next_.append((value, part.index, value[part.index], new_path))
+                    next_.append((
+                        value, part.index, value[part.index],
+                        new_path, parts + (part.index,),
+                    ))
 
                 elif isinstance(part, _ast.Each):
                     if not isinstance(value, list):
@@ -192,13 +211,13 @@ class CompiledSelector:
                     # Empty list → zero matches, which is a success (no-op).
                     for i, item in enumerate(value):
                         new_path = f"{path}[{i}]"
-                        next_.append((value, i, item, new_path))
+                        next_.append((value, i, item, new_path, parts + (i,)))
 
             current = next_
 
         return [
-            Reference(parent=p, key=k, value=v, path=path or ".")
-            for p, k, v, path in current
+            Reference(parent=p, key=k, value=v, path=path or ".", path_parts=parts)
+            for p, k, v, path, parts in current
         ]
 
     def apply(self, record: Any, references: list[Reference], new_values: list[Any]) -> Any:

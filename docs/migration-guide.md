@@ -43,8 +43,174 @@ If you also need to recursively decode nested strings inside `.metadata.annotati
 
 ```bash
 datapipe transform \
-  'fromjson(.tools) | fromjson(.metadata.annotation, recursive=true)' \
+  'fromjson(.tools); fromjson(.metadata.annotation, recursive=true)' \
   input.jsonl output.jsonl
+```
+
+## Metadata nesting and extraction
+
+The workflow the structural language exists for: collapsing a wide record into
+a compact `metadata` object, and pulling fields back out of one.
+
+### Collapsing root fields into a metadata object
+
+Suppose records arrive flat, and everything that is not an identifier or a
+payload should be tucked into a serialized `metadata` string:
+
+```json
+{"instance_id": "i1", "messages": [{"role": "user"}], "temperature": 0.7, "score": 9}
+```
+
+**Before** — this needed either two passes or a custom stage, because no single
+`tool(path)` invocation can move fields between paths:
+
+```python
+from datapipe import Pipeline, GenericStage, ProcessExecutor
+import json
+
+KEEP = {"instance_id", "messages"}
+
+def nest_metadata(record):
+    metadata = {k: v for k, v in record.items() if k not in KEEP}
+    result = {k: record[k] for k in record if k in KEEP}
+    result["metadata"] = json.dumps(metadata, separators=(",", ":"))
+    return result
+
+pipeline = Pipeline([GenericStage(process=nest_metadata, name="nest")])
+pipeline.run(source="in.jsonl", sink="out.jsonl", executor=ProcessExecutor())
+```
+
+**After** — one expression, one pass:
+
+```bash
+datapipe transform '.metadata << .(^instance_id|messages) | tojson' in.jsonl out.jsonl
+```
+
+```json
+{"instance_id": "i1", "messages": [{"role": "user"}], "metadata": "{\"temperature\":0.7,\"score\":9}"}
+```
+
+`^` makes the field set a *complement*: everything except the named fields
+moves. The destination excludes itself automatically, so `.metadata` never ends
+up nested inside itself, and the trailing `| tojson` serializes the assembled
+object rather than the last source.
+
+When the field list comes from config rather than being typed literally, use
+the `nest` tool — same operation, keyword arguments:
+
+```bash
+datapipe transform \
+  'nest(., key="metadata", exclude=["instance_id","messages"], jsonify=true)' \
+  in.jsonl out.jsonl
+```
+
+```json
+{"instance_id": "i1", "messages": [{"role": "user"}], "metadata": "{\"temperature\":0.7,\"score\":9}"}
+```
+
+To nest an explicit list instead of a complement, name the fields positively:
+
+```bash
+datapipe transform '.metadata << .(temperature|score) | tojson' in.jsonl out.jsonl
+```
+
+```json
+{"instance_id": "i1", "temperature": 0.7, "score": 9}
+{"instance_id": "i1", "metadata": "{\"temperature\":0.7,\"score\":9}"}
+```
+
+A positive set is strict — a named field the record lacks is an error, rather
+than being silently skipped.
+
+### Extracting fields back out
+
+Now the other direction: `metadata` is a JSON string and two of its fields need
+to be first-class columns again, with the rest left serialized.
+
+```json
+{"instance_id": "i1", "metadata": "{\"temperature\":0.7,\"score\":9,\"note\":\"keep\"}"}
+```
+
+**Before** — decode, move, re-encode, by hand:
+
+```python
+import json
+
+def extract(record):
+    metadata = json.loads(record["metadata"])
+    for field in ("temperature", "score"):
+        record[field] = metadata.pop(field)
+    record["metadata"] = json.dumps(metadata, separators=(",", ":"))
+    return record
+```
+
+**After** — three statements, one worker pass:
+
+```bash
+datapipe transform \
+  'fromjson(.metadata); . << .metadata.(temperature|score); tojson(.metadata)' \
+  in.jsonl out.jsonl
+```
+
+```json
+{"instance_id": "i1", "metadata": "{\"note\":\"keep\"}", "temperature": 0.7, "score": 9}
+```
+
+Read it as: decode `.metadata` in place; move two of its fields up to the root;
+re-serialize what is left. The `;` separators sequence mutations of the same
+record — nothing is dispatched twice.
+
+The complement works here too, when it is easier to name what should *stay*:
+
+```bash
+datapipe transform \
+  'fromjson(.metadata); . << .metadata.(^note); tojson(.metadata)' \
+  in.jsonl out.jsonl
+```
+
+```json
+{"instance_id": "i1", "metadata": "{\"note\":\"keep\"}", "temperature": 0.7, "score": 9}
+```
+
+And the `unnest` tool packages the whole three-statement shape behind
+`parse`/`jsonify` flags:
+
+```bash
+datapipe transform \
+  'unnest(., key="metadata", include=["temperature"], parse=true, jsonify=true)' \
+  in.jsonl out.jsonl
+```
+
+```json
+{"instance_id": "i1", "metadata": "{\"temperature\":0.7,\"note\":\"keep\"}"}
+{"instance_id": "i1", "metadata": "{\"note\":\"keep\"}", "temperature": 0.7}
+```
+
+To lift a single field, `<-` is more direct than a one-element field set, and
+it can decode on the way:
+
+```bash
+datapipe transform '.temperature <- fromjson(.metadata.temperature)' in.jsonl out.jsonl
+```
+
+```json
+{"id": "i1", "metadata": {"temperature": "0.7"}}
+{"id": "i1", "metadata": {}, "temperature": 0.7}
+```
+
+### Why this is one pass
+
+Every expression above compiles to a single per-record program. A record is
+dispatched to a worker once, every statement runs inside that worker, and the
+result is gathered once — regardless of how many statements, moves, or pipes
+the expression contains. There is no per-statement future and no intermediate
+materialization of the dataset.
+
+Use `datapipe inspect-expression` to confirm what a structural expression will
+do before running it against data:
+
+```bash
+datapipe inspect-expression '.metadata << .(^instance_id|messages) | tojson'
 ```
 
 ## Feature comparison

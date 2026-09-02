@@ -128,6 +128,81 @@ class Invocation:
     span: Span
 
 
+@dataclass(frozen=True)
+class BareToolCall:
+    """A bare tool reference in a focused pipe: just a name, optionally with args.
+
+    Used in ``statement.pipes`` after the base operation establishes a target.
+    The selector is implied by the current focus.
+    """
+    qualified_name: QualifiedName
+    arguments: tuple[Argument, ...]
+    span: Span
+
+
+# ---------------------------------------------------------------------------
+# Assignment nodes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AssignmentRHS:
+    """Right-hand side of an assignment.
+
+    Exactly one of ``source`` and ``literal`` is set, matching the plan §9
+    grammar ``value_expression := path | literal | invocation``:
+
+    - ``source`` is the primary source selector, shared with ``transform``'s
+      own selector when a transform is present.  A move (``<-``) requires it,
+      because there is nothing else to remove.
+    - ``literal`` is a constant right-hand side (``.a = 5``).  It has no path,
+      so it never carries a transform and is rejected for ``<-``.
+    """
+    source: "Selector | None"
+    transform: "Invocation | BareToolCall | None"
+    span: Span
+    literal: "Literal | None" = None
+
+
+@dataclass(frozen=True)
+class Assignment:
+    """``.dest = rhs`` (copy) or ``.dest <- rhs`` (move)."""
+    destination: Selector
+    rhs: AssignmentRHS
+    is_move: bool
+    span: Span
+
+
+# ---------------------------------------------------------------------------
+# Move-into nodes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FieldSet:
+    """``.base.(a|b|c)`` / ``.base.(^a|b|c)`` — a named set of sibling fields.
+
+    ``complement`` inverts the whole parenthesized set: every field of the
+    object at ``base`` *except* ``names``.
+    """
+    base: Selector
+    names: tuple[str, ...]
+    complement: bool
+    span: Span
+
+
+@dataclass(frozen=True)
+class MoveInto:
+    """``.dest << src, src, ...`` — move each source under the destination object.
+
+    Each source contributes one destination key, derived from its final object
+    field name.  A ``FieldSet`` source contributes one key per expanded field.
+    """
+    destination: Selector
+    sources: tuple["Selector | FieldSet", ...]
+    span: Span
+
+
 # ---------------------------------------------------------------------------
 # Top-level expression
 # ---------------------------------------------------------------------------
@@ -137,4 +212,35 @@ class Invocation:
 class Expression:
     """A complete pipeline expression: one or more ``|``-separated invocations."""
     invocations: tuple[Invocation, ...]
+    span: Span
+
+
+@dataclass(frozen=True)
+class Statement:
+    """One record-mutation statement.
+
+    For invocation-first statements (existing form), ``focus_selector`` is None
+    and ``operation`` is an ``Invocation``.
+
+    For selector-first focused statements, ``focus_selector`` is the leading
+    selector, ``operation`` is the first bare tool call, and ``pipes`` has
+    further bare tool calls.
+
+    For assignments, ``operation`` is an ``Assignment`` and ``focus_selector``
+    is the assignment's destination — trailing pipes apply to the value that
+    was just written there.
+
+    For move-intos, ``operation`` is a ``MoveInto`` and ``focus_selector`` is
+    its destination, so a trailing pipe applies to the assembled object.
+    """
+    operation: "Invocation | BareToolCall | Assignment | MoveInto"
+    pipes: "tuple[BareToolCall, ...]"
+    focus_selector: "Selector | None"   # None for invocation-first statements
+    span: Span
+
+
+@dataclass(frozen=True)
+class Program:
+    """A complete multi-statement program: one or more ``;``-separated statements."""
+    statements: tuple[Statement, ...]
     span: Span

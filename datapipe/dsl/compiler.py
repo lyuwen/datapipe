@@ -22,10 +22,14 @@ boundary.
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+import warnings
 
 from datapipe.dsl import ast as _ast
 from datapipe.dsl.errors import (
@@ -33,7 +37,7 @@ from datapipe.dsl.errors import (
     ToolConfigurationError,
     ToolResolutionError,
 )
-from datapipe.dsl.parser import parse
+from datapipe.dsl.parser import parse, parse_program
 from datapipe.dsl.selector import CompiledSelector
 from datapipe.tools.contract import ParameterSpec, ToolContract
 from datapipe.tools.decorator import get_contract
@@ -292,15 +296,18 @@ def _annotation_name(annotation: Any) -> str:
 # ---------------------------------------------------------------------------
 
 # Names that are permanently reserved and cannot be shadowed by providers.
-_BUILTIN_NAMES: frozenset[str] = frozenset({"fromjson", "tojson"})
+_BUILTIN_NAMES: frozenset[str] = frozenset({"fromjson", "tojson", "nest", "unnest"})
 
 
 def _build_builtin_registry() -> dict[str, Callable]:
     """Return the canonical mapping of tool name → function for built-ins."""
     from datapipe.tools.builtins.json import fromjson, tojson
+    from datapipe.tools.builtins.structural import nest, unnest
     return {
         "fromjson": fromjson,
         "tojson": tojson,
+        "nest": nest,
+        "unnest": unnest,
     }
 
 
@@ -575,6 +582,107 @@ class CompiledExpression:
 
 
 # ---------------------------------------------------------------------------
+# Multi-statement program IR (Phase S2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CompiledBareCall:
+    """A resolved bare tool call for use in focused pipe execution."""
+    expression_index: int
+    callable: Callable | None        # None for provider tools
+    descriptor: ToolDescriptor | None  # set for provider tools
+    bound_args: dict[str, Any]
+    span: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class CompiledLiteral:
+    """A constant assignment right-hand side (``.a = 5``).
+
+    Holds the parsed JSON value.  Containers are deep-copied per record at
+    write time, never handed out directly, so no two records — and no record
+    and the compiled program — can ever share one.
+    """
+    value: Any
+
+
+@dataclass(frozen=True)
+class CompiledAssignment:
+    """A compiled ``=`` / ``<-`` statement operation.
+
+    ``dest_parent`` and ``dest_key`` are precomputed for the common case where
+    the destination ends in a field: the parent must already exist, but the
+    final key may be absent (that is what assignment creates).  They are
+    ``None`` when the final part is an index or wildcard, in which case the
+    whole destination selector is resolved instead.
+
+    ``source`` is ``None`` exactly when ``literal`` is set: a constant
+    right-hand side names no location to read, move, or overlap with.
+    """
+    destination: CompiledSelector
+    source: CompiledSelector | None
+    transform: "ToolInvocation | CompiledBareCall | None"
+    is_move: bool
+    span: tuple[int, int]
+    dest_parent: CompiledSelector | None = None
+    dest_key: str | None = None
+    literal: CompiledLiteral | None = None
+
+
+@dataclass(frozen=True)
+class CompiledFieldSet:
+    """A compiled ``.base.(a|b|c)`` / ``.base.(^a|b|c)`` move-into source.
+
+    Expansion happens per record: the named fields (or, for a complement, every
+    other field) are read from the object at ``base`` **in that object's own key
+    order**, which is what fixes the destination key order (§6.4).
+    """
+    base: CompiledSelector
+    names: tuple[str, ...]
+    complement: bool
+    span: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class CompiledMoveInto:
+    """A compiled ``.dest << src, ...`` statement operation.
+
+    ``dest_parent`` / ``dest_key`` are precomputed exactly as for
+    ``CompiledAssignment``: ``<<`` creates a missing final field as ``{}`` when
+    the parent exists (§8.2), so only the parent must already resolve.  They are
+    ``None`` for a root, index, or wildcard destination, which must exist.
+    """
+    destination: CompiledSelector
+    sources: tuple["CompiledSelector | CompiledFieldSet", ...]
+    span: tuple[int, int]
+    dest_parent: CompiledSelector | None = None
+    dest_key: str | None = None
+
+    @property
+    def source(self) -> CompiledSelector:
+        """The first source, for diagnostics that report a single selector."""
+        first = self.sources[0]
+        return first.base if isinstance(first, CompiledFieldSet) else first
+
+
+@dataclass(frozen=True)
+class CompiledStatement:
+    """One compiled statement: a base operation plus optional focused pipes."""
+    operation: "ToolInvocation | CompiledBareCall | CompiledAssignment | CompiledMoveInto"
+    pipes: tuple[CompiledBareCall, ...]
+    focus_selector: CompiledSelector | None  # None for invocation-first
+    span: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class CompiledProgram:
+    """Compiled representation of a multi-statement program."""
+    statements: tuple[CompiledStatement, ...]
+    source: str
+
+
+# ---------------------------------------------------------------------------
 # Compiler entry point
 # ---------------------------------------------------------------------------
 
@@ -606,7 +714,7 @@ def compile_expression(expression: str) -> CompiledExpression:
 
         selector = _compile_selector(inv_node.selector, contract, expression)
         arguments = _bind_arguments(
-            inv_node.arguments, contract, expression, inv_node.span
+            inv_node.arguments, contract, expression, inv_node.span, tool_fn
         )
 
         # Built-in callables live in a real importable module and pickle fine.
@@ -624,12 +732,706 @@ def compile_expression(expression: str) -> CompiledExpression:
             expression_span=(inv_node.span.start, inv_node.span.end),
         ))
 
+    # Legacy | migration diagnostic: warn when multiple explicit-target
+    # invocations are piped together.  This is the deprecated grammar
+    # regardless of whether the selectors are root, wildcard, or named fields.
+    # Single-invocation expressions are silent because there is no | to rewrite.
+    if len(invocations) > 1:
+        suggested = "; ".join(
+            f"{inv.tool_name}({_render_invocation_args(inv)})"
+            for inv in invocations
+        )
+        warnings.warn(
+            f"`|` between explicit record mutations is deprecated; use semicolons:\n"
+            f"  {suggested}",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     _check_static_compatibility(invocations, expression)
 
     return CompiledExpression(
         invocations=tuple(invocations),
         source=expression,
     )
+
+
+def _render_invocation_args(inv: "ToolInvocation") -> str:
+    """Render an invocation's selector plus any non-default arguments.
+
+    The migration suggestion must be a drop-in replacement for the legacy
+    expression.  Rendering only the selector silently dropped configuration:
+    ``fromjson(.a, recursive=true)`` was suggested as ``fromjson(.a)``, which
+    compiles but does not decode nested payloads, so following the advice
+    changed the output.
+    """
+    parts = [inv.selector.render()]
+    defaults = {p.name: p.default for p in inv.contract.parameters}
+    for name, value in inv.arguments.items():
+        if name in defaults and defaults[name] == value:
+            continue
+        parts.append(f"{name}={json.dumps(value)}")
+    return ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Multi-statement program compiler
+# ---------------------------------------------------------------------------
+
+
+def compile_program(expression: str) -> CompiledProgram:
+    """Compile a multi-statement program expression.
+
+    Calls ``parse_program`` then compiles each statement into a
+    ``CompiledStatement``.  Invocation-first statements have
+    ``focus_selector=None``; selector-first focused statements carry the
+    compiled focus selector and use it as the base operation's selector.
+    Assignment statements compile to a ``CompiledAssignment`` whose focus is
+    the destination.
+
+    ``expression_index`` values are unique across every operation, assignment
+    transform, and bare call in the whole program so the executing stage can
+    key resolved callables by index.
+    """
+    program = parse_program(expression)
+    registry = _build_full_registry()
+    statements: list[CompiledStatement] = []
+
+    # Monotonic counter shared by base operations, assignment transforms, and
+    # bare pipe calls so every resolved callable has a distinct key in the
+    # stage's _resolved_fns dict.
+    index = 0
+
+    for stmt in program.statements:
+        op_node = stmt.operation
+
+        if isinstance(op_node, _ast.Assignment):
+            operation, focus, index = _compile_assignment(
+                op_node, registry, expression, index
+            )
+        elif isinstance(op_node, _ast.MoveInto):
+            operation, focus = _compile_move_into(op_node, expression)
+        else:
+            operation, focus, index = _compile_tool_operation(
+                stmt, op_node, registry, expression, index
+            )
+
+        # The location a trailing pipe operates on.  A tool operation feeds
+        # the value at its own selector (invocation-first statements have
+        # focus=None but still target that selector); `=` / `<-` / `<<` feed
+        # the value written to their destination.
+        if isinstance(operation, (CompiledAssignment, CompiledMoveInto)):
+            pipe_focus = operation.destination
+        else:
+            pipe_focus = operation.selector
+
+        # The declared output feeding the first bare call, when one is known.
+        # Structural operations (`<<`, and `=` / `<-` without a transform)
+        # produce no declared type, which leaves the chain unprovable.
+        if isinstance(operation, CompiledAssignment):
+            chain_out = (
+                (operation.transform.tool_name, operation.transform.contract.output_type)
+                if operation.transform is not None
+                else None
+            )
+        elif isinstance(operation, CompiledMoveInto):
+            chain_out = None
+        else:
+            chain_out = (operation.tool_name, operation.contract.output_type)
+
+        # Compile each bare pipe call against the same focus.
+        pipes: list[CompiledBareCall] = []
+        for bare_node in stmt.pipes:
+            bare_fn, bare_desc = _resolve_tool(
+                bare_node.qualified_name, registry, expression
+            )
+            bare_contract = get_contract(bare_fn)
+            if bare_contract is None:
+                raise ToolResolutionError(
+                    f"tool {bare_node.qualified_name.display!r} has no contract; "
+                    "only @tool-decorated functions are supported",
+                    expression=expression,
+                    span=bare_node.qualified_name.span,
+                )
+            # A record-target tool rewrites the whole row, so it is only
+            # meaningful when the focus it is piped into is the root.  The
+            # first operation is checked by _compile_selector; trailing bare
+            # calls carry no selector of their own and are checked here.
+            if bare_contract.target == "record" and not pipe_focus.is_root:
+                _reject_non_root_record_target(
+                    bare_contract, expression, bare_node.span
+                )
+
+            # Within one statement the base operation and its bare calls are
+            # connected by value flow (`new_value = bare(new_value)`), so the
+            # conservative disjointness check applies along the chain.
+            if chain_out is not None:
+                _reject_disjoint_types(
+                    producer_name=chain_out[0],
+                    out_spec=chain_out[1],
+                    consumer_name=bare_contract.name,
+                    in_spec=bare_contract.input_type,
+                    path_label=pipe_focus.render(),
+                    expression=expression,
+                    span=bare_node.span,
+                )
+            chain_out = (bare_contract.name, bare_contract.output_type)
+
+            bare_args = _bind_arguments(
+                bare_node.arguments, bare_contract, expression, bare_node.span,
+                bare_fn,
+            )
+            pipes.append(CompiledBareCall(
+                expression_index=index,
+                callable=bare_fn if bare_desc is None else None,
+                descriptor=bare_desc,
+                bound_args=bare_args,
+                span=(bare_node.span.start, bare_node.span.end),
+            ))
+            index += 1
+
+        statements.append(CompiledStatement(
+            operation=operation,
+            pipes=tuple(pipes),
+            focus_selector=focus,
+            span=(stmt.span.start, stmt.span.end),
+        ))
+
+    # No cross-statement compatibility pass: separate statements operate on
+    # independent selectors with no output-to-input value flow between them,
+    # so nothing there is statically provable.  Within a statement the flow is
+    # explicit, and that chain is checked above as each bare call is compiled.
+    return CompiledProgram(
+        statements=tuple(statements),
+        source=expression,
+    )
+
+
+def _compile_tool_operation(
+    stmt: "_ast.Statement",
+    op_node: "_ast.Invocation | _ast.BareToolCall",
+    registry: dict[str, tuple[Callable, ToolDescriptor | None]],
+    expression: str,
+    index: int,
+) -> tuple[ToolInvocation, CompiledSelector | None, int]:
+    """Compile an invocation-first or focused statement's base operation."""
+    tool_fn, tool_desc = _resolve_tool(op_node.qualified_name, registry, expression)
+    contract = get_contract(tool_fn)
+    if contract is None:
+        raise ToolResolutionError(
+            f"tool {op_node.qualified_name.display!r} has no contract; "
+            "only @tool-decorated functions are supported",
+            expression=expression,
+            span=op_node.qualified_name.span,
+        )
+
+    # Invocation-first statements carry their own selector; focused
+    # statements take the leading focus selector as the operation target.
+    if stmt.focus_selector is None:
+        selector_node = op_node.selector
+    else:
+        selector_node = stmt.focus_selector
+
+    selector = _compile_selector(selector_node, contract, expression)
+    arguments = _bind_arguments(
+        op_node.arguments, contract, expression, op_node.span, tool_fn
+    )
+
+    operation = ToolInvocation(
+        tool_descriptor=tool_desc,
+        builtin_fn=tool_fn if tool_desc is None else None,
+        tool_name=contract.name,
+        contract=contract,
+        selector=selector,
+        arguments=arguments,
+        expression_index=index,
+        expression_span=(op_node.span.start, op_node.span.end),
+    )
+    focus = selector if stmt.focus_selector is not None else None
+    return operation, focus, index + 1
+
+
+def _compile_assignment(
+    node: "_ast.Assignment",
+    registry: dict[str, tuple[Callable, ToolDescriptor | None]],
+    expression: str,
+    index: int,
+) -> tuple[CompiledAssignment, CompiledSelector, int]:
+    """Compile a ``=`` / ``<-`` statement, applying the §12 static rejections."""
+    op_label = "move" if node.is_move else "copy"
+
+    # A literal right-hand side is a constant: it names no location, so there
+    # is nothing for a move to remove.  Same rule as the root-source case
+    # below, reached one step earlier because there is no selector at all.
+    if node.rhs.literal is not None:
+        if node.is_move:
+            raise ToolConfigurationError(
+                f"move (`<-`) requires a statically identifiable source path, "
+                f"but the right-hand side is a literal value with no source to "
+                f"remove; use `=` to assign the constant",
+                expression=expression,
+                span=node.rhs.span,
+            )
+        dest_parent, dest_key = _split_destination(node.destination)
+        operation = CompiledAssignment(
+            destination=CompiledSelector(node.destination),
+            source=None,
+            transform=None,
+            is_move=False,
+            span=(node.span.start, node.span.end),
+            dest_parent=dest_parent,
+            dest_key=dest_key,
+            literal=CompiledLiteral(value=node.rhs.literal.value),
+        )
+        return operation, operation.destination, index
+
+    # A move must have a statically identifiable primary source to delete.
+    # The root selector names no removable field, so it is only ever a
+    # computation — that is a copy, not a move.
+    if node.is_move and node.rhs.source.is_root:
+        raise ToolConfigurationError(
+            f"move (`<-`) requires a statically identifiable source path, but "
+            f"the right-hand side has no source to remove; use `=` to assign "
+            f"the computed value without deleting anything",
+            expression=expression,
+            span=node.rhs.span,
+        )
+
+    _reject_static_overlap(node, expression, op_label)
+
+    transform: ToolInvocation | None = None
+    if node.rhs.transform is not None:
+        inv_node = node.rhs.transform
+        tool_fn, tool_desc = _resolve_tool(
+            inv_node.qualified_name, registry, expression
+        )
+        contract = get_contract(tool_fn)
+        if contract is None:
+            raise ToolResolutionError(
+                f"tool {inv_node.qualified_name.display!r} has no contract; "
+                "only @tool-decorated functions are supported",
+                expression=expression,
+                span=inv_node.qualified_name.span,
+            )
+        transform = ToolInvocation(
+            tool_descriptor=tool_desc,
+            builtin_fn=tool_fn if tool_desc is None else None,
+            tool_name=contract.name,
+            contract=contract,
+            selector=_compile_selector(node.rhs.source, contract, expression),
+            arguments=_bind_arguments(
+                inv_node.arguments, contract, expression, inv_node.span, tool_fn
+            ),
+            expression_index=index,
+            expression_span=(inv_node.span.start, inv_node.span.end),
+        )
+        index += 1
+
+    dest_parent, dest_key = _split_destination(node.destination)
+
+    operation = CompiledAssignment(
+        destination=CompiledSelector(node.destination),
+        source=CompiledSelector(node.rhs.source),
+        transform=transform,
+        is_move=node.is_move,
+        span=(node.span.start, node.span.end),
+        dest_parent=dest_parent,
+        dest_key=dest_key,
+    )
+    return operation, operation.destination, index
+
+
+def _compile_move_into(
+    node: "_ast.MoveInto", expression: str
+) -> tuple[CompiledMoveInto, CompiledSelector]:
+    """Compile a ``<<`` statement, applying the §12 static rejections.
+
+    Rejected here, before any record is read:
+
+    - a source whose key cannot be inferred — an index, a wildcard, or the root
+      (§8.9): ``<<`` derives destination keys from object fields only;
+    - duplicate exact names inside one field set;
+    - two sources that provably derive the same destination key (§8.8);
+    - a statically provable source/destination overlap (§8.8).
+
+    A ``FieldSet`` source contributes keys that are only known per record when
+    it is a complement, so its duplicate and overlap checks are completed at
+    runtime; the positive form is fully static and checked here.
+    """
+    dest_path = _static_path(node.destination)
+
+    # Derived keys that are knowable at compile time, mapped to the source text
+    # that produced them, so a collision names both sides.
+    derived: dict[str, str] = {}
+
+    for source in node.sources:
+        if isinstance(source, _ast.FieldSet):
+            _check_field_set(source, node, expression)
+            base_path = _static_path(source.base)
+            if source.complement:
+                _check_complement_base(dest_path, base_path, source, node, expression)
+                continue
+            # A positive set is fully static: each name is an ordinary source
+            # rooted at the base, so it gets the ordinary key and overlap checks.
+            for name in source.names:
+                rendered = f"{_render_field_set(source)} → {name}"
+                _record_derived_key(derived, name, rendered, node, expression)
+                _check_move_overlap(
+                    dest_path,
+                    None if base_path is None else base_path + (name,),
+                    rendered, node, expression,
+                )
+            continue
+
+        key = _inferred_key(source)
+        if key is None:
+            raise ToolConfigurationError(
+                f"cannot infer a destination key for source "
+                f"{_render_selector(source)!r} in move-into "
+                f"{_render_selector(node.destination)} << ...: `<<` derives the "
+                f"key from a final object field, so an array index, a wildcard, "
+                f"or the root needs an explicit destination "
+                f"(`{_render_selector(node.destination)}.<key> <- "
+                f"{_render_selector(source)}`)",
+                expression=expression,
+                span=source.span,
+            )
+        _record_derived_key(
+            derived, key, _render_selector(source), node, expression
+        )
+        _check_move_overlap(
+            dest_path, _static_path(source), _render_selector(source),
+            node, expression,
+        )
+
+    dest_parent, dest_key = _split_destination(node.destination)
+    operation = CompiledMoveInto(
+        destination=CompiledSelector(node.destination),
+        sources=tuple(_compile_move_source(s) for s in node.sources),
+        span=(node.span.start, node.span.end),
+        dest_parent=dest_parent,
+        dest_key=dest_key,
+    )
+    return operation, operation.destination
+
+
+def _compile_move_source(
+    source: "_ast.Selector | _ast.FieldSet",
+) -> "CompiledSelector | CompiledFieldSet":
+    """Compile one ``<<`` source into its runtime form."""
+    if isinstance(source, _ast.FieldSet):
+        return CompiledFieldSet(
+            base=CompiledSelector(source.base),
+            names=source.names,
+            complement=source.complement,
+            span=(source.span.start, source.span.end),
+        )
+    return CompiledSelector(source)
+
+
+def _inferred_key(source: "_ast.Selector") -> str | None:
+    """Return the destination key ``<<`` derives from *source*, or None (§8.9).
+
+    Only a final object field yields a key.  An index, a wildcard, or the root
+    yields ``None``, which the caller turns into a compile error.  A wildcard
+    anywhere in the path also yields ``None``: it matches many values that would
+    all claim the one derived key.  An index *before* the final field is fine —
+    ``.bag << .items[0].a`` names exactly one value and derives ``a``.
+    """
+    if not source.parts:
+        return None
+    if source.has_wildcard:
+        return None
+    last = source.parts[-1]
+    if isinstance(last, _ast.Field):
+        return last.name
+    if isinstance(last, _ast.QuotedKey):
+        return last.key
+    return None
+
+
+def _record_derived_key(
+    derived: dict[str, str],
+    key: str,
+    rendered: str,
+    node: "_ast.MoveInto",
+    expression: str,
+) -> None:
+    """Register *key* as derived by *rendered*, rejecting a second claim (§8.8)."""
+    previous = derived.get(key)
+    if previous is not None:
+        raise ToolConfigurationError(
+            f"two sources derive the same destination key {key!r} in move-into "
+            f"{_render_selector(node.destination)} << ...: {previous} and "
+            f"{rendered}; `<<` uses collision=\"error\", so give one an explicit "
+            f"destination with `<-`",
+            expression=expression,
+            span=node.span,
+        )
+    derived[key] = rendered
+
+
+def _check_field_set(
+    source: "_ast.FieldSet", node: "_ast.MoveInto", expression: str
+) -> None:
+    """Reject duplicate names inside one field set, and a wildcard base (§12)."""
+    seen: set[str] = set()
+    for name in source.names:
+        if name in seen:
+            raise ToolConfigurationError(
+                f"duplicate field name {name!r} in field set "
+                f"{_render_field_set(source)}",
+                expression=expression,
+                span=source.span,
+            )
+        seen.add(name)
+
+    if source.base.has_wildcard or _static_path(source.base) is None:
+        raise ToolConfigurationError(
+            f"field set {_render_field_set(source)} selects from a wildcard "
+            f"base; a field set must name one object",
+            expression=expression,
+            span=source.span,
+        )
+
+
+def _check_move_overlap(
+    dest_path: "tuple[str | int, ...] | None",
+    src_path: "tuple[str | int, ...] | None",
+    rendered: str,
+    node: "_ast.MoveInto",
+    expression: str,
+) -> None:
+    """Reject a statically provable source/destination overlap for ``<<`` (§8.8).
+
+    ``<<`` desugars to ``dest.<key> <- source``, so the overlap that matters is
+    between the source and that *effective* destination — not between the source
+    and the destination object.  Checking the object itself would reject §6.6's
+    ``. << .metadata.x``, where the destination is legitimately an ancestor of
+    the source.
+    """
+    if dest_path is None or src_path is None:
+        return
+
+    effective = dest_path + (src_path[-1],)
+    detail = overlap_reason(effective, src_path, is_move=True)
+    if detail is None:
+        return
+
+    raise ToolConfigurationError(
+        f"overlapping source and destination in move-into "
+        f"{_render_selector(node.destination)} << {rendered}: {detail}",
+        expression=expression,
+        span=node.span,
+    )
+
+
+def _check_complement_base(
+    dest_path: "tuple[str | int, ...] | None",
+    base_path: "tuple[str | int, ...] | None",
+    source: "_ast.FieldSet",
+    node: "_ast.MoveInto",
+    expression: str,
+) -> None:
+    """Reject a complement whose base *is* the destination (§8.8).
+
+    A complement's members are only known per record, so only the base can be
+    checked statically.  ``.m << .m.(^a)`` is provably wrong for every record —
+    every derived key lands back on the very field it came from — so it is
+    worth a compile error rather than a per-record one.
+
+    Anything else is left to the runtime, which has the record and therefore
+    the complement's actual membership.  Two directions matter:
+
+    - the destination inside the base, as in ``.metadata << .(^instance_id)`` —
+      the intended blanket move, kept safe by the §8.7 self-exclusion;
+    - the base inside the destination, as in §6.6's ``. << .metadata.(^note)`` —
+      the intended extraction.  Only a *specific* member can conflict here (a
+      ``.metadata.metadata`` whose derived key reproduces the base), and
+      ``_check_move_entries`` rejects exactly that member by the same
+      effective-destination rule ``_check_move_overlap`` applies statically.
+      Rejecting the whole form because one hypothetical member could conflict
+      is what made the positive and complement field sets differ in power.
+    """
+    if dest_path is None or base_path is None:
+        return
+    if base_path != dest_path:
+        return
+    raise ToolConfigurationError(
+        f"overlapping source and destination in move-into "
+        f"{_render_selector(node.destination)} << {_render_field_set(source)}: "
+        f"the source is the destination itself",
+        expression=expression,
+        span=node.span,
+    )
+
+
+def _render_field_set(source: "_ast.FieldSet") -> str:
+    """Render a field set back to its source syntax for diagnostics."""
+    base = _render_selector(source.base)
+    prefix = "" if base == "." else base
+    caret = "^" if source.complement else ""
+    return f"{prefix}.({caret}{'|'.join(source.names)})"
+
+
+def _split_destination(
+    destination: "_ast.Selector",
+) -> tuple[CompiledSelector | None, str | None]:
+    """Split ``.a.b`` into the parent selector ``.a`` and the final key ``"b"``.
+
+    Assignment creates the final key when it is absent, so only the parent has
+    to already exist.  Returns ``(None, None)`` when the final part is not an
+    object key (root, index, or wildcard) — those destinations must resolve as
+    a whole because there is no key to create.
+    """
+    parts = destination.parts
+    if not parts:
+        return None, None
+    last = parts[-1]
+    if isinstance(last, _ast.Field):
+        key = last.name
+    elif isinstance(last, _ast.QuotedKey):
+        key = last.key
+    else:
+        return None, None
+    parent = _ast.Selector(parts=parts[:-1], span=destination.span)
+    return CompiledSelector(parent), key
+
+
+def _static_path(selector: "_ast.Selector") -> tuple[str | int, ...] | None:
+    """Return a comparable canonical path for *selector*, or None if dynamic.
+
+    ``.a`` and ``.["a"]`` name the same key and canonicalize identically.  A
+    wildcard makes the path unknowable at compile time, so those are deferred
+    to the runtime overlap check.  Keys canonicalize to ``str`` and indices to
+    ``int``, matching ``Reference.path_parts`` so the two checks compare the
+    same shape.
+    """
+    canonical: list[str | int] = []
+    for part in selector.parts:
+        if isinstance(part, _ast.Field):
+            canonical.append(part.name)
+        elif isinstance(part, _ast.QuotedKey):
+            canonical.append(part.key)
+        elif isinstance(part, _ast.Index):
+            canonical.append(part.index)
+        else:
+            return None  # Each / unknown — not statically comparable
+    return tuple(canonical)
+
+
+def overlap_reason(
+    dest: tuple[str | int, ...],
+    source: tuple[str | int, ...],
+    *,
+    is_move: bool,
+    has_transform: bool = False,
+) -> str | None:
+    """Return why *dest* and *source* overlap illegally, or None if they are fine.
+
+    A move is rejected for any overlap (§8.8): whichever direction it runs, the
+    write lands in the subtree the source is about to be removed from.
+
+    A copy is rejected where the overlap is *provably* self-destructive:
+
+    - the same path, or the destination above the source — the write drops the
+      source subtree, and ``=`` must never delete;
+    - the source above the destination with no transform — the assigned value
+      is an alias of the container it is written into, so ``.a.b = .a`` builds
+      a self-referential record that no serializer can emit.
+
+    A transform makes the last case unprovable (its result is normally a fresh
+    value), so it compiles; the runtime identity guard in the stage catches a
+    transform that happens to return its input unchanged.
+
+    A move whose source is an array element additionally conflicts with any
+    destination inside that same array: removing the element renumbers every
+    later one, so the destination resolved before the delete no longer names
+    the slot it was resolved against.  A move out of an array into a *different*
+    container (§8.9, ``.metadata.first <- .values[0]``) is unaffected and stays
+    legal.
+    """
+    if dest == source:
+        return "the source and destination are the same path"
+
+    if source[: len(dest)] == dest:
+        return "the destination is an ancestor of the source"
+
+    if dest[: len(source)] == source:
+        if is_move:
+            return "the source is an ancestor of the destination"
+        if not has_transform:
+            return (
+                "the source is an ancestor of the destination, so the assigned "
+                "value would contain itself"
+            )
+
+    if is_move and _same_array_indices(dest, source):
+        return (
+            "the source and destination are elements of the same array, and "
+            "removing the source would renumber the destination"
+        )
+
+    return None
+
+
+def _same_array_indices(
+    dest: tuple[str | int, ...], source: tuple[str | int, ...]
+) -> bool:
+    """True when *source* is an array element and *dest* lives in that array.
+
+    ``source`` ending in an index means the move deletes by position, which
+    shifts every later element of the enclosing array.  Any destination that
+    reaches into the same array through its own index is therefore unstable.
+    """
+    if not source or not isinstance(source[-1], int):
+        return False
+    container = source[:-1]
+    if len(dest) <= len(container) or dest[: len(container)] != container:
+        return False
+    return isinstance(dest[len(container)], int)
+
+
+def _reject_static_overlap(
+    node: "_ast.Assignment", expression: str, op_label: str
+) -> None:
+    """Reject a provably self-destructive source/destination pair (§8.8).
+
+    Only paths that are fully static are compared; a wildcard defers the same
+    check to runtime, where the concrete paths are known.
+    """
+    if node.rhs.source is None:
+        # A literal right-hand side reads no location, so there is nothing it
+        # could overlap with.
+        return
+
+    dest = _static_path(node.destination)
+    src = _static_path(node.rhs.source)
+    if dest is None or src is None:
+        return
+
+    detail = overlap_reason(
+        dest,
+        src,
+        is_move=node.is_move,
+        has_transform=node.rhs.transform is not None,
+    )
+    if detail is None:
+        return
+
+    raise ToolConfigurationError(
+        f"overlapping source and destination in {op_label} "
+        f"{_render_selector(node.destination)} "
+        f"{'<-' if node.is_move else '='} {_render_selector(node.rhs.source)}: "
+        f"{detail}",
+        expression=expression,
+        span=node.span,
+    )
+
+
+def _render_selector(selector: "_ast.Selector") -> str:
+    """Render an AST selector for a diagnostic (mirrors CompiledSelector.render)."""
+    return CompiledSelector(selector).render()
 
 
 # ---------------------------------------------------------------------------
@@ -658,10 +1460,6 @@ def _check_static_compatibility(
     consumer's declared input.  Wildcards, differing paths, and anything
     involving ``ANY`` are left to runtime validation.
     """
-    from datapipe.tools.types import JsonType, as_type_spec
-
-    any_spec = as_type_spec(JsonType.ANY)
-
     for producer, consumer in zip(invocations, invocations[1:]):
         if producer.selector.has_wildcard or consumer.selector.has_wildcard:
             continue
@@ -672,32 +1470,62 @@ def _check_static_compatibility(
         if producer.contract.target != consumer.contract.target:
             continue
 
-        out_spec = producer.contract.output_type
-        in_spec = consumer.contract.input_type
-        if out_spec == any_spec or in_spec == any_spec:
-            continue
-
-        if any(
-            _matches(v, out_spec) and _matches(v, in_spec) for v in _PROBES
-        ):
-            continue
-        # No probe matched the producer's output at all: we cannot prove the
-        # output is inhabited, so we cannot prove a contradiction either.
-        if not any(_matches(v, out_spec) for v in _PROBES):
-            continue
-
-        from datapipe.tools.types import describe as _describe
-        raise ToolConfigurationError(
-            f"tool {producer.tool_name!r} outputs "
-            f"{_describe(out_spec)} at {producer.selector.render()}, but "
-            f"{consumer.tool_name!r} accepts only {_describe(in_spec)} there; "
-            "no value can satisfy both",
+        _reject_disjoint_types(
+            producer_name=producer.tool_name,
+            out_spec=producer.contract.output_type,
+            consumer_name=consumer.tool_name,
+            in_spec=consumer.contract.input_type,
+            path_label=producer.selector.render(),
             expression=expression,
             span=Span(
                 consumer.expression_span[0],
                 consumer.expression_span[1],
             ) if consumer.expression_span else None,
         )
+
+
+def _reject_disjoint_types(
+    *,
+    producer_name: str,
+    out_spec: Any,
+    consumer_name: str,
+    in_spec: Any,
+    path_label: str,
+    expression: str,
+    span: "Span | None",
+) -> None:
+    """Raise when no JSON value can satisfy both *out_spec* and *in_spec*.
+
+    The single disjointness core, shared by the legacy adjacent-invocation
+    pass and the within-statement pipe-chain check, so both report the same
+    diagnostic shape.  Conservative by construction: an unknown spec, ``ANY``
+    on either side, or an output no probe inhabits proves nothing and is
+    silently accepted.
+    """
+    if out_spec is None or in_spec is None:
+        return
+
+    from datapipe.tools.types import JsonType, as_type_spec, describe as _describe
+
+    any_spec = as_type_spec(JsonType.ANY)
+    if out_spec == any_spec or in_spec == any_spec:
+        return
+
+    if any(_matches(v, out_spec) and _matches(v, in_spec) for v in _PROBES):
+        return
+    # No probe matched the producer's output at all: we cannot prove the
+    # output is inhabited, so we cannot prove a contradiction either.
+    if not any(_matches(v, out_spec) for v in _PROBES):
+        return
+
+    raise ToolConfigurationError(
+        f"tool {producer_name!r} outputs "
+        f"{_describe(out_spec)} at {path_label}, but "
+        f"{consumer_name!r} accepts only {_describe(in_spec)} there; "
+        "no value can satisfy both",
+        expression=expression,
+        span=span,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -742,13 +1570,65 @@ def _compile_selector(
 ) -> CompiledSelector:
     """Validate selector against the contract's target scope and compile it."""
     if contract.target == "record" and not selector_node.is_root:
-        raise ToolConfigurationError(
-            f"tool {contract.name!r} has target='record' and requires the "
-            "root selector '.', but a field selector was supplied",
-            expression=expression,
-            span=selector_node.span,
-        )
+        _reject_non_root_record_target(contract, expression, selector_node.span)
     return CompiledSelector(selector_node)
+
+
+def _reject_non_root_record_target(
+    contract: ToolContract,
+    expression: str,
+    span: "Span | None",
+) -> None:
+    """Raise the single diagnostic for a record-target tool aimed off the root.
+
+    Both entry points share this wording: an explicit selector checked by
+    ``_compile_selector``, and a bare pipe call whose statement focus is not
+    the root.  *span* is the offending syntax in each case (the selector, or
+    the bare call itself), so the caret points at what the author wrote.
+    """
+    raise ToolConfigurationError(
+        f"tool {contract.name!r} has target='record' and requires the "
+        "root selector '.', but a field selector was supplied",
+        expression=expression,
+        span=span,
+    )
+
+
+def _validate_structural_config(
+    tool_fn: Callable,
+    contract: ToolContract,
+    bound: dict[str, Any],
+    expression: str,
+    span: Span,
+) -> None:
+    """Statically check ``nest``/``unnest`` configuration, if *tool_fn* is one.
+
+    Identity, not name: ``contract.name`` carries no namespace, so a provider
+    tool named ``nest`` is indistinguishable from the built-in by name alone
+    and would otherwise inherit rules that do not apply to it.
+
+    The rules themselves come from the tool module's own validators, so there
+    is exactly one definition of valid configuration.  Re-deriving them here
+    is what previously let the compiler and the runtime disagree about whether
+    an empty list counts as "supplied".
+    """
+    from datapipe.tools.builtins import structural as _structural
+
+    if tool_fn is not _structural.nest and tool_fn is not _structural.unnest:
+        return
+
+    try:
+        _structural.validate_configuration(
+            include=bound.get("include"),
+            exclude=bound.get("exclude"),
+            collision=bound.get("collision", "error"),
+            missing=bound.get("missing", "error"),
+            tool_name=contract.name,
+        )
+    except (ValueError, TypeError) as exc:
+        raise ToolConfigurationError(
+            str(exc), expression=expression, span=span
+        ) from exc
 
 
 def _bind_arguments(
@@ -756,6 +1636,7 @@ def _bind_arguments(
     contract: ToolContract,
     expression: str,
     _invocation_span: Span,
+    tool_fn: "Callable | None" = None,
 ) -> dict[str, Any]:
     """Bind expression arguments to the contract's ParameterSpec list.
 
@@ -793,6 +1674,29 @@ def _bind_arguments(
         param = param_map[arg.name]
         _validate_argument_type(value, param, contract.name, expression, arg.span)
         bound[arg.name] = value
+
+    # Cross-parameter semantic validation for the built-in structural tools.
+    #
+    # These constraints are statically checkable because the argument values
+    # are literals, so surfacing them here means an invalid configuration fails
+    # before the source opens rather than once per record -- which under
+    # `--errors skip` silently dropped every record and still exited 0.
+    #
+    # Two things this must NOT do, both of which an earlier version got wrong:
+    #
+    # 1. Key on the tool *name*.  `contract.name` carries no namespace, so a
+    #    provider tool legitimately named `nest` would inherit rules written
+    #    for the built-in and fail with an unrelated error.  Identity against
+    #    the actual built-in function objects is the only sound test.
+    # 2. Reimplement the rules.  A second copy drifts from the runtime's, and
+    #    did: it read an empty list as "supplied", so `nest(include=[],
+    #    exclude=["id"])` was rejected by the DSL while the identical direct
+    #    call succeeded.  Delegating to the tool's own validators keeps one
+    #    definition of what valid configuration means.
+    if tool_fn is not None:
+        _validate_structural_config(
+            tool_fn, contract, bound, expression, _invocation_span
+        )
 
     # Fill in defaults for unspecified parameters and validate them.
     for param in contract.parameters:
@@ -881,6 +1785,47 @@ def _matches_annotation(value: Any, annotation: Any) -> bool:
     return isinstance(value, expected)
 
 
+def _normalize_live_union(annotation: Any) -> Any:
+    """Convert a live ``Union[...]`` / ``X | None`` / ``Literal[...]`` into the
+    internal representation the validator understands.
+
+    Provider contracts arrive decoded from the registry, where unions are
+    already ``UnionAnnotation`` and literals are already ``EnumValues``.  A
+    *built-in* tool's annotation comes straight off the live signature, so raw
+    ``typing`` objects reach validation without going through the decoder — and
+    the argument is rejected with "annotation Optional which is not supported",
+    contradicting the message's own promise.
+
+    This function normalises the three live forms that previously fell through:
+
+    - ``typing.Optional[X]`` / ``typing.Union[X, None]`` → ``UnionAnnotation``
+    - PEP 604 ``X | None`` (Python ≥ 3.10) → ``UnionAnnotation``
+    - ``typing.Literal["a", "b"]`` → ``EnumValues``
+
+    Non-union, non-literal annotations are returned untouched.
+    """
+    import typing
+
+    origin = typing.get_origin(annotation)
+
+    # PEP 604 `X | None` uses types.UnionType on 3.10+, which has a different
+    # origin from typing.Union.
+    is_union = origin is typing.Union
+    if not is_union:
+        union_type = getattr(types, "UnionType", None)
+        is_union = union_type is not None and isinstance(annotation, union_type)
+    if is_union:
+        members = tuple(
+            type(None) if m is None else m for m in typing.get_args(annotation)
+        )
+        return UnionAnnotation(members)
+
+    if origin is typing.Literal:
+        return EnumValues("Literal", tuple(typing.get_args(annotation)))
+
+    return annotation
+
+
 def _validate_argument_type(
     value: Any,
     param: ParameterSpec,
@@ -900,6 +1845,8 @@ def _validate_argument_type(
     annotation = param.annotation
     if annotation is None:
         return  # no annotation → no static check
+
+    annotation = _normalize_live_union(annotation)
 
     if isinstance(annotation, UnsupportedAnnotation):
         raise ToolConfigurationError(
