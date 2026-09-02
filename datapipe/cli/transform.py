@@ -283,42 +283,81 @@ def _compile_or_report(expression: str):
     fallback: it is the only one that accepts ``invocation | invocation``
     (which it also deprecates).  When *neither* form parses, the
     ``parse_program`` diagnostic is the one reported.
+
+    Compilation warnings are echoed to stderr in the CLI's ``warning:`` form.
+    The compiler raises them as ``DeprecationWarning``, which Python's default
+    filter hides outside ``__main__``, so §13.5's migration diagnostic reached
+    no actual user.  Each one is re-issued afterwards, leaving the
+    library-level ``warnings.warn`` behavior that callers filter on unchanged.
     """
-    from datapipe.dsl.compiler import compile_expression, compile_program
+    import warnings
+
     from datapipe.dsl.errors import (
         ExpressionSyntaxError,
         ToolConfigurationError,
         ToolResolutionError,
     )
-    from datapipe.dsl.parser import parse_program
 
-    program_ast = None
-    program_error = None
+    caught: list = []
     try:
         try:
-            program_ast = parse_program(expression)
-        except ExpressionSyntaxError as exc:
-            program_error = exc
-
-        if program_ast is not None and _needs_program_path(program_ast):
-            return compile_program(expression)
-
-        # Either the program parse failed (legacy `a | b` form) or the program
-        # is a single plain invocation whose legacy output shape we preserve.
-        try:
-            return compile_expression(expression)
-        except ExpressionSyntaxError:
-            if program_ast is not None:
-                # parse_program accepted it; only the legacy grammar objects.
-                return compile_program(expression)
-            # Neither grammar parses — report the canonical diagnostic.
-            raise program_error
+            return _compile_capturing_warnings(expression, caught)
+        finally:
+            # Outside the recorder: re-issuing inside it would append to the
+            # very list being drained, and the CLI would spin forever.
+            for entry in caught:
+                if issubclass(entry.category, DeprecationWarning):
+                    print(f"warning: {entry.message}", file=sys.stderr)
+            for entry in caught:
+                warnings.warn_explicit(
+                    entry.message, entry.category, entry.filename, entry.lineno
+                )
     except (ExpressionSyntaxError, ToolResolutionError, ToolConfigurationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return None
     except Exception as exc:  # noqa: BLE001
         print(f"error compiling expression: {exc}", file=sys.stderr)
         return None
+
+
+def _compile_capturing_warnings(expression: str, caught: list):
+    """Run the routing compile, collecting its warnings into *caught*.
+
+    Compilation is a coordinator-side step that runs once, before any record is
+    read, so a migration notice recorded here can never repeat per record.
+    """
+    import warnings
+
+    from datapipe.dsl.compiler import compile_expression, compile_program
+    from datapipe.dsl.errors import ExpressionSyntaxError
+    from datapipe.dsl.parser import parse_program
+
+    program_ast = None
+    program_error = None
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        try:
+            try:
+                program_ast = parse_program(expression)
+            except ExpressionSyntaxError as exc:
+                program_error = exc
+
+            if program_ast is not None and _needs_program_path(program_ast):
+                return compile_program(expression)
+
+            # Either the program parse failed (legacy `a | b` form) or the
+            # program is a single plain invocation whose legacy output shape
+            # we preserve.
+            try:
+                return compile_expression(expression)
+            except ExpressionSyntaxError:
+                if program_ast is not None:
+                    # parse_program accepted it; only the legacy grammar objects.
+                    return compile_program(expression)
+                # Neither grammar parses — report the canonical diagnostic.
+                raise program_error
+        finally:
+            caught.extend(recorded)
 
 
 def _emit_compiled(compiled, args: "argparse.Namespace") -> int:
@@ -499,13 +538,21 @@ def _describe_invocation(inv) -> dict:
 
 
 def _describe_assignment(op) -> dict:
-    """Render one ``CompiledAssignment`` (a ``=`` or ``<-`` statement operation)."""
+    """Render one ``CompiledAssignment`` (a ``=`` or ``<-`` statement operation).
+
+    A literal right-hand side names no location, so ``source`` is null and the
+    constant is carried in ``literal`` instead.  Both keys are always present:
+    a consumer distinguishes the two forms by which one is null, rather than by
+    a key being absent.
+    """
+    literal = op.literal
     return {
         "kind": "assignment",
         "operator": "<-" if op.is_move else "=",
         "move": op.is_move,
         "destination": op.destination.render(),
-        "source": op.source.render(),
+        "source": None if literal is not None else op.source.render(),
+        "literal": None if literal is None else {"value": literal.value},
         "transform": (
             None if op.transform is None else _describe_invocation(op.transform)
         ),
@@ -683,9 +730,16 @@ def _print_compiled(compiled, expression: str, *, validate: str = "always") -> N
             op = stmt["operation"]
             if op["kind"] == "assignment":
                 verb = "move" if op["move"] else "copy"
+                # Rendered from the JSON document, not the IR, so the text and
+                # `--json` surfaces cannot describe different things.  A literal
+                # RHS has a null source and shows the constant in its place.
+                rhs = (
+                    op["source"]
+                    if op["literal"] is None
+                    else _literal(op["literal"]["value"])
+                )
                 print(
-                    f"    {verb} {op['destination']} {op['operator']} "
-                    f"{op['source']}"
+                    f"    {verb} {op['destination']} {op['operator']} {rhs}"
                 )
                 if op["transform"] is not None:
                     t = op["transform"]

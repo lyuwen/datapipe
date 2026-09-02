@@ -919,8 +919,6 @@ class CompiledProgramStage(Stage):
                     ),
                 )
 
-        # A root destination is unreachable here: step 4 rejects it, because
-        # the root path is a prefix of every source path.
         # Containers are deep-copied so the destination cannot be mutated
         # through the source (or vice versa) by a later statement; §6.1 says
         # `=` copies.  Scalars are immutable and skip the per-record cost.
@@ -930,6 +928,14 @@ class CompiledProgramStage(Stage):
         written = new_value if detached_input else _detached(new_value)
         if dest_parent_container is not None:
             dest_parent_container[dest_key] = written
+        elif dest_ref.parent is None:
+            # Root destination: `Reference.replace` is a documented no-op there
+            # and the new record is published by returning it, exactly as
+            # `CompiledSelector.apply` does.  Only a literal reaches this branch
+            # — a selector source is always rejected in step 4, since the root
+            # is an ancestor of every path — so there is no move source below
+            # that the replacement could have just discarded.
+            record = written
         else:
             dest_ref.replace(written)
 

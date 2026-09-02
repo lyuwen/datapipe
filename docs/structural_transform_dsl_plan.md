@@ -271,6 +271,13 @@ which operate on the constant at the published focus like any other value. A
 container literal is copied per record, so no two records — and no record and
 the compiled program — ever share one object.
 
+The destination may be the root: `. = {"x": 1}` replaces the whole record, and
+the replacement is what later statements see and what reaches the sink (§5.2's
+"explicit root operation replaces `.`"). This is the one assignment form that
+can target the root, because the reason `. = .meta` is rejected is overlap —
+the root is an ancestor of every path — and a constant has no path to overlap
+with.
+
 ### 6.2 Exact move assignment: `<-`
 
 ```text
@@ -1022,6 +1029,12 @@ JSON path exposes the same tree — `statements[]` with `focus`, `operation`
 (`kind`, `destination`, `sources`) and `pipes` — so both surfaces describe the
 same thing.
 
+An assignment operation carries both a `source` and a `literal` key, exactly
+one of which is non-null: a path right-hand side renders into `source`, and a
+literal one into `literal` (as `{"value": ...}`), since a constant names no
+location. The text surface renders *from* the JSON document, so the two cannot
+drift apart.
+
 ## 14. Implementation phases
 
 ### Phase S0: Freeze semantics and examples
@@ -1296,3 +1309,10 @@ deferred and the window is measured from the release that introduces `;`.
 What S6 did add is the §13.3 *ambiguity* rejection: an explicit selector
 following a bare focus call (`fromjson(.a) | tojson | tojson(.b)`) is no longer
 a bare parse error but a diagnostic naming the `;` rewrite.
+
+Delivery (added after review 3): the compiler raises the diagnostic as a
+`DeprecationWarning`, which Python's default filter hides outside `__main__` —
+so on the real CLI it reached no one. The CLI now also prints it to stderr once
+per compile, in the same `warning: ...` form it already uses for provider and
+registry problems, and re-issues the warning so library callers that filter on
+the category still see it. It stays non-fatal.
