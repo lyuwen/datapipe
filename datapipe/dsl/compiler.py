@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -1725,6 +1726,44 @@ def _matches_annotation(value: Any, annotation: Any) -> bool:
     return isinstance(value, expected)
 
 
+def _normalize_live_union(annotation: Any) -> Any:
+    """Convert a live ``Union[...]`` / ``X | None`` object into ``UnionAnnotation``.
+
+    Provider contracts arrive decoded from the registry, where unions are
+    already ``UnionAnnotation``.  A *built-in* tool's annotation instead comes
+    straight off the live signature, so a union reaches validation as a raw
+    ``typing`` object that no branch below recognises — and the argument is
+    rejected with "annotation Optional which is not supported", contradicting
+    the same message's promise that "Optional/Union of those" is supported.
+
+    That made a perfectly ordinary signature unusable::
+
+        def my_tool(value, *, mode: str | None = None) -> str: ...
+
+    It also made the built-ins Python-version dependent.  Under 3.10,
+    ``typing.get_type_hints`` still applied PEP 484's implicit-Optional rule
+    and rewrote ``include: list = None`` to ``Optional[list]``; 3.11 dropped
+    that rule, so the identical source validated there and failed on 3.10.
+    Normalising here fixes both, and leaves non-union annotations untouched.
+    """
+    import typing
+
+    origin = typing.get_origin(annotation)
+    is_union = origin is typing.Union
+    if not is_union:
+        # PEP 604 `X | None` is types.UnionType, which is a distinct origin
+        # from typing.Union on 3.10-3.13.
+        union_type = getattr(types, "UnionType", None)
+        is_union = union_type is not None and origin is union_type
+    if not is_union:
+        return annotation
+
+    members = tuple(
+        type(None) if m is None else m for m in typing.get_args(annotation)
+    )
+    return UnionAnnotation(members)
+
+
 def _validate_argument_type(
     value: Any,
     param: ParameterSpec,
@@ -1744,6 +1783,8 @@ def _validate_argument_type(
     annotation = param.annotation
     if annotation is None:
         return  # no annotation → no static check
+
+    annotation = _normalize_live_union(annotation)
 
     if isinstance(annotation, UnsupportedAnnotation):
         raise ToolConfigurationError(
