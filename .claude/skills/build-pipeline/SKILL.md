@@ -44,11 +44,17 @@ happen to each record?
 ### 2. Classify complexity
 
 **Shell path** — use when ALL of the following are true:
-- A single transformation (one or a piped sequence of DSL tool invocations)
 - No custom Python logic needed
 - No per-worker state (no resources to load at setup time)
-- The need is covered by `fromjson` / `tojson` (the only built-in tools) or by
-  a provider the user has already installed via `datapipe tools install`
+- The need is covered by the built-in tools (`fromjson`, `tojson`, `nest`,
+  `unnest`), by the structural operators (`=`, `<-`, `<<`, `^`), or by a
+  provider the user has already installed via `datapipe tools install`
+
+The shell path is more capable than a single transformation. A program is a
+`;`-separated sequence of statements applied to one evolving record, so
+reshaping work — copying, moving, folding fields into a sub-object, lifting
+them back out, setting constants — belongs on the shell path, not the Python
+path. Reach for Python only when you need real logic or per-worker state.
 
 **Python path** — use when ANY of the following is true:
 - Multiple distinct processing stages
@@ -65,22 +71,37 @@ a sequence of field transformations?"
 
 Guide the user to a complete `datapipe transform` invocation:
 
-1. Help them write the DSL expression (one or more tool invocations separated
-   by `|`).
-2. Show the full command with all relevant flags:
+1. Help them write the DSL program. Sequence independent record mutations with
+   `;`. Use `|` only to chain a *bare* tool onto the current focus
+   (`.metadata | fromjson | tojson`). Do **not** join two explicit-selector
+   invocations with `|` — `fromjson(.a) | tojson(.b)` is deprecated; write
+   `fromjson(.a); tojson(.b)`.
+2. Verify the program compiles before running it over data:
 
 ```bash
-datapipe transform 'EXPR' input.jsonl output.jsonl \
+datapipe transform --dry-run 'PROGRAM' input.jsonl output.jsonl
+```
+
+   Check the reported statements, resolved tools, and bound argument defaults.
+3. **Single-quote the program.** Every structural operator (`;`, `|`, `<<`,
+   `<-`, `^`, `(`, `)`, `[]`) is a shell metacharacter. Unquoted, the shell
+   consumes it before datapipe starts — the generated `pipeline.sh` is
+   silently corrupted rather than rejected. Prefer single quotes over double;
+   double still expand `$` and backticks.
+4. Show the full command with all relevant flags:
+
+```bash
+datapipe transform 'PROGRAM' input.jsonl output.jsonl \
   --executor process \
   --workers 8 \
   --errors skip \
   --error-output errors.jsonl
 ```
 
-3. Explain each flag briefly.
-4. Write the command to a `pipeline.sh` file at the user's working directory
+5. Explain each flag briefly.
+6. Write the command to a `pipeline.sh` file at the user's working directory
    (or a path they specify).
-5. Offer to execute it: "Want me to run this now?"
+7. Offer to execute it: "Want me to run this now?"
 
 When running, use `bash pipeline.sh` and report the completion stats.
 

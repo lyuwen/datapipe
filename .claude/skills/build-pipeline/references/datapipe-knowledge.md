@@ -1,7 +1,8 @@
 # datapipe Domain Knowledge
 
-Generated from source at commit HEAD of the `skills` branch. Run
-`/sync-knowledge` to regenerate after architectural changes.
+Generated from `feat/structural-transform-dsl` (b5d3fba), which is `main` plus
+the structural DSL work. Verified against that branch's test suite: 1467 passed,
+5 skipped. Run `/sync-knowledge` to regenerate after architectural changes.
 
 ---
 
@@ -218,6 +219,19 @@ Set via the `errors` parameter on `Pipeline.run()` (default `"raise"`):
 always aborts the run, regardless of the `errors` setting. This is by design:
 a worker that failed initialization cannot process any records safely.
 
+### Error types
+
+| Type | Raised by | Notes |
+|------|-----------|-------|
+| `StageExecutionError` | coordinator | Outer wrapper; carries `stage_name` and `record_seq`. |
+| `ToolExecutionError` | tool call / type-check failure | Full diagnostic context. |
+| `StructuralExecutionError` | `=`, `<-`, `<<` statements | Carries `statement_index`, `operation` (`copy`/`move`/`move-into`), `selector`, `source_path`, `destination_path`, `expression_span`, and `reason`. |
+
+All three define `__reduce__` plus a module-level rebuild factory, so they survive
+the `spawn` process boundary intact. Under `errors="return"`, the error payload
+carries a `structural` dict for structural failures alongside the existing `tool`
+dict for tool failures.
+
 `Pipeline.run()` full signature for reference:
 
 ```python
@@ -322,72 +336,202 @@ class BadStage(Stage):
 
 ---
 
-## DSL expression syntax and `datapipe transform` flags
+## Structural transform DSL
 
-### Expression grammar
+The expression language is at **version 2**. Version 1 was the single-expression
+form (one or more `invocation`s joined by `|`); it still compiles, but the
+multi-invocation form is deprecated (see *Deprecated syntax* below).
+
+### Program grammar
 
 ```
-expression  = invocation ( '|' invocation )*
-invocation  = tool_name '(' selector [ ',' arg ( ',' arg )* ] ')'
-arg         = name '=' json_literal
+program        = statement ( ';' statement )* ';'?
+statement      = assignment | move_into | focused | invocation ( '|' bare_call )*
+invocation     = qualified_name '(' selector ( ',' arg )* ')'
+qualified_name = IDENT ( '.' IDENT )?
+arg            = name '=' literal
 ```
 
-Selector semantics (strict by default — a missing field or out-of-range index
-is a `SelectorResolutionError`, not a silent skip):
+Tool names may be namespace-qualified — `my_tools.normalize(.body)` — for tools
+installed from a provider that declares a namespace.
+
+A program is a sequence of statements separated by `;`, applied in order to one
+evolving root record. Each statement sees the mutations of the statements before
+it. A trailing `;` is legal; an empty statement (`;;`) is an error. Two statements
+juxtaposed without a `;` produce an error naming the missing `;` as the likely
+cause.
+
+`;` also **resets focus** — each statement establishes its own target. Focus never
+leaks across a `;`.
+
+### Operators
+
+| Operator | Name | LHS | RHS | Semantics |
+|----------|------|-----|-----|-----------|
+| `;` | sequence | — | — | Order statements against one evolving record; resets focus |
+| `\|` | pipe | current focus | bare call | Chain a tool onto the current target (see *Focus*) |
+| `=` | copy assign | exact selector (root OK w/ literal) | selector, literal, or invocation | Copy; source retained |
+| `<-` | exact move | exact selector | selector or invocation (**not** a literal) | Move; source removed only after destination write succeeds |
+| `<<` | move-into | destination object selector | comma-separated selectors / field-sets | Move each source into the destination object, keyed by its final field name |
+| `^` | complement | — | — | Only inside `.( … )`; complements the whole parenthesized name set |
+
+Notes:
+- `.a <- 5` is rejected at compile time with a diagnostic pointing at `=`.
+- `. = {"x": 1}` (root literal) is legal — a constant has no path that can overlap
+  with root. `. = .meta` is rejected for overlap.
+- Destinations of `=`, `<-`, `<<` must be exact: no `[]` wildcards.
+- `<<` creates a missing destination object as `{}`.
+- `,` binds tighter than `|` in a `<<` source list.
+- There is no bare `<` token; only `<-` and `<<`.
+
+### Selectors
+
+Strict by default — a missing field or out-of-range index raises
+`SelectorResolutionError`, never a silent skip.
 
 | Selector | Meaning |
 |----------|---------|
 | `.` | Root — one match, the whole record |
 | `.field` | Dict key lookup |
 | `["key.with.dots"]` | Dict key lookup via quoted string |
-| `[0]` | List index lookup (negative indices are errors) |
-| `[]` | Every element of a list (wildcard); empty list → zero matches, still success |
+| `[0]` | List index (negative indices are errors) |
+| `[]` | Every element of a list; empty list → zero matches, still success |
 
 Applying `[]` to a non-list raises `SelectorResolutionError`.
 
-### Available built-in tools
+**Field sets** appear only as `<<` sources:
 
-**Only two tools ship built-in** — `fromjson` and `tojson`. Anything else
-requires a custom provider installed via `datapipe tools install`. If the
-user's transformation needs logic beyond JSON encode/decode and they have no
-installed provider, the shell path is not viable — use the Python path
-instead.
+```
+.metadata.(temperature|score)     # named fields of .metadata
+.(^instance_id|messages|tools)    # every root field EXCEPT these three
+```
+
+Here `|` joins field *names*, not operations; the closing `)` ends that scope, so
+a `|` after `)` is a statement pipe again. `^` complements the entire set.
+
+### Focus and pipes
+
+A `bare_call` is a tool call with no selector — it takes the **current focus** as
+its target. Focus is established by:
+
+| Statement form | Focus |
+|----------------|-------|
+| `.sel \| tool` | the leading selector |
+| `.dest = rhs \| tool` | the destination (pipes apply to the value just written) |
+| `.dest << srcs \| tool` | the destination (pipes apply to the assembled object) |
+| `tool(.sel) \| tool2` | inferred from the invocation's selector |
+
+Wildcard focus is **elementwise**: `.items[] | fromjson | tojson` applies the whole
+chain to each element independently.
+
+Mixing an explicit selector into a pipe chain after a bare call is a hard parse
+error, not a warning:
+
+```
+fromjson(.a) | tojson | tojson(.b)
+# error: ambiguous `|`: 'tojson' is given an explicit selector but follows a
+# bare tool call, which takes the current focus; `|` cannot mean both.
+# Use `;` to sequence record mutations:  fromjson(.a) | tojson; tojson(.b)
+```
+
+### Literals
+
+JSON spelling. Accepted: strings (`"a"` / `'a'`), integers, floats (incl. `1e10`),
+`true`/`false`, `null`, arrays, objects. `True`/`False`/`None` are also accepted as
+aliases. Max literal nesting depth is **64**.
+
+Legal as: the RHS of `=`, and argument values. **Not** legal as the RHS of `<-`.
+Literals may carry trailing pipes — `.a = 5 | tojson` writes the string `"5"`.
+Container literals are copied per record.
+
+### Built-in tools
+
+Four tools ship built-in. Anything else requires a provider installed via
+`datapipe tools install`.
+
+**Value-targeted** (any selector):
 
 ```python
 fromjson(value, *, recursive=False, containers_only=True)
-    # input:  string | array | object     output: any
-    # Decode a JSON-encoded string. recursive=True traverses arrays and
-    # objects decoding nested JSON-encoded strings.
-
+    # input: string|array|object   output: any
 tojson(value, *, ensure_ascii=False, compact=True, sort_keys=False)
-    # input:  any                          output: string
-    # Serialize to a JSON string. An already-string value is re-serialized
-    # as a JSON string literal.
+    # input: any                   output: string
 ```
 
-Example expressions:
+**Record-targeted** (selector must be `.`; the tool receives and returns the whole row):
+
+```python
+nest(record, *, key="metadata", include=None, exclude=None,
+     jsonify=False, collision="error", missing="error")
+    # input: object  output: object
+unnest(record, *, key="metadata", include=None, exclude=None, parse=False,
+       jsonify=False, collision="error", missing="error")
+    # input: object  output: object
 ```
-fromjson(.tools)
-fromjson(.tools) | tojson(.tools[].name)
-fromjson(.payload, recursive=true)
-tojson(.metadata, sort_keys=true)
+
+`nest`/`unnest` are convenience sugar over the structural operators:
+
+```
+nest(., key=K, include=[f1,f2])   ≡  .K << .(f1|f2)
+nest(., key=K, exclude=[a,b])     ≡  .K << .(^a|b)
+nest(., key=K, jsonify=true)      ≡  .K << .(^) | tojson
+unnest(., key=K, include=[x])     ≡  . << .K.(x)
+unnest(., key=K, exclude=[x])     ≡  . << .K.(^x)
+unnest(., key=K, parse=true, jsonify=true, include=[x])
+                                  ≡  fromjson(.K); . << .K.(x); tojson(.K)
 ```
 
-Note that DSL literals use JSON spelling — `true`/`false`, not `True`/`False`.
+Error modes: an `include` naming a missing field is an error; an `exclude` naming a
+missing field is silent. A destination key collision is an error. Supplying both
+`include` and `exclude` raises immediately. `collision`/`missing` accept only
+`"error"` today. `include=[]` and `exclude=[]` are both treated as "not supplied".
+In `nest`, the destination key is automatically excluded from its own complement.
 
-The compiler resolves tool names against the registry, validates
-selector/target scope, binds arguments, and fills defaults. The resulting
-`CompiledExpression` carries resolved callables and is registry-independent
-at execution time.
+### Deprecated syntax
 
-Workers automatically receive `JsonLoadStage → CompiledToolProgramStage →
-JsonDumpStage` — do not include `fromjson(.)` / `tojson(.)` for the outer
-row in your expression.
+`|` joining two **explicit-selector** invocations is deprecated but still works:
 
-### `datapipe transform` key flags
+```
+fromjson(.a) | tojson(.b)      # deprecated
+fromjson(.a); tojson(.b)       # use this
+```
+
+The compiler emits a `DeprecationWarning`; the CLI prints it once to stderr as
+`warning: …`. The suggested rewrite preserves all non-default arguments. It only
+triggers when there is more than one invocation and no selector is root or
+wildcard. Removal is deferred — the stated window is one minor release after the
+release that introduces `;`, and `;` has not shipped in a release yet.
+
+### Execution model for programs
+
+The CLI wraps the compiled program exactly as before:
+
+```
+JsonLoadStage → <program stage> → JsonDumpStage
+```
+
+with `raw=True` on the JSONL source and sink, so workers do the JSON parsing.
+Only the middle stage type varies:
+
+| Compiled form | Stage |
+|---------------|-------|
+| `CompiledExpression` (single plain invocation) | `CompiledToolProgramStage` |
+| `CompiledProgram` (multi-statement, focused, assignment, or piped) | `CompiledProgramStage` |
+
+Both are reached from the same command; the CLI picks the program path when the
+expression has more than one statement, any focus selector, or any bare pipe.
+Do not include `fromjson(.)` / `tojson(.)` for the outer row — that is what the
+implicit load/dump stages already do.
+
+Per record, `CompiledProgramStage` runs every statement in order inside **one**
+worker call, rebinding the record after each statement. Statement N+1 sees all
+writes made by statements 0…N. A failure on any statement aborts that record;
+assignments write only after all preconditions pass, so no partial writes persist.
+
+### `datapipe transform` flags
 
 ```bash
-datapipe transform 'EXPR' input.jsonl output.jsonl \
+datapipe transform 'PROGRAM' input.jsonl output.jsonl \
   --executor process|thread|sequential   # default: process
   --workers N                            # default: CPU count
   --max-in-flight N                      # default: workers * 4
@@ -396,9 +540,28 @@ datapipe transform 'EXPR' input.jsonl output.jsonl \
   --ordered / --unordered                # default: --ordered
   --progress / --no-progress             # default: --progress
   --validate-tools always|sample|off     # default: always
-  --dry-run                              # compile + inspect, no data
-  --json                                 # with --dry-run: JSON output
+  --input-format jsonl                   # default: jsonl
+  --output-format jsonl                  # default: jsonl
+  --rank N --world-size N --local-rank N # distributed override
+  --dry-run                              # compile + inspect, no data processed
+  --json                                 # with --dry-run: emit JSON
 ```
+
+`--dry-run` and `--json` are new alongside the program syntax.
+
+### Inspecting before running
+
+`datapipe inspect-expression 'PROGRAM'` and `datapipe transform --dry-run …`
+produce the same report. For a program it prints `expression-language: 2`, a
+`Statements: N` block (each with its focus, operation kind — `call` / `copy` /
+`move` / `move-into` — resolved provider, target, input/output types,
+cardinality, bound arguments, and any `pipe:` sub-entries), then the `Stages:`
+list. The legacy single-expression form prints `Invocations: N` instead.
+With `--json`, a program yields a `statements` array and a legacy expression
+yields `invocations`.
+
+Use `--dry-run` to confirm argument defaults and selector scope before spending
+a full pass over the data.
 
 ### `datapipe run` key flags
 
@@ -418,3 +581,72 @@ datapipe run ./pipeline.py:pipeline \
 ```
 
 Format is inferred from extension if not prefixed: `.jsonl`/`.ndjson`/`.jsonl.gz`/`.jsonl.zst` → jsonl; `.parquet` → parquet; directories → jsonl.
+
+### Shell quoting
+
+**Always wrap the program in single quotes.** Every structural operator is a
+shell metacharacter: `<<` starts a heredoc, `<-` redirects input, `;` ends the
+command, `|` pipes it, `(` and `)` open a subshell, `^` is history substitution
+in some shells, and `[]` globs. Unquoted, the shell consumes them before
+datapipe ever starts.
+
+```bash
+# Right
+datapipe transform '.m << .(^id)' in.jsonl out.jsonl
+# Wrong — the shell eats the operators
+datapipe transform .m << .(^id) in.jsonl out.jsonl
+```
+
+Single quotes pass the text through verbatim; double quotes still expand `$` and
+backticks, so prefer single. To embed a literal single quote, close and reopen:
+
+```bash
+datapipe transform 'normalize(.body, pad='"'"'-'"'"')' in.jsonl out.jsonl
+```
+
+This applies to any generated `pipeline.sh` — an unquoted program there is
+silently corrupted rather than rejected.
+
+### Worked examples
+
+```bash
+# Decode one JSON-encoded column
+datapipe transform 'fromjson(.tools)' in.jsonl out.jsonl
+
+# Two independent mutations, sequenced
+datapipe transform 'tojson(.tools); tojson(.metadata)' in.jsonl out.jsonl
+
+# Fold everything except three fields into .metadata, then serialize it
+datapipe transform '.metadata << .(^instance_id|messages|tools) | tojson' in.jsonl out.jsonl
+
+# Same thing via the convenience tool
+datapipe transform 'nest(., key="metadata", exclude=["instance_id","messages","tools"], jsonify=true)' in.jsonl out.jsonl
+
+# Lift two fields back out of a JSON-encoded .metadata and re-serialize it
+datapipe transform 'fromjson(.metadata); . << .metadata.(temperature|score); tojson(.metadata)' in.jsonl out.jsonl
+
+# Elementwise over a list
+datapipe transform '.items[] | fromjson | tojson(compact=false)' in.jsonl out.jsonl
+
+# Copy, move, and set a constant
+datapipe transform '.backup = .payload; .id <- .legacy_id; .status = "processed"' in.jsonl out.jsonl
+```
+
+### Validation modes
+
+`--validate-tools` controls runtime type-contract checking:
+
+| Mode | Behaviour |
+|------|-----------|
+| `always` | Check every record (default). |
+| `sample` | Check the first 100 records per worker, then stop. |
+| `off` | No contract checks. |
+
+The decision is made once per record, before any statement runs, and is inherited
+by the inner program that `nest`/`unnest` desugar into — so `sample` genuinely
+samples through those tools rather than degrading to `always`.
+
+### Limits
+
+Argument-literal nesting in a DSL expression is bounded at **64 levels**; deeper
+literals raise `ExpressionSyntaxError` rather than crashing the parser.

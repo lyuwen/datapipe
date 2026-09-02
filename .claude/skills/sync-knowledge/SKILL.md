@@ -36,6 +36,17 @@ Read all of these files before writing anything:
 - `datapipe/cli/transform.py` — `transform_command`, DSL expression flags
 - `datapipe/tools/contract.py` — `ToolContract`, `Cardinality`
 - `datapipe/tools/decorator.py` — `@tool` decorator usage
+- `datapipe/dsl/lexer.py`, `parser.py`, `ast.py` — token set, program/statement
+  grammar, operators (`;`, `|`, `=`, `<-`, `<<`, `^`), selectors, field sets,
+  literal forms and the literal depth limit
+- `datapipe/dsl/compiler.py` — `compile_expression` vs `compile_program`,
+  scope validation, deprecation diagnostics
+- `datapipe/tools/builtins/` — the full built-in tool inventory, including
+  `structural.py` (`nest` / `unnest`) and their desugarings
+- `datapipe/stages/tool_program.py` — `CompiledToolProgramStage` and
+  `CompiledProgramStage`; per-record statement sequencing; validation modes
+- `datapipe/tools/errors.py` — `ToolExecutionError`, `StructuralExecutionError`,
+  and their `__reduce__` / factory pickling
 
 ## Step 3: Write the synthesized knowledge file
 
@@ -79,11 +90,28 @@ these sections in order:
    importing from `datapipe.cli` inside a stage; treating `max_in_flight` as
    a hint; using mutable class-level state across workers.
 
-8. **DSL expression syntax and `datapipe transform` flags** — expression
-   grammar (tool invocations, selectors, pipes); key flags: `--executor`,
-   `--workers`, `--max-in-flight`, `--errors`, `--error-output`,
-   `--ordered`/`--unordered`, `--validate-tools`, `--dry-run`; the implicit
-   `JsonLoadStage` / `JsonDumpStage` wrapping.
+8. **Structural transform DSL** — the expression-language version; the
+   program grammar (`;`-separated statements over one evolving record); every
+   operator (`;`, `|`, `=`, `<-`, `<<`, `^`) with what is legal on each side;
+   selector syntax including field sets and complements; focus and bare-call
+   pipe semantics, including the ambiguous-pipe hard error; literal forms and
+   where literals are legal; the complete built-in tool inventory with
+   value-targeted vs record-targeted distinction and the `nest`/`unnest`
+   desugarings; namespace-qualified tool names; shell-quoting guidance for
+   the operators (read the `EXPRESSION_EPILOG` in `datapipe/cli/transform.py`);
+   and any deprecated syntax with its replacement.
+
+9. **Program execution, CLI flags, and inspection** — which compiled form maps
+   to which stage; per-record statement sequencing; error types
+   (`StageExecutionError`, `ToolExecutionError`, `StructuralExecutionError`);
+   validation modes; parser limits; key flags: `--executor`, `--workers`,
+   `--max-in-flight`, `--errors`, `--error-output`, `--ordered`/`--unordered`,
+   `--validate-tools`, `--dry-run`, `--json`; `datapipe inspect-expression`;
+   the implicit `JsonLoadStage` / `JsonDumpStage` wrapping; worked examples.
+
+Verify every tool name, flag name, and operator against the code before writing
+it. This file must not contain a tool or flag that does not exist. Prefer
+example expressions taken from the test suite over invented ones.
 
 ## Step 4: Diff and report
 
