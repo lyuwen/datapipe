@@ -1328,9 +1328,18 @@ What S6 did add is the §13.3 *ambiguity* rejection: an explicit selector
 following a bare focus call (`fromjson(.a) | tojson | tojson(.b)`) is no longer
 a bare parse error but a diagnostic naming the `;` rewrite.
 
-Delivery (added after review 3): the compiler raises the diagnostic as a
-`DeprecationWarning`, which Python's default filter hides outside `__main__` —
-so on the real CLI it reached no one. The CLI now also prints it to stderr once
-per compile, in the same `warning: ...` form it already uses for provider and
-registry problems, and re-issues the warning so library callers that filter on
-the category still see it. It stays non-fatal.
+Delivery (added after review 3, amended after review 4): the compiler raises the
+diagnostic as a `DeprecationWarning`, which Python's default filter hides outside
+`__main__` — so on the real CLI it reached no one. The CLI now prints it to
+stderr once per compile, in the same `warning: ...` form it already uses for
+provider and registry problems, and does **not** re-issue that category: an
+earlier version did, which printed the same notice twice under
+`PYTHONWARNINGS=default` or `-Wd`, the second copy pointing at the CLI module
+rather than at the user's expression. Warning categories the CLI does not render
+itself are re-issued untouched. Library callers are unaffected —
+`compile_expression()` still raises the filterable `DeprecationWarning`, which is
+where a caller filtering on the category receives it.
+
+One consequence is deliberate: because the CLI captures warnings before Python's
+filter chain runs, `-W error` does not turn the legacy-pipe diagnostic into a
+fatal error. The form stays non-fatal until its removal (see the window above).
