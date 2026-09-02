@@ -73,6 +73,8 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any
 
+import typing
+
 from datapipe.tools.decorator import tool
 from datapipe.tools.contract import ToolExample
 from datapipe.tools.types import JsonType
@@ -120,8 +122,8 @@ def nest(
     include: list | None = None,
     exclude: list | None = None,
     jsonify: bool = False,
-    collision: str = "error",
-    missing: str = "error",
+    collision: typing.Literal["error"] = "error",
+    missing: typing.Literal["error"] = "error",
 ) -> dict:
     """Move fields of *record* into the nested object at *key*.
 
@@ -197,8 +199,8 @@ def unnest(
     exclude: list | None = None,
     parse: bool = False,
     jsonify: bool = False,
-    collision: str = "error",
-    missing: str = "error",
+    collision: typing.Literal["error"] = "error",
+    missing: typing.Literal["error"] = "error",
 ) -> dict:
     """Move fields out of the nested object at *key* up to the record root.
 

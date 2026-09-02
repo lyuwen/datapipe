@@ -1,6 +1,6 @@
 # Design: datapipe pipeline-builder skill
 
-**Date**: 2026-09-01  
+**Date**: 2026-09-01
 **Status**: approved
 
 ---

@@ -732,14 +732,11 @@ def compile_expression(expression: str) -> CompiledExpression:
             expression_span=(inv_node.span.start, inv_node.span.end),
         ))
 
-    # Legacy | migration diagnostic: warn when multiple invocations all use
-    # explicit (non-root, non-wildcard) selectors.  Single-invocation
-    # expressions and any expression with a root or wildcard selector are
-    # silent so we do not warn on legitimate uses.
-    if len(invocations) > 1 and all(
-        not inv.selector.has_wildcard and not inv.selector.is_root
-        for inv in invocations
-    ):
+    # Legacy | migration diagnostic: warn when multiple explicit-target
+    # invocations are piped together.  This is the deprecated grammar
+    # regardless of whether the selectors are root, wildcard, or named fields.
+    # Single-invocation expressions are silent because there is no | to rewrite.
+    if len(invocations) > 1:
         suggested = "; ".join(
             f"{inv.tool_name}({_render_invocation_args(inv)})"
             for inv in invocations
@@ -1639,6 +1636,33 @@ def _bind_arguments(
         _validate_argument_type(value, param, contract.name, expression, arg.span)
         bound[arg.name] = value
 
+    # Cross-parameter semantic validation for built-in structural tools.
+    # These constraints are expressed in the tool docstring and enforced at
+    # runtime by _check_policy/_selection in structural.py, but they are also
+    # statically checkable because the argument values are literals.  Moving
+    # the check here surfaces them before the source opens, which is the
+    # invariant the planner requires.
+    if contract.name in ("nest", "unnest"):
+        if bound.get("include") is not None and bound.get("exclude") is not None:
+            raise ToolConfigurationError(
+                f"arguments 'include' and 'exclude' are mutually exclusive "
+                f"for {contract.name!r}; pass only one",
+                expression=expression,
+                span=_invocation_span,
+            )
+        for arg_name in ("include", "exclude"):
+            value = bound.get(arg_name)
+            if value is not None:
+                bad = [v for v in value if not isinstance(v, str)]
+                if bad:
+                    raise ToolConfigurationError(
+                        f"argument {arg_name!r} for {contract.name!r} must be "
+                        f"a list of field-name strings; got non-string element(s): "
+                        f"{bad[:3]!r}",
+                        expression=expression,
+                        span=_invocation_span,
+                    )
+
     # Fill in defaults for unspecified parameters and validate them.
     for param in contract.parameters:
         if param.name not in bound:
@@ -1727,41 +1751,44 @@ def _matches_annotation(value: Any, annotation: Any) -> bool:
 
 
 def _normalize_live_union(annotation: Any) -> Any:
-    """Convert a live ``Union[...]`` / ``X | None`` object into ``UnionAnnotation``.
+    """Convert a live ``Union[...]`` / ``X | None`` / ``Literal[...]`` into the
+    internal representation the validator understands.
 
     Provider contracts arrive decoded from the registry, where unions are
-    already ``UnionAnnotation``.  A *built-in* tool's annotation instead comes
-    straight off the live signature, so a union reaches validation as a raw
-    ``typing`` object that no branch below recognises — and the argument is
-    rejected with "annotation Optional which is not supported", contradicting
-    the same message's promise that "Optional/Union of those" is supported.
+    already ``UnionAnnotation`` and literals are already ``EnumValues``.  A
+    *built-in* tool's annotation comes straight off the live signature, so raw
+    ``typing`` objects reach validation without going through the decoder — and
+    the argument is rejected with "annotation Optional which is not supported",
+    contradicting the message's own promise.
 
-    That made a perfectly ordinary signature unusable::
+    This function normalises the three live forms that previously fell through:
 
-        def my_tool(value, *, mode: str | None = None) -> str: ...
+    - ``typing.Optional[X]`` / ``typing.Union[X, None]`` → ``UnionAnnotation``
+    - PEP 604 ``X | None`` (Python ≥ 3.10) → ``UnionAnnotation``
+    - ``typing.Literal["a", "b"]`` → ``EnumValues``
 
-    It also made the built-ins Python-version dependent.  Under 3.10,
-    ``typing.get_type_hints`` still applied PEP 484's implicit-Optional rule
-    and rewrote ``include: list = None`` to ``Optional[list]``; 3.11 dropped
-    that rule, so the identical source validated there and failed on 3.10.
-    Normalising here fixes both, and leaves non-union annotations untouched.
+    Non-union, non-literal annotations are returned untouched.
     """
     import typing
 
     origin = typing.get_origin(annotation)
+
+    # PEP 604 `X | None` uses types.UnionType on 3.10+, which has a different
+    # origin from typing.Union.
     is_union = origin is typing.Union
     if not is_union:
-        # PEP 604 `X | None` is types.UnionType, which is a distinct origin
-        # from typing.Union on 3.10-3.13.
         union_type = getattr(types, "UnionType", None)
-        is_union = union_type is not None and origin is union_type
-    if not is_union:
-        return annotation
+        is_union = union_type is not None and isinstance(annotation, union_type)
+    if is_union:
+        members = tuple(
+            type(None) if m is None else m for m in typing.get_args(annotation)
+        )
+        return UnionAnnotation(members)
 
-    members = tuple(
-        type(None) if m is None else m for m in typing.get_args(annotation)
-    )
-    return UnionAnnotation(members)
+    if origin is typing.Literal:
+        return EnumValues("Literal", tuple(typing.get_args(annotation)))
+
+    return annotation
 
 
 def _validate_argument_type(

@@ -283,11 +283,12 @@ def test_include_and_exclude_together_is_an_error():
 
 
 def test_mutual_exclusion_surfaces_through_the_dsl():
-    with pytest.raises(ToolExecutionError) as exc:
-        _run('nest(., key="m", include=["a"], exclude=["b"])', {"a": 1, "b": 2})
-    cause = _cause(exc)
-    assert isinstance(cause, ValueError)
-    assert "mutually exclusive" in str(cause)
+    """include and exclude are mutually exclusive; now caught at compile time."""
+    from datapipe.dsl.compiler import compile_program
+    from datapipe.dsl.errors import ToolConfigurationError
+    with pytest.raises(ToolConfigurationError) as exc:
+        compile_program('nest(., key="m", include=["a"], exclude=["b"])')
+    assert "mutually exclusive" in str(exc.value)
 
 
 def test_unnest_include_and_exclude_together_is_an_error():
